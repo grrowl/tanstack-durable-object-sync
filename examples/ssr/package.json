@@ -7,14 +7,16 @@
     "build": "vite build",
     "preview": "vite preview",
     "deploy": "npm run build && wrangler deploy",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check:single-copy": "node ../check-single-copy.mjs . dist/client dist/server",
+    "smoke": "node ../smoke-boot.mjs 4173 \"vite preview --port 4173 --strictPort --host 127.0.0.1\" \"GET /live-query >>ssr-todo-seed-1\" \"GET /live-suspense-query >>ssr-todo-seed-1\" \"WS /sync/main\""
   },
   "dependencies": {
-    "@tanstack/db": "^0.8.5",
-    "@tanstack/react-db": "^0.3.5",
-    "@tanstack/react-router": "^1.170.0",
+    "@tanstack/db": "^0.9.2",
+    "@tanstack/react-db": "^0.4.1",
+    "@tanstack/react-router": "^1.170.39",
     "@tanstack/react-router-with-db": "^0.1.0",
-    "@tanstack/react-start": "^1.168.0",
+    "@tanstack/react-start": "^1.168.58",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "tanstack-durable-object-sync": "file:../.."

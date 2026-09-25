@@ -30,4 +30,5 @@ explains the displacement.
 | [0020](./0020-connect-contract-abortable-open.md) | connect() never resolves disconnected; open() is abortable via AbortSignal | Accepted (amends 0016 + 0011 seam) |
 | [0021](./0021-in-flight-settlement-unexpected-close.md) | In-flight mut/call settlement across an unexpected close: hold-and-replay + typed `ConnectionLostError` | Accepted (fixes #39; builds on 0020/0016/0011) |
 | [0022](./0022-db-version-support-policy.md) | `@tanstack/db` version support: an uncapped floor, tested at both ends | Accepted (supersedes 0011 D5 peer floor in part) |
+| [0024](./0024-examples-single-tanstack-db.md) | Examples bundle exactly one `@tanstack/db`, and CI proves it | Accepted (examples only) |
 | [0025](./0025-empty-op-key-rejection.md) | An empty `mut` op key is rejected with a reply, after the dedup lookup | Accepted (amends 0012 D1 for op keys; makes 0014 D3 true) |

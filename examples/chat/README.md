@@ -11,8 +11,9 @@ the current code. A published consumer would `import` from
 ## Run
 
 ```sh
+npm install --prefix ../..   # the repo root: the adapter is imported from ../../src
 npm install
-npm run dev      # builds the client bundle, then `wrangler dev`
+npm run dev                  # builds the client bundle, then `wrangler dev`
 ```
 
 Open the printed URL (default http://localhost:8787), then open a **second tab**

@@ -1,0 +1,67 @@
+name: Examples
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref (e.g. rapid pushes to a PR).
+concurrency:
+  group: examples-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  WRANGLER_SEND_METRICS: "false"
+
+jobs:
+  example:
+    name: ${{ matrix.example }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        example: [board, chat, multi-do, on-demand, ssr]
+    defaults:
+      run:
+        working-directory: examples/${{ matrix.example }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            examples/${{ matrix.example }}/package-lock.json
+
+      # The examples import the adapter from the repo root (../../src, or a
+      # file:../.. link whose dist/ ssr consumes), so the root installs first.
+      - name: Install and build the library
+        working-directory: .
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # --sourcemap for ssr: vite has no metafile, so the single-copy check
+      # reads its source maps.
+      - name: Build
+        run: npm run build ${{ matrix.example == 'ssr' && '-- --sourcemap' || '' }}
+
+      - name: Single @tanstack/db copy
+        run: npm run check:single-copy
+
+      # No Cloudflare account needed: wrangler dev / vite preview run workerd
+      # locally.
+      - name: Boot smoke (workerd)
+        run: npm run smoke

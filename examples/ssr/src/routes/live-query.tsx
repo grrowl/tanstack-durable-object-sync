@@ -47,7 +47,9 @@ function LiveQueryPage() {
       <p style={{ color: "#666", marginTop: 0 }}>
         <span data-testid="hydration-state">{hydrated ? "hydrated" : "ssr"}</span>
         {" · "}
-        <span data-testid="ready-state">{isReady ? "live" : "catching up"}</span>
+        {/* The server's snapshot is "ready" too; gate on hydration so the first
+            client render matches the server HTML ("catching up"). */}
+        <span data-testid="ready-state">{hydrated && isReady ? "live" : "catching up"}</span>
         {" · "}
         rows: <b data-testid="ssr-row-count">{data.length}</b>
       </p>

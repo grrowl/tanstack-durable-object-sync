@@ -34,9 +34,9 @@ const tasks = createCollection(
   // Row (Task) is inferred from BoardApi + the "tasks" table — no runtime schema.
   doCollectionOptions({ transport, table: "tasks", getKey: (t) => t.id, syncMode: "on-demand" }),
 )
-// A range index on the order column lets the live query page lazily via the
-// cursor instead of falling back to loading the whole subset. BTreeIndex suits
-// this write-heavy (firehose) collection.
+// A range index on the order column is what lets the window page lazily via
+// the cursor: without it the window loads its first page and can never grow.
+// BTreeIndex suits this write-heavy (firehose) collection.
 tasks.createIndex((t) => t.updated_at, { indexType: BTreeIndex })
 
 const PAGE = 50

@@ -7,8 +7,7 @@ first paint, then goes live over the socket and converges — catch-up from the
 dehydrated cursor delivers whatever changed while the HTML was in flight.
 Stale-while-revalidate, never a flash of empty.
 
-Built on the **released** TanStack DB SSR API (`@tanstack/db` ≥ 0.8.5,
-`@tanstack/react-db` ≥ 0.3.5) and the official
+Built on the **released** TanStack DB SSR API and the official
 [`@tanstack/react-router-with-db`](https://www.npmjs.com/package/@tanstack/react-router-with-db)
 Start adapter — `routerWithDbClient(router, dbClient)` handles DbProvider,
 dehydrate/hydrate through the router, and Suspense query streaming. The only
@@ -20,6 +19,7 @@ The example depends on the local package (`"tanstack-durable-object-sync":
 ## Run
 
 ```sh
+npm install --prefix ../..     # the repo root's dependencies
 npm run build --prefix ../..   # build the library's dist/ (file: dep)
 npm install
 npm run dev                    # vite dev with the Cloudflare plugin (runs in workerd)

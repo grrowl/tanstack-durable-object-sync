@@ -8,8 +8,9 @@ Categories you never open are never synced.
 ## Run
 
 ```sh
+npm install --prefix ../..   # the repo root: the adapter is imported from ../../src
 npm install
-npm run dev            # builds the client, then `wrangler dev`
+npm run dev                  # builds the client, then `wrangler dev`
 # optional: seed some rows
 curl 'http://localhost:8787/seed?room=demo'
 ```

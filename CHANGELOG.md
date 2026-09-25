@@ -70,6 +70,7 @@ While pre-1.0, the public API may change between 0.x releases.
   `instanceof`-distinct from `MutationRejectedError`, `TransportClosedError`, and
   the generic confirmation timeout. The type is the contract: an app catches it
   to hold its optimistic overlay (the outcome is unknown) rather than roll back.
+- Examples updated to `@tanstack/db` 0.9 / `@tanstack/react-db` 0.4, each bundling exactly one `@tanstack/db`; CI now typechecks, builds and boots every example (ADR-0024).
 
 ### Fixed
 
