@@ -44,6 +44,8 @@ readonly`, override-able by subclasses at construction time):
 - **`maxOpsPerMutation = 128`**: checked at the top of `handleMut`. **Reject,
   don't truncate** — a partial apply would silently drop client writes. Sends
   `rejected` with `code: "LIMIT_EXCEEDED"`.
+  *(2026-09-25: now checked after the dedup lookup, so a resent `txId` keeps
+  its stored outcome; see [ADR-0025](./0025-empty-op-key-rejection.md).)*
 - **`maxSubsPerSocket = 256`**: checked in `handleSub` before `subs.add`. A
   re-sub on an existing `subId` replaces the old entry
   (`SubscriptionRegistry.add` semantics) and does NOT count against the cap —
