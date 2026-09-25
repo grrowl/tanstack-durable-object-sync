@@ -131,6 +131,12 @@ While pre-1.0, the public API may change between 0.x releases.
   `rejected` (`code: "VALIDATION"`) before authorize or any row write, so the client
   gets a prompt `MutationRejectedError` and rolls back. **Behaviour change:** a
   write that used `""` as a pk used to be accepted and is now refused.
+- **A replayed `mut` is no longer rejected by a lowered op limit (ADR-0025
+  amendment).** `maxOpsPerMutation` was checked before the dedup lookup. If the
+  limit was lowered (for example, by a deploy) while a hold-and-replay
+  (ADR-0021) was pending, the replayed frame got `LIMIT_EXCEEDED` and the client
+  rolled back a write that had committed. The check now runs after the lookup,
+  so a resent `mut` gets its stored outcome while that receipt is retained.
 
 ### Internal
 

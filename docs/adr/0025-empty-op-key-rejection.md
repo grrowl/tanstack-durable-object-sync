@@ -65,3 +65,27 @@ tracked separately.
   replays identical frames, so only the first case can reach it. It is left as
   a follow-up.
 - Tests: `tests/empty-op-key.test.ts`.
+
+## Amendment — 2026-09-25: every per-tx rejection runs after the dedup lookup
+
+Rule 3 now applies to every check in `#handleMut` and `#handleCall` that can
+answer a `txId` with `rejected`, not only the empty-key check. The one check
+that ran before the lookup was `maxOpsPerMutation` (see the Consequences
+above). It now runs after it. This matters most for ADR-0021's
+hold-and-replay: the client resends an identical frame after a drop, and if
+the limit was lowered in between (a deploy over the same storage), a limit
+check that ran first would answer `LIMIT_EXCEEDED` and the client would roll
+back a write that had committed. `#handleCall` already looked up first.
+
+Checks that run before decode or before the shape guard are not per-tx
+rejections and stay where they are: `maxFrameBytes` and the shape guard drop
+the frame with no reply (ADR-0012 D1, ADR-0018), so they cannot contradict a
+stored receipt. `maxFrameBytes` must run before decode to bound the work.
+
+This rule covers a resend that arrives after the first frame has been
+answered. It does not cover two frames with the same `txId` in flight at
+once: both handlers can pass the lookup before either records an outcome,
+because `authorize` (and a command's `execute`) can await. That needs a
+per-`txId` reservation, which is a separate decision and is not made here.
+
+Tests: `tests/dedup-before-limits.test.ts`.

@@ -704,14 +704,16 @@ export function Syncable<Env = unknown, TUser = unknown>() {
        * optimistic overlay is never dropped before the authoritative row lands.
        */
       async #handleMut(ws: WebSocket, f: Extract<ClientFrame, { t: "mut" }>): Promise<void> {
+        // Dedup first: a resent txId gets its stored outcome, never a fresh
+        // rejection from a check below (ADR-0025).
+        const seen = lookupTx(this.#sql, f.txId)
+        if (seen) return this.#replayReceipt(ws, f.txId, seen)
+
         // Inbound limit: reject over-length batches without applying anything
         // (ADR-0012). Reject-don't-truncate: a partial apply silently drops writes.
         if (f.ops.length > this.maxOpsPerMutation) {
           return this.#rejectTx(ws, f.txId, `mutation exceeds maxOpsPerMutation (${this.maxOpsPerMutation})`, "LIMIT_EXCEEDED")
         }
-
-        const seen = lookupTx(this.#sql, f.txId)
-        if (seen) return this.#replayReceipt(ws, f.txId, seen)
 
         // An op key is the row's client-supplied TEXT pk; `""` is never a real
         // identity. Reject with a reply, not a shape-guard drop, so the client
