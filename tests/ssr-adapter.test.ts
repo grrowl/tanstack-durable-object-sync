@@ -268,9 +268,9 @@ describe("commit receipts (0.8.5 SyncAppliedReceipt)", () => {
       (e: Error) => `rejected:${e.message}`,
     )
     await flush()
-    const h = handlers.get("messages#null")!
-    h.onSnap(undefined, { id: "a", body: "x" })
-    h.onSnapEnd() // flush → rejected receipt
+    const [h] = [...handlers.values()] // the subset's watch (fresh subId per watch, ADR-0023)
+    h!.onSnap(undefined, { id: "a", body: "x" })
+    h!.onSnapEnd() // flush → rejected receipt
     await expect(settled).resolves.toBe("rejected:aborted application")
   })
 

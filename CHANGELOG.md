@@ -72,9 +72,44 @@ While pre-1.0, the public API may change between 0.x releases.
   the generic confirmation timeout. The type is the contract: an app catches it
   to hold its optimistic overlay (the outcome is unknown) rather than roll back.
 - Examples updated to `@tanstack/db` 0.9 / `@tanstack/react-db` 0.4, each bundling exactly one `@tanstack/db`; CI now typechecks, builds and boots every example (ADR-0024).
+- **On-demand: a released query's rows leave the collection (ADR-0023).**
+  Releasing a query releases its server subscription and removes the rows only
+  it kept current, unless another loaded query still holds them. Before, they
+  stayed with nothing keeping them current, so a row deleted meanwhile came back
+  after a reload. A row with a pending optimistic write stays visible until the
+  write settles.
 
 ### Fixed
 
+- **On-demand requests load exactly what they ask for (ADR-0023).** A subset was
+  identified by its `where` alone, so two queries with one filter and different
+  orders or limits shared the first one's bounded snapshot (the second showed
+  the wrong rows), a growing window without an index never reached the Durable
+  Object, and on `@tanstack/db` 0.9 the new tie, prefix and full-subset requests
+  were answered with the first page, so windows stopped paging. Identical
+  requests still share one load; a request that an existing subscription
+  already keeps current is a one-off fetch.
+- **On `@tanstack/db` 0.9, an ordered window no longer loses rows or stops paging
+  (`examples/board`).** 0.9 requests the rows tied at a page boundary
+  separately; each became a live server subscription (piling up against
+  `maxSubsPerSocket`) whose move-out delete removed rows the window's own
+  subscription still held, so a new row inserted at the top of the window was
+  lost once its write was confirmed. Tie requests are now one-off fetches.
+- **A row another loaded query still holds is no longer deleted by a
+  neighbour's move-out.** Every subscription gets a delete for a changed row it
+  does not match; the adapter applied it even when another subscription still
+  matched the row. A row now leaves only when no subscription holds it.
+- **A refused on-demand subscription no longer truncates the collection.** An
+  unsupported predicate, the per-socket subscription cap or an unknown
+  collection wiped every other loaded subset on 0.8, and on 0.9 looped: the
+  truncate replay re-subscribed the refused predicate hundreds of times a
+  second. A refusal now settles only its own load.
+- **A reload no longer receives a released subscription's in-flight snapshot.**
+  Subscription ids were reused per filter; each subscription now gets a fresh id.
+- **Cleaning up an on-demand collection no longer closes a shared transport.** It
+  unsubscribes what it owns, and other collections on the transport keep
+  receiving changes (0.9.1's GC reclaim runs cleanup more often). The transport
+  is the caller's: close it with `transport.close()` when you are done with it.
 - **A subscription that drops before its first snapshot now loads.** On
   reconnect the transport resubscribed it from the shared cursor, so the Durable
   Object answered a catch-up: its rows never arrived and its load never settled
@@ -82,6 +117,9 @@ While pre-1.0, the public API may change between 0.x releases.
   now restarts from a snapshot, undoing what a partial first snapshot
   delivered. An SSR hydration catch-up interrupted the same way resumes from its
   own dehydrated cursor.
+- `unloadSubset` is idempotent and never throws, and a page whose request was
+  aborted installs nothing (`@tanstack/db` 0.9 subset contracts).
+
 - `#send` no longer throws an uncaught `Can't call send() after close()` when a
   client subscribes then closes before the snapshot finishes streaming (normal
   churn: dispose, navigate-away, StrictMode teardown, forced reconnect). The

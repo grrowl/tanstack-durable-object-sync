@@ -8,12 +8,15 @@
 // Two sync modes:
 //   - 'eager' (default): subscribe to the whole collection (optionally filtered
 //     by a static `where`) up front. A `where` also preflights writes.
-//   - 'on-demand': sync nothing up front; the collection calls loadSubset(where)
-//     as live queries mount, and unloadSubset when they unmount. Each distinct
-//     `where` is one refcounted server subscription; ordering/limit are applied
-//     client-side by IVM over the loaded rows. Writes that land outside every
-//     loaded subset are confirmed and their optimistic overlay retired by a
-//     post-mutation empty sync commit (ADR-0002 C2, verified).
+//   - 'on-demand': sync nothing up front; the collection calls loadSubset as
+//     live queries mount, and unloadSubset when they unmount (ADR-0023). Each
+//     request loads exactly the rows it asks for: identical requests share one
+//     load; a request an existing server subscription already keeps live is a
+//     one-shot fetch; any other opens its own subscription. A released
+//     subscription takes the rows only it held with it. Ordering/limit are
+//     applied client-side by IVM over the loaded rows. Writes that land outside
+//     every loaded subset are confirmed and their optimistic overlay retired by
+//     a post-mutation empty sync commit (ADR-0002 C2, verified).
 
 import {
   compileSingleRowExpression,
@@ -103,6 +106,7 @@ interface LoadSubsetOptions {
   limit?: number
   offset?: number
   cursor?: { whereFrom: unknown; whereCurrent: unknown; lastKey?: unknown }
+  signal?: AbortSignal
 }
 
 function compilePredicate(where: unknown): (row: Record<string, unknown>) => boolean {
@@ -252,6 +256,17 @@ export function doCollectionOptions(opts: {
       begin()
       track(commit()) // a standalone empty boundary; runs the direct-upsert clear path
     }
+    const writeDelta = (op: RowOp, key: string, cols: Record<string, unknown> | undefined): void => {
+      ensureBegin()
+      if (op === "delete") write({ type: "delete", key })
+      // A catch-up emits the LATEST op per changed key, so a key deleted-
+      // and-reinserted while we were away arrives as "insert" for a key we
+      // still HOLD — TanStack's sync write throws DuplicateKeySyncError on
+      // that unless values deep-equal. Apply a held-key insert as the
+      // upsert it semantically is (update upserts; move-in, ADR-0002 C4).
+      else if (op === "insert" && syncedHas(key)) write({ type: "update", value: cols })
+      else write({ type: op, value: cols })
+    }
 
     const makeHandler = (
       onReady: () => void,
@@ -299,17 +314,7 @@ export function doCollectionOptions(opts: {
           }
           afterApplied(flush(), onReady, onFail)
         },
-        onDelta: (op, key, cols) => {
-          ensureBegin()
-          if (op === "delete") write({ type: "delete", key: key as string })
-          // A catch-up emits the LATEST op per changed key, so a key deleted-
-          // and-reinserted while we were away arrives as "insert" for a key we
-          // still HOLD — TanStack's sync write throws DuplicateKeySyncError on
-          // that unless values deep-equal. Apply a held-key insert as the
-          // upsert it semantically is (update upserts; move-in, ADR-0002 C4).
-          else if (op === "insert" && syncedHas(key as string)) write({ type: "update", value: cols })
-          else write({ type: op, value: cols })
-        },
+        onDelta: (op, key, cols) => writeDelta(op, key as string, cols),
         // The transport restarts a sub that never bootstrapped from a fresh
         // snapshot (a drop before its snap-end). Undo what the partial snapshot
         // wrote, in the still-open transaction, so a row deleted meanwhile is not
@@ -339,6 +344,175 @@ export function doCollectionOptions(opts: {
     }
 
     if (syncMode === "on-demand") {
+      // --- Watches, acquisitions and holds (ADR-0023) --------------------------
+      // A WATCH is one live server sub: it keeps a predicate (`where`) live, i.e.
+      // every delta for a row it matches arrives on it. An ACQUISITION is one
+      // `loadSubset` request, identified by its where/orderBy/limit: identical
+      // requests share one; a request that an accepted watch already covers is
+      // answered by a one-shot fetch and PINS that watch; any other opens its own
+      // watch, whose snapshot is shaped by the request. HOLDS record which
+      // watches keep each row live. Every sub on the socket gets a frame for
+      // every changed key (ADR-0002 C4): the row if it matches, else a synthetic
+      // delete — also when ANOTHER watch still matches it. So a `delete` from one
+      // watch drops only that watch's hold, and the row goes when no watch holds
+      // it; a real delete reaches every holder, so the last one removes it. A
+      // released watch takes the rows only it held with it (the release/load gap:
+      // nothing would keep them live, so a later delete would never reach us).
+      // Per loaded row: one `holders` entry, a small Set (usually one watch), and
+      // one entry in each holding watch's `rows`. Every frame is O(1) bookkeeping.
+      interface Watch {
+        subId: string
+        where: unknown
+        /** Encoded top-level conjuncts of `where`: the watch covers any request
+         *  whose conjuncts include all of them. */
+        conjunctKeys: Array<string>
+        pins: number
+        /** Reached its first snap-end: the DO accepted it. */
+        bootstrapped: boolean
+        /** Settles true at its first snap-end, false if refused or retired;
+         *  rejects if its subscribe itself fails. */
+        accepted: Promise<boolean>
+        accept: (ok: boolean) => void
+        gen: number
+        rows: Set<string>
+      }
+      interface Acquisition {
+        key: string
+        refs: number
+        ready: Promise<void>
+        watch: Watch | null
+        released: boolean
+        gen: number
+        /** Resolve the load without rows: a truncate or a release overtook it. */
+        settle: () => void
+        fail: (e: unknown) => void
+      }
+      // Bumped by every truncate: acquisitions and watches from before it no
+      // longer share or cover, so upstream's truncate replay (load-then-release
+      // on 0.8, release-then-reload on 0.9) really reloads every demand.
+      let gen = 0
+      let alive = true // false after cleanup: late async work installs nothing
+      const watches = new Set<Watch>()
+      const acquisitions = new Map<string, Acquisition>() // current generation, by request key
+      const acquisitionOf = new WeakMap<object, Acquisition>() // by the options object core loaded
+      const outstanding = new WeakMap<object, number>() // loads not yet released, per options object
+      const holders = new Map<string, Set<Watch>>()
+      const requestKey = (o: LoadSubsetOptions): string => codecEncode([o.where ?? null, o.orderBy ?? null, o.limit ?? null])
+
+      /** Release must never throw (0.9 UnloadSubsetFn). A send that throws means
+       *  the socket is closing; the DO drops every sub of a closed socket
+       *  (webSocketClose), so there is nothing to retry. */
+      const unsubscribeQuietly = (subId: string): void => {
+        try {
+          transport.unsubscribe(subId)
+        } catch {
+          /* closing socket */
+        }
+      }
+      const hold = (key: string, w: Watch): void => {
+        let hs = holders.get(key)
+        if (!hs) holders.set(key, (hs = new Set()))
+        hs.add(w)
+        w.rows.add(key)
+      }
+      /** Drop `w`'s hold on `key`; true when no watch holds it any more. */
+      const unhold = (key: string, w: Watch): boolean => {
+        w.rows.delete(key)
+        const hs = holders.get(key)
+        if (!hs) return true
+        hs.delete(w)
+        if (hs.size > 0) return false
+        holders.delete(key)
+        return true
+      }
+      /** Drop every hold `w` has; delete the rows no other watch holds —
+       *  unconditionally: a row may still be only an insert in the open sync
+       *  transaction, or in a commit core has queued, and so not yet synced
+       *  (a delete of an absent key is a no-op, as for any synthetic delete). */
+      const dropHolds = (w: Watch): void => {
+        for (const key of w.rows) {
+          const hs = holders.get(key)
+          hs?.delete(w)
+          if (hs && hs.size > 0) continue
+          holders.delete(key)
+          ensureBegin()
+          write({ type: "delete", key })
+        }
+        w.rows.clear()
+      }
+      /** Truncate the whole collection and start a new generation. Every
+       *  current watch is retired at once — unsubscribed, so its trailing frames
+       *  find no handler even if core applies the truncate (and replays every
+       *  demand with fresh subs) only later, behind a persisting transaction;
+       *  and older acquisitions no longer share, cover or install pages. */
+      const truncateAll = (): CommitReceipt => {
+        for (const w of watches) {
+          w.accept(false)
+          unsubscribeQuietly(w.subId)
+        }
+        watches.clear()
+        holders.clear()
+        const orphans = [...acquisitions.values()]
+        acquisitions.clear()
+        gen++
+        flush()
+        begin()
+        truncate()
+        const receipt = track(commit())
+        // A retired watch's snapshot will never arrive: settle every load still
+        // waiting on one, or it would stay pending forever (0.8 keeps it in
+        // isLoadingSubset). Resolve, not reject — core would report a rejected
+        // load as the query's error, and its truncate replay reloads them all —
+        // but only once the truncate is applied (core's replay barrier exists
+        // from then on); a truncate that fails fails them.
+        afterApplied(
+          receipt,
+          () => orphans.forEach((a) => a.settle()),
+          (e) => orphans.forEach((a) => a.fail(e)),
+        )
+        return receipt
+      }
+      const unpin = (w: Watch): void => {
+        if (--w.pins > 0 || !watches.delete(w)) return
+        unsubscribeQuietly(w.subId)
+        dropHolds(w)
+        flush()
+      }
+      const conjuncts = (e: unknown): Array<unknown> => {
+        const f = e as { type?: unknown; name?: unknown; args?: unknown } | null
+        return f?.type === "func" && f.name === "and" && Array.isArray(f.args) ? f.args.flatMap(conjuncts) : [e]
+      }
+      const conjunctKeys = (where: unknown): Array<string> => conjuncts(where).map((c) => codecEncode(c ?? null))
+      /** A watch of this generation that keeps every row of `where` live:
+       *  unfiltered, or every conjunct of its predicate is a conjunct of `where`
+       *  (so `where` implies it). Upstream's boundary-tie requests are
+       *  `and(subscriptionWhere, tie)`; a subscription `where` may itself be an
+       *  `and`. `pending` also admits a watch the DO has not accepted yet (the
+       *  caller waits for it). */
+      const findCover = (where: unknown, pending = false): Watch | null => {
+        let keys: Set<string> | null = null
+        for (const w of watches) {
+          if (w.gen !== gen || !(w.bootstrapped || pending)) continue
+          if (w.where == null) return w
+          keys ??= new Set(conjunctKeys(where))
+          if (w.conjunctKeys.every((k) => keys!.has(k))) return w
+        }
+        return null
+      }
+      /** Write a fetched page insert-if-absent (ADR-0003: a key already synced
+       *  keeps its value; the watch streams its changes) and attribute every row
+       *  to the watch that keeps it live. Settles once the rows are visible. */
+      const installPage = async (rows: Array<unknown>, w: Watch | null): Promise<void> => {
+        ensureBegin()
+        for (const r of rows) {
+          const key = getKey(r as Record<string, unknown>)
+          if (!syncedHas(key)) write({ type: "insert", value: r })
+          if (w && w.gen === gen && watches.has(w)) hold(key, w)
+        }
+        const receipt = flush()
+        if (receipt !== true) await receipt
+      }
+
       // Hydration catch-up (ADR-0011 D3): the dehydrated rows are the union of
       // whatever subsets the server render loaded — per-subset resume is
       // unsound (a subset the render didn't cover has no since to resume
@@ -364,17 +538,29 @@ export function doCollectionOptions(opts: {
       // socket the catch-up's truncate/deltas always precede subset
       // snapshots. Ready never waits for data — stale-while-revalidate.
       const hc = consumeHydratedCursor()
+      let catchupId: string | null = null
       let readyGate: Promise<void>
       if (hc !== null && hc !== "0") {
-        const catchupId = `${table}#hydrate#${++subSeq}`
-        const done = (): void => transport.unsubscribe(catchupId)
+        const id = `${table}#hydrate#${++subSeq}`
+        catchupId = id
+        const done = (): void => {
+          if (catchupId === id) catchupId = null
+          unsubscribeQuietly(id)
+        }
         readyGate = transport.subscribe(
-          catchupId,
+          id,
           table,
           {
             onSnap: () => {}, // catch-ups never snapshot; reset's resnapshot is dropped (unsubbed)
             onSnapEnd: () => {},
-            onDelta: makeHandler(() => {}).onDelta,
+            onDelta: (op, key, cols) => {
+              // Unfiltered: a delete here is a real delete — no hold survives it.
+              if (op === "delete") {
+                for (const w of holders.get(key as string) ?? []) w.rows.delete(key as string)
+                holders.delete(key as string)
+              }
+              writeDelta(op, key as string, cols)
+            },
             onUptodate: (ownTerminal) => {
               flush()
               if (ownTerminal) {
@@ -388,10 +574,7 @@ export function doCollectionOptions(opts: {
               }
             },
             onReset: () => {
-              flush()
-              begin()
-              truncate()
-              track(commit())
+              truncateAll()
               done() // before the trailing resnapshot frames arrive
               markReady() // same healing as the terminal path
             },
@@ -404,9 +587,7 @@ export function doCollectionOptions(opts: {
       } else if (hc === "0") {
         // No resume point: drop the hydrated rows at sync start, honestly.
         readyGate = transport.connect().then(() => {
-          begin()
-          truncate()
-          track(commit())
+          truncateAll()
         })
       } else {
         readyGate = transport.connect()
@@ -416,9 +597,82 @@ export function doCollectionOptions(opts: {
       // once the transport's policy-driven reconnect succeeds (0.8.2).
       void readyGate.then(markReady, (e) => markError?.(e))
 
-      // Distinct `where` -> one refcounted server subscription.
-      const loaded = new Map<string, { subId: string; refs: number; ready: Promise<void> }>()
-      const keyOf = (o: LoadSubsetOptions): string => JSON.stringify(o.where ?? null)
+      const openWatch = (o: LoadSubsetOptions, onReady: () => void, onFail: (e: unknown) => void, onRefused: () => void): Watch => {
+        let accept!: (ok: boolean) => void
+        let failAccept!: (e: unknown) => void
+        const accepted = new Promise<boolean>((res, rej) => {
+          accept = res
+          failAccept = rej
+        })
+        accepted.catch(() => {}) // observed by covered requests, if any
+        const w: Watch = {
+          subId: `${table}#${++subSeq}`, // fresh per watch: a released sub's late frames find no handler
+          where: o.where,
+          conjunctKeys: conjunctKeys(o.where),
+          pins: 1,
+          bootstrapped: false,
+          accepted,
+          accept,
+          gen,
+          rows: new Set(),
+        }
+        watches.add(w)
+        const handler: SubHandler = {
+          onSnap: (_key, row) => {
+            const key = getKey(row as Record<string, unknown>)
+            ensureBegin()
+            // A held key's snapshot row is an upsert (the snapshot is never
+            // staler than the held synced row, C1′).
+            write(syncedHas(key) ? { type: "update", value: row } : { type: "insert", value: row })
+            hold(key, w)
+          },
+          onSnapEnd: () => {
+            w.bootstrapped = true
+            w.accept(true)
+            afterApplied(flush(), onReady, onFail)
+          },
+          onDelta: (op, key, cols) => {
+            if (op !== "delete") {
+              writeDelta(op, key as string, cols)
+              hold(key as string, w)
+            } else if (unhold(key as string, w)) writeDelta(op, key as string, cols)
+          },
+          onUptodate: () => flush(),
+          onReset: () => {
+            if (!w.bootstrapped) {
+              // Before its first snapshot a reset can only be a refusal
+              // (unsupported predicate, sub cap, unknown collection): a sub that
+              // never bootstrapped never resubscribes with `since`, so no
+              // below-floor reset reaches it. It holds no rows. Settle its load
+              // as before and touch nothing else — a truncate here looped on 0.9
+              // (truncate → replay → the same refusal) and wiped every other
+              // subset on 0.8.
+              watches.delete(w)
+              w.accept(false)
+              unsubscribeQuietly(w.subId)
+              onRefused()
+              onReady()
+              return
+            }
+            // Below the retention floor on reconnect: whatever this watch held
+            // may be stale, and so may rows that covered fetches and cursor pages
+            // attributed to it, which its bounded resnapshot never restores. Only
+            // upstream's truncate replay knows every demand, so truncate; the new
+            // generation makes that replay reload each one with fresh subs, and
+            // the old subs' trailing frames find no handler.
+            afterApplied(truncateAll(), onReady, onFail)
+          },
+          // The transport restarts a sub that never bootstrapped from a fresh
+          // snapshot (reconnect before its snap-end): drop what the partial one
+          // delivered, so a row deleted meanwhile does not survive the restart.
+          onRestart: () => dropHolds(w),
+        }
+        void transport.subscribe(w.subId, table, handler, o.where, o.orderBy, o.limit).catch((e) => {
+          onFail(e)
+          failAccept(e) // requests waiting to be covered by it fail with it
+        })
+        return w
+      }
 
       // Cursor load-more (scroll-back). The live sub on `where` already streams
       // deltas for the whole subset, so this is a one-shot fetch of the older
@@ -439,6 +693,8 @@ export function doCollectionOptions(opts: {
       // source of truth for anything currently in the collection.
       const loadMore = async (o: LoadSubsetOptions): Promise<void> => {
         const { whereFrom, whereCurrent } = o.cursor!
+        const g = gen
+        const cover = findCover(o.where) // the watch that keeps these rows live, as of the request
         const page = await transport.fetch({
           t: "fetch",
           fetchId: `${table}#fetch#${++subSeq}`,
@@ -448,21 +704,57 @@ export function doCollectionOptions(opts: {
           orderBy: o.orderBy,
           limit: o.limit,
         })
-        ensureBegin()
-        for (const r of page) {
-          if (collection.get(getKey(r)) === undefined) write({ type: "insert", value: r })
-        }
+        // A request cancelled, a truncate (new generation), or a session cleaned
+        // up meanwhile: install nothing (0.9 cooperative cancellation; a page
+        // read before a truncate would come back as an unheld ghost).
+        if (!alive || o.signal?.aborted || g !== gen) return
         // 0.8.5 contract: a subset load settles only once its rows are visible.
-        const receipt = flush()
-        if (receipt !== true) await receipt
+        await installPage(page, cover)
+      }
+
+      /** A request a watch covers: its exact rows in one fetch, once the DO has
+       *  accepted the watch. A refused watch covers nothing: the request then
+       *  opens its own. */
+      const fetchCovered = async (acq: Acquisition, o: LoadSubsetOptions, w: Watch): Promise<void> => {
+        if (!(await w.accepted)) {
+          if (!alive || acq.released || acq.gen !== gen) return
+          unpin(w)
+          await new Promise<void>((resolve, reject) => {
+            acq.watch = openWatch(o, resolve, reject, () => {
+              if (acquisitions.get(acq.key) === acq) acquisitions.delete(acq.key)
+            })
+          })
+          return
+        }
+        const page = await transport.fetch({
+          t: "fetch",
+          fetchId: `${table}#fetch#${++subSeq}`,
+          collection: table,
+          where: o.where,
+          orderBy: o.orderBy,
+          limit: o.limit,
+        })
+        // Released by every owner, or from before a truncate: install nothing. An
+        // acquisition can be shared, so one owner's abort does not cancel it —
+        // core releases an aborted owner, and the last release sets `released`.
+        if (!alive || acq.released || acq.gen !== gen) return
+        await installPage(page, w)
       }
 
       const loadSubset = (o: LoadSubsetOptions): true | Promise<void> => {
         if (o.cursor) return loadMore(o)
-        const key = keyOf(o)
-        const existing = loaded.get(key)
+        // Neither a watch's snapshot nor a fetch can skip rows without a cursor:
+        // fail loud rather than answer with the wrong page. (Upstream pairs a
+        // non-zero offset with a cursor.)
+        if (o.offset) {
+          return Promise.reject(new Error(`on-demand '${table}': a subset request with offset ${o.offset} and no cursor is unsupported`))
+        }
+        outstanding.set(o, (outstanding.get(o) ?? 0) + 1)
+        const key = requestKey(o)
+        const existing = acquisitions.get(key)
         if (existing) {
           existing.refs++
+          acquisitionOf.set(o, existing)
           return existing.ready
         }
         let resolve!: () => void
@@ -471,38 +763,53 @@ export function doCollectionOptions(opts: {
           resolve = res
           reject = rej
         })
-        const subId = `${table}#${key}`
-        loaded.set(key, { subId, refs: 1, ready })
-        // Forward orderBy/limit so the INITIAL snapshot is the bounded window
-        // (recent N), not the whole where-subset. The live sub's predicate is
-        // still `where`, so entering rows (e.g. new messages) are delivered.
-        // A send failure or rejected receipt rejects THIS load (0.8.4 surfaces
-        // it per-subscription as loadSubset:error), not the whole collection.
-        // A completed subset also (re)marks ready — the recovery path out of a
-        // failed ready-gate's error state (idempotent otherwise).
-        const handler = makeHandler(
-          () => {
-            resolve()
-            markReady()
-          },
-          { onFail: reject },
-        )
-        void transport.subscribe(subId, table, handler, o.where, o.orderBy, o.limit).catch(reject)
+        const acq: Acquisition = { key, refs: 1, ready, watch: null, released: false, gen, settle: () => resolve(), fail: reject }
+        acquisitions.set(key, acq)
+        acquisitionOf.set(o, acq)
+        // A completed load also (re)marks ready — the recovery path out of a
+        // failed ready-gate's error state (idempotent otherwise). A send failure
+        // or rejected receipt rejects THIS load (0.8.4 surfaces it
+        // per-subscription as loadSubset:error), not the whole collection.
+        const loaded = (): void => {
+          resolve()
+          markReady()
+        }
+        // A pending watch covers too: a compatible request mounted in the same
+        // tick waits for it rather than opening a second subscription.
+        const cover = findCover(o.where, true)
+        if (cover) {
+          cover.pins++
+          acq.watch = cover
+          fetchCovered(acq, o, cover).then(loaded, reject)
+        } else {
+          // Forward orderBy/limit so the snapshot is this request's bounded
+          // window (recent N), not the whole where-subset. The watch's
+          // predicate is still `where`, so entering rows are delivered.
+          acq.watch = openWatch(o, loaded, reject, () => {
+            // Refused: a later identical request tries again.
+            if (acquisitions.get(key) === acq) acquisitions.delete(key)
+          })
+        }
         return ready
       }
 
       const unloadSubset = (o: LoadSubsetOptions): void => {
         // Symmetric with loadSubset: a cursor load was a one-shot fetch that
-        // never took a refcount, so its unload must not release one either —
-        // otherwise a second live query on the same `where` is under-counted
-        // and its still-live sub is torn down early.
+        // never took a refcount, so its unload must not release one either.
         if (o.cursor) return
-        const key = keyOf(o)
-        const entry = loaded.get(key)
-        if (entry && --entry.refs <= 0) {
-          transport.unsubscribe(entry.subId)
-          loaded.delete(key)
-        }
+        // Idempotent (0.9 UnloadSubsetFn): core releases each acquisition once,
+        // with the options object it loaded (0.8.x and 0.9.x alike). A repeat
+        // release, or an object that was never loaded, is a no-op — releasing by
+        // an equal object's request key could release another owner's load.
+        const acq = acquisitionOf.get(o)
+        const n = outstanding.get(o) ?? 0
+        if (!acq || n <= 0) return
+        outstanding.set(o, n - 1)
+        if (acq.released || --acq.refs > 0) return
+        acq.released = true
+        acq.settle() // released before its rows arrived: nothing will settle it now
+        if (acquisitions.get(acq.key) === acq) acquisitions.delete(acq.key)
+        if (acq.watch) unpin(acq.watch)
       }
 
       return {
@@ -510,7 +817,18 @@ export function doCollectionOptions(opts: {
         unloadSubset,
         cleanup: () => {
           hydratedCursor = null // GC wiped the rows; a retained cursor would lie
-          transport.close()
+          alive = false
+          // Unsubscribe what this collection owns — never close the transport:
+          // it is the caller's and may serve other collections (a shared
+          // transport stopped delivering to them when on-demand closed it).
+          for (const w of watches) {
+            w.accept(false)
+            unsubscribeQuietly(w.subId)
+          }
+          watches.clear()
+          holders.clear()
+          acquisitions.clear()
+          if (catchupId !== null) unsubscribeQuietly(catchupId)
         },
       }
     }
