@@ -8,6 +8,8 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-09-25
+
 ### Added
 
 - **SSR support (experimental, ADR-0011)** — built on TanStack DB's merged
@@ -41,7 +43,7 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ### Changed
 
-- **Peer dependency: `@tanstack/db >= 0.8.6`** (was `>= 0.6.0`) — the SSR
+- **Peer dependency: `@tanstack/db >= 0.8.6`** (was `>= 0.6.0`). Breaking. The SSR
   hooks shipped in 0.8.0; 0.8.5 carries the `commit()`-receipt contract and
   descriptor reuse this adapter adopts; 0.8.6 is the first release whose
   module evaluation is Worker-safe (0.8.5 calls `crypto.getRandomValues()` at
@@ -77,7 +79,8 @@ While pre-1.0, the public API may change between 0.x releases.
   it kept current, unless another loaded query still holds them. Before, they
   stayed with nothing keeping them current, so a row deleted meanwhile came back
   after a reload. A row with a pending optimistic write stays visible until the
-  write settles.
+  write settles. **Behaviour change:** code that read a released query's rows
+  from the collection no longer finds them.
 
 ### Fixed
 
@@ -108,8 +111,9 @@ While pre-1.0, the public API may change between 0.x releases.
   Subscription ids were reused per filter; each subscription now gets a fresh id.
 - **Cleaning up an on-demand collection no longer closes a shared transport.** It
   unsubscribes what it owns, and other collections on the transport keep
-  receiving changes (0.9.1's GC reclaim runs cleanup more often). The transport
-  is the caller's: close it with `transport.close()` when you are done with it.
+  receiving changes (0.9.1's GC reclaim runs cleanup more often). **Behaviour
+  change:** the transport is the caller's; close it with `transport.close()`
+  when you are done with it.
 - **A subscription that drops before its first snapshot now loads.** On
   reconnect the transport resubscribed it from the shared cursor, so the Durable
   Object answered a catch-up: its rows never arrived and its load never settled
@@ -119,7 +123,6 @@ While pre-1.0, the public API may change between 0.x releases.
   own dehydrated cursor.
 - `unloadSubset` is idempotent and never throws, and a page whose request was
   aborted installs nothing (`@tanstack/db` 0.9 subset contracts).
-
 - `#send` no longer throws an uncaught `Can't call send() after close()` when a
   client subscribes then closes before the snapshot finishes streaming (normal
   churn: dispose, navigate-away, StrictMode teardown, forced reconnect). The

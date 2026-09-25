@@ -1,6 +1,6 @@
 {
   "name": "tanstack-durable-object-sync",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Sync a TanStack DB collection to a Cloudflare Durable Object over WebSockets — optimistic mutations, live queries, and single-ordered-stream write confirmation.",
   "type": "module",
   "license": "MIT",
