@@ -14,7 +14,7 @@ when you want the runtime check as well.
 ```ts
 // server
 import { z } from "zod" // 3.24 or later; any Standard Schema library works
-import { defineSync } from "tanstack-durable-object-sync/server"
+import { defineSync } from "tanstack-durable-object-sync"
 
 const Message = z.object({
   id: z.string(),
@@ -110,9 +110,10 @@ with the equivalent from your library and change nothing else.
   schema you pass, so `op.cols` and `args` are typed exactly as the schema
   describes.
 - **A failed validation tells the client why.** For both mutations and commands,
-  a schema failure (or an `authorize` throw) is surfaced to the client with its
-  reason and a `VALIDATION` code, so you can show the user what was wrong. Only an
-  `execute` error is sanitized to a generic message.
+  a schema failure is surfaced to the client with its reason and a `VALIDATION`
+  code, so you can show the user what was wrong. An `authorize` throw also
+  surfaces its reason, without that code. Only an `execute` error is sanitized to
+  a generic message.
 - **It runs on every matching write,** so keep schemas cheap.
 
 ## See also
