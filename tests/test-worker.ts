@@ -251,6 +251,86 @@ export class LimitsTestDO extends SyncTestDO {
   protected override readonly maxSubsPerSocket = 2
 }
 
+// ---- In-flight duplicate fixtures (inflight-txid.test.ts) -----------------
+//
+// An `authorize` that awaits a real non-storage promise, released by a LATER
+// event (the test's runInDurableObject). While it is parked the input gate is
+// open, so a second frame for the same txId can be dispatched: the window an
+// I/O-bound authorize opens in production (ADR-0025 amendment, in-flight).
+
+/** Gates keyed by a tag the test chooses; module-scoped because `authorize`
+ *  has no instance. `parked` counts authorize calls that reached the gate. */
+const gates = new Map<string, { parked: number; open: boolean; waiters: Array<() => void> }>()
+
+function gateFor(tag: string) {
+  let g = gates.get(tag)
+  if (!g) gates.set(tag, (g = { parked: 0, open: false, waiters: [] }))
+  return g
+}
+
+async function parkAt(tag: string): Promise<void> {
+  const g = gateFor(tag)
+  g.parked++
+  if (!g.open) await new Promise<void>((r) => g.waiters.push(r))
+}
+
+export const gatedSchema = sync.schema({
+  collections: {
+    gated: sync.collection<MsgRow>({
+      pk: "id",
+      mutations: {
+        insert: {
+          authorize: ({ op }) => parkAt(op.cols.body),
+          execute: ({ op, sql }) => {
+            sql.exec("INSERT INTO gated(id, body) VALUES (?, ?)", op.cols.id, op.cols.body)
+          },
+        },
+      },
+    }),
+  },
+  commands: {
+    // A side effect that must run once per txId: bumps a counter, returns it.
+    bump: sync.command<{ tag: string }>()({
+      authorize: ({ args }) => parkAt(args.tag),
+      execute: ({ sql }) => {
+        sql.exec("UPDATE bumps SET n = n + 1")
+        return { n: Array.from(sql.exec("SELECT n FROM bumps"))[0]!.n as number }
+      },
+    }),
+    echo: sync.command<unknown>()(({ args }) => ({ echoed: args })),
+  },
+})
+
+export type GatedApi = typeof gatedSchema
+
+export class GatedTestDO extends SyncDurableObject<unknown, Claims> {
+  constructor(ctx: DurableObjectState, env: unknown) {
+    super(ctx, env)
+    ctx.blockConcurrencyWhile(async () => {
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS gated (id TEXT PRIMARY KEY, body TEXT)`)
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS bumps (n INTEGER NOT NULL)`)
+      if (Array.from(this.sql.exec("SELECT n FROM bumps")).length === 0) this.sql.exec("INSERT INTO bumps(n) VALUES (0)")
+      this.registerSync(gatedSchema)
+    })
+  }
+
+  protected override parseAttachment(): Claims {
+    return { userId: "anon" }
+  }
+
+  /** How many authorize calls have reached the gate `tag`. */
+  gateParked(tag: string): number {
+    return gateFor(tag).parked
+  }
+
+  /** Open the gate `tag`: release every parked authorize, and let later ones through. */
+  gateRelease(tag: string): void {
+    const g = gateFor(tag)
+    g.open = true
+    for (const w of g.waiters.splice(0)) w()
+  }
+}
+
 // ---- Host-matrix fixtures (host-matrix.test.ts) ---------------------------
 //
 // A fake partyserver-like host base and the Syncable mixin applied over it. The
@@ -365,6 +445,7 @@ interface Env {
   MAINT_DO: DurableObjectNamespace
   SLOW_DO: DurableObjectNamespace
   LIMITS_DO: DurableObjectNamespace
+  GATED_DO: DurableObjectNamespace
   HOST_DO: DurableObjectNamespace
   HOST_OPTIN_DO: DurableObjectNamespace
 }
@@ -387,6 +468,10 @@ export default {
     if (url.pathname.startsWith("/limits/")) {
       const name = url.pathname.slice("/limits/".length) || "default"
       return env.LIMITS_DO.get(env.LIMITS_DO.idFromName(name)).fetch(req)
+    }
+    if (url.pathname.startsWith("/gated/")) {
+      const name = url.pathname.slice("/gated/".length) || "default"
+      return env.GATED_DO.get(env.GATED_DO.idFromName(name)).fetch(req)
     }
     // Host-matrix routes: /host/<name>/... and /host-optin/<name>/... forward the
     // WHOLE request so the DO sees the trailing /_sync or /_host discriminator.
