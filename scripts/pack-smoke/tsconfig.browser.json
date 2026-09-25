@@ -1,0 +1,15 @@
+{
+  // The browser program: DOM, no workers types, skipLibCheck OFF. Only the
+  // `./client` entry is imported.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": [],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": false
+  },
+  "files": ["src/browser.ts"]
+}

@@ -125,6 +125,19 @@ While pre-1.0, the public API may change between 0.x releases.
   `.js.map`/`.d.ts.map` references, so go-to-definition lands on the source
   instead of a missing file.
 
+### Internal
+
+- CI tests both ends of the `@tanstack/db` peer range (ADR-0022): a `locked`
+  leg (the lockfile's version; the devDependency moves to `^0.9.2`) and a
+  `floor` leg that installs the version derived from `peerDependencies`.
+- A pack smoke test (`npm run smoke:pack`, run in CI) installs the packed
+  tarball into a throwaway consumer at the floor and locked versions, checks
+  the tarball ships everything its manifest and source maps reference,
+  type-checks the shipped declarations with `skipLibCheck` off, and boots a
+  consumer Worker in workerd that renders SSR from a Durable Object.
+- A weekly (and manually dispatchable) workflow runs the suite and the pack
+  smoke test against `@tanstack/db@latest`.
+
 ## [0.6.0] — 2026-07-27
 
 ### Added

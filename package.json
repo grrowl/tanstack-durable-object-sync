@@ -51,6 +51,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "smoke:pack": "node scripts/pack-smoke.mjs",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {

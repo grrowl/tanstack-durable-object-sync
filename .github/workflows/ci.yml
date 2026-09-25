@@ -16,8 +16,18 @@ permissions:
 
 jobs:
   build:
-    name: typecheck · test · build
+    # Both ends of the @tanstack/db peer range (ADR-0022): `locked` is the
+    # lockfile's version; `floor` is the declared `>=X.Y.Z`, derived from
+    # package.json so it cannot drift. The db version never floats here — an
+    # upstream release must not turn unrelated PRs red (upstream-latest.yml
+    # covers latest).
+    name: typecheck · test${{ matrix.db == 'locked' && ' · build' || '' }} (@tanstack/db ${{ matrix.db }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        db: [locked, floor]
     steps:
       - uses: actions/checkout@v6
 
@@ -29,6 +39,20 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install @tanstack/db at the declared floor
+        if: matrix.db == 'floor'
+        run: |
+          floor="$(node scripts/db-floor.mjs)"
+          npm install --no-save --no-audit --no-fund "@tanstack/db@${floor}"
+          echo "EXPECTED_DB=${floor}" >> "$GITHUB_ENV"
+
+      - name: Assert the @tanstack/db under test
+        run: |
+          expected="${EXPECTED_DB:-$(node -p 'require("./package-lock.json").packages["node_modules/@tanstack/db"].version')}"
+          actual="$(node -p 'require("./node_modules/@tanstack/db/package.json").version')"
+          echo "@tanstack/db ${actual} (expected ${expected})"
+          test "${actual}" = "${expected}"
+
       # Tests run inside workerd via @cloudflare/vitest-pool-workers; the pool
       # provisions miniflare/workerd itself, so no Cloudflare account or
       # secrets are required here.
@@ -39,4 +63,27 @@ jobs:
         run: npm test
 
       - name: Build
+        if: matrix.db == 'locked'
         run: npm run build
+
+  pack-smoke:
+    # The package as npm consumers receive it, at the floor and the locked
+    # version: tarball contents, shipped types (skipLibCheck off), and a boot
+    # in real workerd (scripts/pack-smoke.mjs, ADR-0022). db is exact; the
+    # consumer resolves its other ranges fresh, as a real install does.
+    name: pack smoke (floor · locked)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Pack smoke
+        run: npm run smoke:pack
