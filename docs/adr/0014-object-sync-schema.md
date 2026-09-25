@@ -130,6 +130,8 @@ the compiled `authorize`, before the author's `authorize`/`execute`, throwing
 - a command's schema validates its `args`.
 - a `delete` has no schema. It carries only the key, the wire layer already checks
   the key is a non-empty string (ADR-0012), and the pk was validated at insert.
+  *(2026-09-25: this check was not enforced until 0.7.0; see
+  [ADR-0025](./0025-empty-op-key-rejection.md).)*
 
 This reverses ADR-0010's B3 rejection narrowly and deliberately. ADR-0010 rejected
 a schema slot because it bought no *injection* safety (parameterised binding
