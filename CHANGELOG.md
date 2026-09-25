@@ -41,10 +41,13 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ### Changed
 
-- **Peer dependency: `@tanstack/db >= 0.8.5`** (was `>= 0.6.0`) — the SSR
+- **Peer dependency: `@tanstack/db >= 0.8.6`** (was `>= 0.6.0`) — the SSR
   hooks shipped in 0.8.0; 0.8.5 carries the `commit()`-receipt contract and
-  descriptor reuse this adapter adopts. The 0.6-era API is otherwise
-  unchanged: the full pre-lift suite passes on 0.8.5 without modification.
+  descriptor reuse this adapter adopts; 0.8.6 is the first release whose
+  module evaluation is Worker-safe (0.8.5 calls `crypto.getRandomValues()` at
+  module scope, so a Worker rendering SSR fails to start). The range stays
+  uncapped (ADR-0022). The 0.6-era API is otherwise unchanged: the full
+  pre-lift suite passed on 0.8.5 without modification.
 - The transport ignores STREAM frames from an abandoned socket
   (identity-guarded message dispatch): only the current socket speaks for the
   stream; dropped frames are re-covered by the resubscribe catch-up from the

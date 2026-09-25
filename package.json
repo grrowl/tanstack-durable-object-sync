@@ -56,12 +56,12 @@
     "@msgpack/msgpack": "^3.0.0"
   },
   "peerDependencies": {
-    "@tanstack/db": ">=0.8.5"
+    "@tanstack/db": ">=0.8.6"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.18.7",
     "@cloudflare/workers-types": "^4.20260518.1",
-    "@tanstack/db": "^0.8.5",
+    "@tanstack/db": "^0.9.2",
     "typescript": "^5.7",
     "vitest": "4.1.10",
     "wrangler": "^4"
