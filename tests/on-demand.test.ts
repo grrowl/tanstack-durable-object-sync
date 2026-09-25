@@ -201,18 +201,20 @@ describe("on-demand loadSubset (M12) — cursor load-more (scroll-back)", () => 
     const { res } = startOnDemand(transport)
     const base = whereEq("room", "r1")
 
-    await res.loadSubset({ where: base }) // initial live sub, refs = 1
+    const live = { where: base } // core releases with the object it loaded
+    await res.loadSubset(live) // initial live sub, refs = 1
     expect(subs.length).toBe(1)
 
     const cursor = { whereFrom: whereFunc("lt", "body", "16"), whereCurrent: whereEq("body", "16") }
-    await res.loadSubset({ where: base, orderBy: cursorOrderBy, limit: 5, cursor }) // one-shot
+    const page = { where: base, orderBy: cursorOrderBy, limit: 5, cursor }
+    await res.loadSubset(page) // one-shot
     expect(subs.length).toBe(1) // no new sub
 
     // The framework unloads EVERY loadedSubset, cursor loads included. A cursor
     // unload must be a no-op or it would under-count the still-live base sub.
-    res.unloadSubset({ where: base, orderBy: cursorOrderBy, limit: 5, cursor })
+    res.unloadSubset(page)
     expect(unsubs.length).toBe(0)
-    res.unloadSubset({ where: base }) // releases the live sub
+    res.unloadSubset(live) // releases the live sub
     expect(unsubs).toEqual([subs[0]!.subId])
   })
 
@@ -325,9 +327,12 @@ describe("on-demand loadSubset (M11) — against the DO", () => {
     )
     await messages.preload()
 
-    // Top-5 by body desc — the live query's limit must bound the load.
+    // Top-5 by body desc — the live query's limit must bound the load. The
+    // order is lexical so 0.9 can express it as a cursor: for an order it
+    // cannot express (e.g. the default locale string order) 0.9 asks for the
+    // full matching subset instead, and the adapter honours that (ADR-0023).
     const top5 = createLiveQueryCollection((q) =>
-      q.from({ m: messages }).orderBy(({ m }) => m.body, "desc").limit(5),
+      q.from({ m: messages }).orderBy(({ m }) => m.body, { direction: "desc", stringSort: "lexical" }).limit(5),
     )
     await top5.preload()
     await waitFor(() => top5.size === 5)
@@ -444,8 +449,11 @@ describe("on-demand loadSubset (M11) — against the DO", () => {
       doCollectionOptions({ transport: t, table: "messages", getKey: (m) => m.id, syncMode: "on-demand" }),
     )
     await messages.preload()
-    // Bounded window — top 3 by body desc (m5, m4, m3). m0 is cold.
-    const top3 = createLiveQueryCollection((q) => q.from({ m: messages }).orderBy(({ m }) => m.body, "desc").limit(3))
+    // Bounded window — top 3 by body desc (m5, m4, m3). m0 is cold. Lexical so
+    // 0.9 pages by cursor rather than loading the full subset (see above).
+    const top3 = createLiveQueryCollection((q) =>
+      q.from({ m: messages }).orderBy(({ m }) => m.body, { direction: "desc", stringSort: "lexical" }).limit(3),
+    )
     await top3.preload()
     await waitFor(() => top3.size === 3)
     expect(messages.get("m0")).toBeUndefined()

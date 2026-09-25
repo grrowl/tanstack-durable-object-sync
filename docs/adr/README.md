@@ -8,7 +8,7 @@ explains the displacement.
 | # | Title | Status |
 |---|---|---|
 | [0000](./0000-record-architecture-decisions.md) | Record architecture decisions | Accepted |
-| [0001](./0001-sync-architecture.md) | Sync architecture: single-ordered-stream over a Durable Object | Accepted (amended by 0002; D11 builder superseded by 0014; D13 base class reframed as a mixin by 0015) |
+| [0001](./0001-sync-architecture.md) | Sync architecture: single-ordered-stream over a Durable Object | Accepted (amended by 0002; D11 builder superseded by 0014; D13 base class reframed as a mixin by 0015; D8 on-demand subset model superseded by 0023) |
 | [0002](./0002-adversarial-review-corrections.md) | Corrections from adversarial review: ordering, shaping, retention | Accepted (C5 retention refined by 0009) |
 | [0003](./0003-atomic-cursor-fetch.md) | Cursor load-more is one atomic fetch, not two | Accepted (naming amended by 0005) |
 | [0004](./0004-after-commit-hook.md) | Side effects go in a fire-and-forget `afterCommit`, not the transaction | Accepted |
@@ -30,5 +30,6 @@ explains the displacement.
 | [0020](./0020-connect-contract-abortable-open.md) | connect() never resolves disconnected; open() is abortable via AbortSignal | Accepted (amends 0016 + 0011 seam) |
 | [0021](./0021-in-flight-settlement-unexpected-close.md) | In-flight mut/call settlement across an unexpected close: hold-and-replay + typed `ConnectionLostError` | Accepted (fixes #39; builds on 0020/0016/0011) |
 | [0022](./0022-db-version-support-policy.md) | `@tanstack/db` version support: an uncapped floor, tested at both ends | Accepted (supersedes 0011 D5 peer floor in part) |
+| [0023](./0023-on-demand-watches-acquisitions-holds.md) | On-demand: watches, exact acquisitions, and row holds | Accepted (supersedes 0001 D8's subset model; 0.9 adapter contracts) |
 | [0024](./0024-examples-single-tanstack-db.md) | Examples bundle exactly one `@tanstack/db`, and CI proves it | Accepted (examples only) |
 | [0025](./0025-empty-op-key-rejection.md) | An empty `mut` op key is rejected with a reply, after the dedup lookup | Accepted (amends 0012 D1 for op keys; makes 0014 D3 true; amended: every per-tx rejection runs after the dedup lookup; a duplicate of an in-flight txId waits, then replays) |

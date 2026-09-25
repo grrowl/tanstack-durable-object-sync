@@ -292,16 +292,17 @@ describe("_sync_subs row count == live subscriptions across churn (ADR-0019)", (
       }),
     )(onDemandControls())
 
-    await res.loadSubset({ where: whereEq("body", "shape-0") })
+    // Core releases each load with the options object it loaded (ADR-0023).
+    let prev = { where: whereEq("body", "shape-0") }
+    await res.loadSubset(prev)
     await waitFor(async () => (await subsView(stub)).live === 1)
 
     // Replace the where-shape repeatedly: load the next, unload the previous —
     // exactly one subset live at any time.
-    let prev: unknown = whereEq("body", "shape-0")
     for (let i = 1; i <= 8; i++) {
-      const next = whereEq("body", `shape-${i}`)
-      await res.loadSubset({ where: next })
-      res.unloadSubset({ where: prev })
+      const next = { where: whereEq("body", `shape-${i}`) }
+      await res.loadSubset(next)
+      res.unloadSubset(prev)
       prev = next
       await waitFor(async () => (await subsView(stub)).live === 1)
       const v = await subsView(stub)
@@ -309,7 +310,7 @@ describe("_sync_subs row count == live subscriptions across churn (ADR-0019)", (
     }
 
     // Unload the last: the table empties while the socket stays open.
-    res.unloadSubset({ where: prev })
+    res.unloadSubset(prev)
     await waitFor(async () => (await subsView(stub)).live === 0)
     expect((await subsView(stub)).total).toBe(0)
     expect((await subsView(stub)).sockets).toBe(1)
