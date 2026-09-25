@@ -310,6 +310,18 @@ export function doCollectionOptions(opts: {
           else if (op === "insert" && syncedHas(key as string)) write({ type: "update", value: cols })
           else write({ type: op, value: cols })
         },
+        // The transport restarts a sub that never bootstrapped from a fresh
+        // snapshot (a drop before its snap-end). Undo what the partial snapshot
+        // wrote, in the still-open transaction, so a row deleted meanwhile is not
+        // carried over; rows that still exist are re-upserted by the
+        // replacement before the commit (no flash).
+        onRestart: () => {
+          for (const key of snapKeys ?? []) {
+            ensureBegin()
+            write({ type: "delete", key })
+          }
+          snapKeys = null
+        },
         onUptodate: () => flush(),
         onReset: () => {
           flush()

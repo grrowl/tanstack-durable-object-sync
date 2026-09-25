@@ -221,7 +221,7 @@ describe("transport cursor bootstrap (SSR hydration, ADR-0011 D3)", () => {
     t.close()
   })
 
-  it("an abandoned socket still settles ID-scoped receipts — but never advances the cursor", async () => {
+  it("an abandoned socket still settles mutation receipts, fails pages — and never advances the cursor", async () => {
     // codex finding: a regress-reconnect must not convert a COMMITTED mutation
     // into a timeout — receipts are not re-covered by any replay. Stream
     // frames from the stale socket stay dropped (the catch-up re-covers them).
@@ -272,7 +272,9 @@ describe("transport cursor bootstrap (SSR hydration, ADR-0011 D3)", () => {
     emit({ t: "committed", txId: "tx-1", seq: "101" }, 0)
     emit({ t: "page", fetchId: "f-1", rows: [{ id: "x" }], seq: "101" }, 0)
     await expect(mut).resolves.toEqual({ result: undefined })
-    await expect(page).resolves.toEqual([{ id: "x" }])
+    // A page is a snapshot, not an outcome: the fresh socket's replay may have
+    // deleted a row it carries, so it fails its fetch (ADR-0023 D8).
+    await expect(page).rejects.toThrow(/abandoned socket/)
     // ...but never the cursor; and its stream frames are dropped outright.
     expect(t.appliedCursor).toBe("50")
     emit({ t: "uptodate", seq: "102" }, 0)

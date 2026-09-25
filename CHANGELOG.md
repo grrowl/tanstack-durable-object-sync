@@ -51,9 +51,10 @@ While pre-1.0, the public API may change between 0.x releases.
 - The transport ignores STREAM frames from an abandoned socket
   (identity-guarded message dispatch): only the current socket speaks for the
   stream; dropped frames are re-covered by the resubscribe catch-up from the
-  applied cursor. ID-scoped receipts (`committed`/`rejected`/`page`) still
-  settle their waiters from a stale socket — they are not re-covered by any
-  replay — but never advance the cursor.
+  applied cursor. Mutation receipts (`committed`/`rejected`) still settle their
+  waiters from a stale socket — they are not re-covered by any replay — but
+  never advance the cursor. A `page` from a stale socket fails its fetch: the
+  fresh socket's replay may already have deleted a row it carries (ADR-0023).
 - **`WebSocketTransport.close()` is now revivable (ADR-0020).** A later
   `connect()` clears the intentional-close latch, restoring auto-reconnect and
   `onClosed` delivery on a reused transport. Previously `close()` was permanent
@@ -74,6 +75,13 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ### Fixed
 
+- **A subscription that drops before its first snapshot now loads.** On
+  reconnect the transport resubscribed it from the shared cursor, so the Durable
+  Object answered a catch-up: its rows never arrived and its load never settled
+  (eager or on-demand, once another subscription had advanced the cursor). It
+  now restarts from a snapshot, undoing what a partial first snapshot
+  delivered. An SSR hydration catch-up interrupted the same way resumes from its
+  own dehydrated cursor.
 - `#send` no longer throws an uncaught `Can't call send() after close()` when a
   client subscribes then closes before the snapshot finishes streaming (normal
   churn: dispose, navigate-away, StrictMode teardown, forced reconnect). The

@@ -37,6 +37,10 @@ export interface SubHandler {
    *  boundary, which can precede its own catch-up frames. */
   onUptodate(ownTerminal?: boolean): void
   onReset(): void
+  /** The transport re-sent this subscription from scratch after a drop: it had
+   *  not reached its first terminal, so it resubscribes without `since` and the
+   *  snapshot that follows replaces whatever part of the first one arrived. */
+  onRestart?(): void
 }
 
 /** The transport surface `doCollectionOptions` consumes — structural, so the
@@ -239,9 +243,22 @@ export class WebSocketTransport<Api = unknown> {
    *  whenever no dial is parked on `await open()`. */
   private openAbort: AbortController | null = null
 
+  /** `bootstrapped`: the sub reached its first terminal (`snap-end`, or its own
+   *  catch-up `uptodate`). Only a bootstrapped sub may resume from the shared
+   *  cursor: the cursor says nothing about rows a sub never received — other
+   *  subs may have advanced it. Until then a sub given an explicit `since`
+   *  (SSR hydration) resumes from THAT, and any other restarts from a snapshot. */
   private readonly handlers = new Map<
     string,
-    { handler: SubHandler; collection: string; where?: unknown; orderBy?: unknown; limit?: number }
+    {
+      handler: SubHandler
+      collection: string
+      where?: unknown
+      orderBy?: unknown
+      limit?: number
+      since?: string
+      bootstrapped: boolean
+    }
   >()
   private appliedSeq = 0n
   private readonly seqWaiters: Array<SeqWaiter> = []
@@ -422,11 +439,13 @@ export class WebSocketTransport<Api = unknown> {
         // cursor on them, would claim positions the fresh socket's replay is
         // about to own (ADR-0011 D3). Dropped stream frames are re-covered by
         // the resubscribe catch-up from the applied cursor, idempotently.
-        // ID-scoped receipts (`committed`/`rejected`/`page`) are NOT
-        // re-covered by any replay, so a stale socket may still settle those
-        // waiters — it just never advances the cursor (codex review: a
-        // committed mutation must not be reported as timed out because a late
-        // hydration chunk forced a reconnect first).
+        // Mutation receipts (`committed`/`rejected`) are NOT re-covered by any
+        // replay, so a stale socket may still settle those waiters — it just
+        // never advances the cursor (codex review: a committed mutation must not
+        // be reported as timed out because a late hydration chunk forced a
+        // reconnect first). A `page` is a snapshot, not an outcome: the fresh
+        // socket's replay may already have deleted a row it carries, so a stale
+        // page FAILS its fetch rather than resurrect that row (ADR-0023).
         this.onMessage(ev.data, this.ws !== ws)
       })
       ws.addEventListener("close", (ev) => {
@@ -525,10 +544,24 @@ export class WebSocketTransport<Api = unknown> {
     }
   }
 
-  /** Re-send a `sub` for every registered subscription, carrying `since`. */
+  /** Re-send a `sub` for every registered subscription. A bootstrapped sub
+   *  carries `since` (catch-up from the cursor). One that never reached its
+   *  first terminal must not: the shared cursor may have been advanced by other
+   *  subs, and a catch-up from it would skip changes it never received — its
+   *  load would never settle. An explicit catch-up resumes from its own `since`
+   *  (replaying a catch-up is idempotent); any other restarts from a snapshot. */
   private resubscribeAll(): void {
-    const since = this.appliedCursor
+    const cursor = this.appliedCursor
     for (const [subId, entry] of this.handlers) {
+      if (!entry.bootstrapped && entry.since === undefined) entry.handler.onRestart?.()
+      // A late hydration chunk may have REGRESSED the cursor below a pending
+      // catch-up's own `since` (seedCursor): then the lower one is the resume
+      // point, so the replay re-covers the clobbered window.
+      const since = entry.bootstrapped
+        ? cursor
+        : entry.since !== undefined && this.appliedSeq > 0n && this.appliedSeq < BigInt(entry.since)
+          ? cursor
+          : entry.since
       this.sendFrame({
         t: "sub",
         subId,
@@ -636,7 +669,7 @@ export class WebSocketTransport<Api = unknown> {
      *  (ADR-0011 D3). One-shot: reconnects resume from `appliedCursor`. */
     since?: string,
   ): Promise<void> {
-    this.handlers.set(subId, { handler, collection, where, orderBy, limit })
+    this.handlers.set(subId, { handler, collection, where, orderBy, limit, since, bootstrapped: false })
     await this.connect()
     // Unsubscribed while the connect was in flight (its `unsub` had no socket
     // to ride): sending now would register a ghost subscription the server
@@ -796,11 +829,14 @@ export class WebSocketTransport<Api = unknown> {
         if (stale) return
         this.handlers.get(frame.sub)?.handler.onSnap(frame.key, frame.row)
         return
-      case "snap-end":
+      case "snap-end": {
         if (stale) return
-        this.handlers.get(frame.sub)?.handler.onSnapEnd()
+        const entry = this.handlers.get(frame.sub)
+        if (entry) entry.bootstrapped = true
+        entry?.handler.onSnapEnd()
         this.advance(frame.seq)
         return
+      }
       case "d":
         if (stale) return
         this.handlers.get(frame.sub)?.handler.onDelta(frame.op, frame.key, frame.cols)
@@ -809,8 +845,11 @@ export class WebSocketTransport<Api = unknown> {
         if (stale) return
         // A sub-scoped terminal (a catch-up's) goes to its handler alone; a
         // broadcast boundary (coalescer tick / barrier flush) goes to all.
-        if (frame.sub) this.handlers.get(frame.sub)?.handler.onUptodate(true)
-        else for (const { handler } of this.handlers.values()) handler.onUptodate(false)
+        if (frame.sub) {
+          const entry = this.handlers.get(frame.sub)
+          if (entry) entry.bootstrapped = true
+          entry?.handler.onUptodate(true)
+        } else for (const { handler } of this.handlers.values()) handler.onUptodate(false)
         this.advance(frame.seq)
         return
       case "committed": {
@@ -837,7 +876,8 @@ export class WebSocketTransport<Api = unknown> {
         if (w) {
           clearTimeout(w.timer)
           this.pendingFetches.delete(frame.fetchId)
-          w.resolve(frame.rows)
+          if (stale) w.reject(new Error(`fetch page from an abandoned socket: ${frame.fetchId}`))
+          else w.resolve(frame.rows)
         }
         return
       }
