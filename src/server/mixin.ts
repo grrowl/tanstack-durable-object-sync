@@ -713,6 +713,14 @@ export function Syncable<Env = unknown, TUser = unknown>() {
         const seen = lookupTx(this.#sql, f.txId)
         if (seen) return this.#replayReceipt(ws, f.txId, seen)
 
+        // An op key is the row's client-supplied TEXT pk; `""` is never a real
+        // identity. Reject with a reply, not a shape-guard drop, so the client
+        // rolls back at once instead of timing out (ADR-0025). After the dedup
+        // lookup, so a resent txId still gets its stored outcome.
+        if (f.ops.some((op) => op.key === "")) {
+          return this.#rejectTx(ws, f.txId, "mutation op key must be a non-empty string", "VALIDATION")
+        }
+
         const user = this.#userFor(ws)
 
         // Authorize every op BEFORE the transaction (may be async).

@@ -124,6 +124,12 @@ While pre-1.0, the public API may change between 0.x releases.
 - Shipped source maps now resolve: the package includes `src/`, which every
   `.js.map`/`.d.ts.map` references, so go-to-definition lands on the source
   instead of a missing file.
+- **A `mut` op with an empty key (`""`) is now rejected (ADR-0025).** The pk is
+  client-supplied TEXT, so `""` is never a real row identity. ADR-0014 said the
+  wire layer already refused it, but it did not. The server now answers with
+  `rejected` (`code: "VALIDATION"`) before authorize or any row write, so the client
+  gets a prompt `MutationRejectedError` and rolls back. **Behaviour change:** a
+  write that used `""` as a pk used to be accepted and is now refused.
 
 ### Internal
 
