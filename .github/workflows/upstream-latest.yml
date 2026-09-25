@@ -1,0 +1,47 @@
+name: Upstream latest
+
+# The safety net for the uncapped peer range (ADR-0022): run everything against
+# whatever `@tanstack/db@latest` is today. PR CI never floats; this does.
+# Red means upstream broke us — fix it or record the incompatibility in an ADR.
+# Green on a newer release means the locked devDependency can move up.
+
+on:
+  schedule:
+    - cron: "23 4 * * 1" # weekly, Monday 04:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  latest:
+    name: typecheck · test · build · pack smoke (@tanstack/db latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install @tanstack/db@latest
+        run: |
+          npm install --no-save --no-audit --no-fund "@tanstack/db@latest"
+          echo "@tanstack/db $(node -p 'require("./node_modules/@tanstack/db/package.json").version')" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Pack smoke
+        run: node scripts/pack-smoke.mjs --db latest

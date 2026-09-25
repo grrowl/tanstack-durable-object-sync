@@ -4,7 +4,8 @@
 [#1564](https://github.com/TanStack/db/pull/1564), lifted onto the PR **as
 merged** in `@tanstack/db` 0.8.0; see *Amendments* below). Generalizes
 ADR-0002 C1's flush-before-`committed` barrier to *all* cursor-advancing
-emissions (C1′ below).
+emissions (C1′ below). **D5's peer-range floor is superseded by
+[ADR-0022](./0022-db-version-support-policy.md)** (0.8.5 → 0.8.6).
 
 ## Context
 

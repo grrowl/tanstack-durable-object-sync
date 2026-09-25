@@ -1,0 +1,12 @@
+{
+  "name": "tddc-pack-smoke",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-03-10",
+  "durable_objects": {
+    "bindings": [
+      { "name": "SESSION", "class_name": "SessionDO" },
+      { "name": "MIXED", "class_name": "MixedDO" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SessionDO", "MixedDO"] }]
+}

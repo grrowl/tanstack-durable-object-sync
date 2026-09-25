@@ -1,0 +1,15 @@
+{
+  // The Worker program: workers types, no DOM. skipLibCheck is OFF so our
+  // shipped .d.ts files are type-checked against the installed @tanstack/db.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2023"],
+    "types": ["@cloudflare/workers-types"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": false
+  },
+  "files": ["src/worker.ts", "src/client.ts"]
+}

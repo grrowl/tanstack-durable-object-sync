@@ -41,10 +41,13 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ### Changed
 
-- **Peer dependency: `@tanstack/db >= 0.8.5`** (was `>= 0.6.0`) — the SSR
+- **Peer dependency: `@tanstack/db >= 0.8.6`** (was `>= 0.6.0`) — the SSR
   hooks shipped in 0.8.0; 0.8.5 carries the `commit()`-receipt contract and
-  descriptor reuse this adapter adopts. The 0.6-era API is otherwise
-  unchanged: the full pre-lift suite passes on 0.8.5 without modification.
+  descriptor reuse this adapter adopts; 0.8.6 is the first release whose
+  module evaluation is Worker-safe (0.8.5 calls `crypto.getRandomValues()` at
+  module scope, so a Worker rendering SSR fails to start). The range stays
+  uncapped (ADR-0022). The 0.6-era API is otherwise unchanged: the full
+  pre-lift suite passed on 0.8.5 without modification.
 - The transport ignores STREAM frames from an abandoned socket
   (identity-guarded message dispatch): only the current socket speaks for the
   stream; dropped frames are re-covered by the resubscribe catch-up from the
@@ -118,6 +121,22 @@ While pre-1.0, the public API may change between 0.x releases.
   query loads every matching row; the static `where` filter is eager-mode only;
   `HydrationBoundary` needs a `DbProvider`; and the mixin also adds the public
   `readSyncSnapshot`.
+- Shipped source maps now resolve: the package includes `src/`, which every
+  `.js.map`/`.d.ts.map` references, so go-to-definition lands on the source
+  instead of a missing file.
+
+### Internal
+
+- CI tests both ends of the `@tanstack/db` peer range (ADR-0022): a `locked`
+  leg (the lockfile's version; the devDependency moves to `^0.9.2`) and a
+  `floor` leg that installs the version derived from `peerDependencies`.
+- A pack smoke test (`npm run smoke:pack`, run in CI) installs the packed
+  tarball into a throwaway consumer at the floor and locked versions, checks
+  the tarball ships everything its manifest and source maps reference,
+  type-checks the shipped declarations with `skipLibCheck` off, and boots a
+  consumer Worker in workerd that renders SSR from a Durable Object.
+- A weekly (and manually dispatchable) workflow runs the suite and the pack
+  smoke test against `@tanstack/db@latest`.
 
 ## [0.6.0] — 2026-07-27
 
