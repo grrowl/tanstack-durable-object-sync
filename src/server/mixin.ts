@@ -192,6 +192,9 @@ export function Syncable<Env = unknown, TUser = unknown>() {
       #writesSinceCompaction = 0
       readonly #broadcaster: Broadcaster
       readonly #liveWs = new Set<WebSocket>()
+      /** txIds whose mut/call handler is running now, each mapped to a promise that
+       *  settles when that attempt ends (ADR-0025, in-flight duplicates). */
+      readonly #inflight = new Map<string, Promise<void>>()
       readonly #api: SyncApi<Env, TUser>
 
       constructor(...args: any[]) {
@@ -705,10 +708,11 @@ export function Syncable<Env = unknown, TUser = unknown>() {
        */
       async #handleMut(ws: WebSocket, f: Extract<ClientFrame, { t: "mut" }>): Promise<void> {
         // Dedup first: a resent txId gets its stored outcome, never a fresh
-        // rejection from a check below (ADR-0025).
-        const seen = lookupTx(this.#sql, f.txId)
-        if (seen) return this.#replayReceipt(ws, f.txId, seen)
+        // rejection from a check in #applyMut (ADR-0025).
+        return this.#oncePerTx(ws, f.txId, () => this.#applyMut(ws, f))
+      }
 
+      async #applyMut(ws: WebSocket, f: Extract<ClientFrame, { t: "mut" }>): Promise<void> {
         // Inbound limit: reject over-length batches without applying anything
         // (ADR-0012). Reject-don't-truncate: a partial apply silently drops writes.
         if (f.ops.length > this.maxOpsPerMutation) {
@@ -798,8 +802,10 @@ export function Syncable<Env = unknown, TUser = unknown>() {
 
       /** Run a named command (outside any transaction) and confirm with its result. */
       async #handleCall(ws: WebSocket, f: Extract<ClientFrame, { t: "call" }>): Promise<void> {
-        const seen = lookupTx(this.#sql, f.txId)
-        if (seen) return this.#replayReceipt(ws, f.txId, seen)
+        return this.#oncePerTx(ws, f.txId, () => this.#applyCall(ws, f))
+      }
+
+      async #applyCall(ws: WebSocket, f: Extract<ClientFrame, { t: "call" }>): Promise<void> {
 
         const def = this.#registry.commands.get(f.name)
         if (!def) return this.#rejectTx(ws, f.txId, `unknown command '${f.name}'`, "UNKNOWN_COMMAND")
@@ -842,6 +848,29 @@ export function Syncable<Env = unknown, TUser = unknown>() {
         this.#send(ws, { t: "committed", txId: f.txId, seq: commitSeq, result })
       }
 
+      /** At most one attempt per txId at a time (ADR-0025). A recorded txId replays
+       *  its receipt. A txId whose attempt is still running (its authorize or a
+       *  command's execute awaits, and the input gate lets this frame in) waits
+       *  for that attempt, then checks again, so it replays the outcome rather
+       *  than running a second time. Otherwise reserve the txId and run. */
+      async #oncePerTx(ws: WebSocket, txId: string, run: () => Promise<void>): Promise<void> {
+        for (;;) {
+          const seen = lookupTx(this.#sql, txId)
+          if (seen) return this.#replayReceipt(ws, txId, seen)
+          const running = this.#inflight.get(txId)
+          if (!running) break
+          await running
+        }
+        let settle!: () => void
+        this.#inflight.set(txId, new Promise<void>((r) => (settle = r)))
+        try {
+          await run()
+        } finally {
+          this.#inflight.delete(txId)
+          settle()
+        }
+      }
+
       #rejectTx(ws: WebSocket, txId: string, message: string, code?: string): void {
         recordTx(this.#sql, txId, false, null, message, code ?? null, null)
         this.#send(ws, { t: "rejected", txId, error: code ? { code, message } : { message } })
@@ -849,6 +878,11 @@ export function Syncable<Env = unknown, TUser = unknown>() {
 
       #replayReceipt(ws: WebSocket, txId: string, seen: SeenTx): void {
         if (seen.ok) {
+          // `committed` advances the client's cursor: flush this socket's pending
+          // deltas first (ADR-0002 C1 / 0011 C1′). A duplicate that waited on an
+          // in-flight attempt replays right after that commit, while the commit's
+          // delta for this socket is still in the coalescer.
+          this.#broadcaster.flushOne(ws)
           this.#send(ws, { t: "committed", txId, seq: seen.cursor ?? "0", result: decodeResult(seen.result) })
         } else {
           // Shape the replay exactly like #rejectTx's original frame — with the

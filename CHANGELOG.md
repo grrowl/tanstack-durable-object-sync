@@ -137,6 +137,15 @@ While pre-1.0, the public API may change between 0.x releases.
   (ADR-0021) was pending, the replayed frame got `LIMIT_EXCEEDED` and the client
   rolled back a write that had committed. The check now runs after the lookup,
   so a resent `mut` gets its stored outcome while that receipt is retained.
+- **A `mut`/`call` replayed while the original is still running no longer runs
+  twice (ADR-0025 amendment).** `authorize`, and a command's `execute`, can
+  await I/O, and a second frame for the same `txId` could slip in and run its
+  own attempt. Under ADR-0021's hold-and-replay (the socket drops mid-authorize,
+  the client replays on reconnect), the replayed mutation failed on its own pk
+  and the client rolled back a write that had committed. A replayed command ran
+  its side effect a second time. A duplicate now waits for the running attempt
+  and replays its outcome. A replayed `committed` also flushes the socket's
+  pending deltas first, so it can't overtake a buffered delta (ADR-0002 C1).
 
 ### Internal
 
