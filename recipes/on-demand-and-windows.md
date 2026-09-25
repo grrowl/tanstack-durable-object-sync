@@ -66,13 +66,16 @@ rows, plus any rows tied at the page boundary. Scrolling loads older pages. See
 
 ## How it works
 
-Each distinct subset a query loads is one subscription on the Durable Object. A
-subscription is shared, so queries with identical subset requests use one, and
-the Durable Object releases it when the last query using it unmounts. A query
-with a limit gets a bounded first snapshot. Each scroll fetch is a one-off read,
-not a subscription, and returns the next bounded page plus every row that ties
-with the boundary value. A query with no limit loads every row that matches its
-filter. The client applies ordering and limits over the rows it has loaded.
+Each subset request loads exactly the rows it asks for. Queries with identical
+subset requests share one load. When a subscription on the Durable Object already
+keeps a request's rows current, for example the same filter with a different
+order or limit, the request is a one-off read. Any other request opens its own
+subscription, with a bounded first snapshot when it has a limit. The Durable
+Object releases a subscription when the last query using it is released, and the
+rows only it kept current leave the collection. Each scroll fetch is a one-off
+read, not a subscription, and returns the next bounded page plus every row that
+ties with the boundary value. A query with no limit loads every row that matches
+its filter. The client applies ordering and limits over the rows it has loaded.
 
 ## Notes
 
@@ -84,6 +87,15 @@ filter. The client applies ordering and limits over the rows it has loaded.
   that moves into the window is added and is not removed later. Keeping the
   loaded set as small as the window is a known limitation, and `examples/board`
   shows the gap as a live number.
+- A released query's rows leave the collection unless another loaded query still
+  holds them. A query is released after it unmounts and its `gcTime` passes. A row
+  with a pending optimistic write stays visible until the write settles.
+- With `@tanstack/db` 0.9, the first time a row in a window is deleted or moves
+  in the order (for example a vote that bumps `updated_at`), the query loads every
+  row that matches its filter once, then pages from local rows. A query whose order
+  0.9 can't express as a cursor, such as a string order with the default locale
+  comparison, does the same when it first loads. This is upstream behaviour, and
+  the Durable Object answers the request in full.
 - Eager mode with a static `where` also filters, but it loads every matching row
   up front. Use on-demand when even the filtered set is too large to load at
   once.
@@ -92,4 +104,5 @@ filter. The client applies ordering and limits over the rows it has loaded.
 
 - `examples/on-demand` loads one category subset at a time.
 - `examples/board` is a windowed list over thousands of rows.
-- ADR-0002 and ADR-0005 cover the subset and page-fetch design.
+- ADR-0002 and ADR-0005 cover the subset and page-fetch design; ADR-0023 covers
+  how subset requests, subscriptions and released rows fit together.
