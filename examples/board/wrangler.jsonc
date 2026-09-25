@@ -1,6 +1,12 @@
 {
   "name": "tanstack-do-db-board",
   "main": "src/worker.ts",
+  // The adapter is imported from ../../src, so its `@tanstack/db` import would
+  // resolve from the REPO ROOT's node_modules, not this example's (ADR-0024).
+  // Pin it here. The target is db's ESM entry FILE: wrangler resolves an alias
+  // with require.resolve, and the bare package name picks the CJS build and
+  // drops tree-shaking. If db moves that file, the build fails loudly.
+  "alias": { "@tanstack/db": "./node_modules/@tanstack/db/dist/esm/index.js" },
   "compatibility_date": "2026-03-10",
   "compatibility_flags": ["nodejs_compat"],
   "durable_objects": {

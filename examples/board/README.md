@@ -15,14 +15,16 @@ real cursor `loadSubset`.
 ## Run
 
 ```sh
+npm install --prefix ../..   # the repo root: the adapter is imported from ../../src
 npm install
-npm run dev            # builds the client, then `wrangler dev`
+npm run dev                  # builds the client, then `wrangler dev`
 ```
 
 Open http://localhost:8787 — the first load auto-seeds 5,000 tasks. Then:
 
-- **Bounded load.** On join, `loaded ≈ 51` (one peek-ahead row) even though
-  `total` is 5,000 — the whole board is *not* synced.
+- **Bounded load.** On join, `loaded` is only a little above `window` (the
+  first page plus a peek-ahead) even though `total` is 5,000 — the whole board
+  is *not* synced.
 - **Scroll-back.** Scroll the list (or "load older") to page older tasks via the
   cursor; `window` and `loaded` grow a page at a time.
 - **Bump / move-in.** ▲ or ★ a task — it jumps to the top. Open a second tab and

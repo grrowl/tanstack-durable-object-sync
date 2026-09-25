@@ -3,14 +3,18 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build:client": "esbuild src/client.tsx --bundle --outfile=public/client.js --format=esm --jsx=automatic",
-    "watch:client": "esbuild src/client.tsx --bundle --outfile=public/client.js --format=esm --jsx=automatic --watch",
-    "dev": "npm run build:client && wrangler dev"
+    "build:client": "esbuild src/client.tsx --bundle --outfile=public/client.js --format=esm --jsx=automatic --alias:@tanstack/db=@tanstack/db",
+    "watch:client": "esbuild src/client.tsx --bundle --outfile=public/client.js --format=esm --jsx=automatic --alias:@tanstack/db=@tanstack/db --watch",
+    "build": "rm -rf dist && npm run build:client -- --metafile=dist/client.meta.json && wrangler deploy --dry-run --outdir dist/worker --metafile",
+    "typecheck": "tsc --noEmit",
+    "check:single-copy": "node ../check-single-copy.mjs . dist/client.meta.json dist/worker/bundle-meta.json",
+    "dev": "npm run build:client && wrangler dev",
+    "smoke": "node ../smoke-boot.mjs 8787 \"wrangler dev --port 8787 --ip 127.0.0.1\" \"GET / >>client.js\" \"GET /count?room=smoke\" \"WS /sync?room=smoke\""
   },
   "dependencies": {
     "@msgpack/msgpack": "^3.0.0",
-    "@tanstack/db": "0.6.5",
-    "@tanstack/react-db": "0.1.83",
+    "@tanstack/db": "0.9.2",
+    "@tanstack/react-db": "0.4.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "ulid": "^2.3.0"

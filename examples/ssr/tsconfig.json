@@ -9,7 +9,10 @@
     "skipLibCheck": true,
     "allowImportingTsExtensions": true,
     "noEmit": true,
-    "types": ["@cloudflare/workers-types", "vite/client"]
+    "types": ["@cloudflare/workers-types", "vite/client"],
+    // The file: dependency's .d.ts files import `@tanstack/db` from the REPO
+    // ROOT's node_modules; type them against this example's copy (ADR-0024).
+    "paths": { "@tanstack/db": ["./node_modules/@tanstack/db"] }
   },
   "include": ["src/**/*", "vite.config.ts"]
 }
