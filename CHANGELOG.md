@@ -108,6 +108,16 @@ While pre-1.0, the public API may change between 0.x releases.
   answer within `timeoutMs` of the drop, the mutation settles promptly with the
   new typed `ConnectionLostError` instead of the generic timeout. Timeout
   semantics for a socket that stays open are unchanged.
+- **Docs audit against `@tanstack/db` 0.9 / `@tanstack/react-db` 0.4.** Every
+  README and recipe snippet now typechecks. The zod recipe imported `defineSync`
+  from `tanstack-durable-object-sync/server`, a subpath the package does not
+  export; it now imports from the package root. Corrected claims: an `authorize`
+  throw surfaces its reason without the `VALIDATION` code (only schema failures
+  carry it); without a range index an on-demand window can't page lazily;
+  on-demand pages can include every row tied at the boundary, and an unlimited
+  query loads every matching row; the static `where` filter is eager-mode only;
+  `HydrationBoundary` needs a `DbProvider`; and the mixin also adds the public
+  `readSyncSnapshot`.
 
 ## [0.6.0] — 2026-07-27
 

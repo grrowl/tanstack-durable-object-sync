@@ -27,8 +27,10 @@ class FeedAgent extends Syncable<Env, Claims>()(Agent<Env, State>) {
 ```
 
 The whole sync API lives behind one facade, `this.sync` (`registerSync`,
-`runSyncedWrite`, `parseAttachment`, `configure`), so the only names the mixin
-adds to your class are `sync` and the four WebSocket/`fetch` handlers. Sync
+`runSyncedWrite`, `drainAndBroadcast`, `parseAttachment`, `configure`,
+`registry`), so the only public names the mixin adds to your class are `sync`,
+`readSyncSnapshot` (the SSR read, public so that DO RPC can reach it), and the
+four WebSocket/`fetch` handlers. Sync
 sockets carry a reserved hibernation tag and a plain attachment, and the mixin
 claims only the `/_sync` path (configurable). Everything else is delegated to
 your host base, so the two protocols never cross. No framework is added to this

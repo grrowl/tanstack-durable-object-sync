@@ -13,7 +13,7 @@ its filter. In the second, a bounded list grows as the user scrolls.
 Create the collection in on-demand mode. Each live query then loads its rows when
 it mounts and releases them when it unmounts.
 
-```ts
+```tsx
 const items = createCollection(
   doCollectionOptions<ItemsApi, "items">({
     transport,
@@ -38,10 +38,10 @@ app.
 ## Grow a window as you scroll
 
 For a long ordered list, use `useLiveInfiniteQuery`. It keeps a bounded window
-and loads the next page when you call `fetchNextPage`. Add a range index on the
-order column so the query can fetch one page at a time instead of loading every
-matching row. A range index is a sorted index that supports fetching rows by a
-range of values.
+and loads the next page when you call `fetchNextPage`. The order column needs a
+range index. Without one, the window can't page lazily: each time it grows, the
+query requests the whole window again from the start instead of fetching only
+the next page. A range index is a sorted index that supports fetching rows by a range of values.
 
 ```ts
 const tasks = createCollection(
@@ -61,15 +61,18 @@ const { data, fetchNextPage, hasNextPage } = useLiveInfiniteQuery(
 ```
 
 On join the client loads about one page, even when the table holds thousands of
-rows. Scrolling loads older pages. See `examples/board` for the full app.
+rows, plus any rows tied at the page boundary. Scrolling loads older pages. See
+`examples/board` for the full app.
 
 ## How it works
 
-Each distinct filter is one subscription on the Durable Object. A subscription is
-shared, so two queries with the same filter use one, and the Durable Object
-releases it when the last query using it unmounts. The Durable Object returns a
-bounded page for each request and never the whole table. The client applies
-ordering and limits over the rows it has loaded.
+Each distinct subset a query loads is one subscription on the Durable Object. A
+subscription is shared, so queries with identical subset requests use one, and
+the Durable Object releases it when the last query using it unmounts. A query
+with a limit gets a bounded first snapshot. Each scroll fetch is a one-off read,
+not a subscription, and returns the next bounded page plus every row that ties
+with the boundary value. A query with no limit loads every row that matches its
+filter. The client applies ordering and limits over the rows it has loaded.
 
 ## Notes
 

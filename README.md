@@ -217,7 +217,7 @@ export default {
     // Only handle /sync/<sessionId> — the sessionId is the DO shard key.
     const match = new URL(req.url).pathname.match(/^\/sync\/(.+)$/)
     if (!match) return new Response("not found", { status: 404 })
-    const sessionId = match[1]
+    const sessionId = match[1]!
 
     // The trust boundary: authenticate here, then stamp claims the DO can trust.
     const claims = await verifyToken(req) // your auth
@@ -233,7 +233,7 @@ export default {
 
 ### 3. Use it from the browser
 
-```ts
+```tsx
 import { createCollection } from "@tanstack/db"
 import { useLiveQuery } from "@tanstack/react-db"
 import { doCollectionOptions, WebSocketTransport } from "tanstack-durable-object-sync/client"
@@ -262,7 +262,7 @@ function ChatRoom({ userId }: { userId: string }) {
 
 One `WebSocketTransport` per DO is shared by every collection on that DO
 (multiplexed over the single socket). Pass `where` to
-`doCollectionOptions` to sync only a matching subset. Commands go through the
+`doCollectionOptions` (eager mode) to sync only a matching subset. Commands go through the
 same socket: `transport.call.<name>(args)` (typed sugar) or the low-level
 `transport.sendCall("clearRoom", undefined)` — both mint the txId for you and
 resolve with the command's result on `committed`.
@@ -310,7 +310,7 @@ once `open()` resolves), but a handshake that never resolves then leaks.
 
 Built on TanStack DB's SSR support (`DbClient` `dehydrate()`/`hydrate()` and
 the `exportSyncMeta`/`importSyncMeta`/`mergeSyncMeta` sync hooks, shipped in
-`@tanstack/db` 0.8.0 — this adapter requires ≥ 0.8.5). Why/how trade-offs
+`@tanstack/db` 0.8.0). Why/how trade-offs
 live in [ADR-0011](./docs/adr/0011-ssr-dehydrate-hydrate.md).
 
 On the worker, render through a **per-request** `DbClient` backed by one
@@ -344,7 +344,7 @@ changed while the HTML was in flight — updates *and* deletes:
 
 ```ts
 const db = new DbClient()
-db.hydrate(dbState) // or <HydrationBoundary state={dbState}> from @tanstack/react-db
+db.hydrate(dbState) // or, in React: <DbProvider client={db}><HydrationBoundary state={dbState}>…</HydrationBoundary></DbProvider>
 const messages = db.collection(
   collectionOptions("messages", () =>
     doCollectionOptions<Api, "messages">({ transport: wsTransport, table: "messages", getKey: (m) => m.id }),
@@ -386,8 +386,9 @@ browser-verified.
 > [!TIP]
 > Using on-demand with `orderBy` + `limit`? Add a **range index** on the order
 > column (`collection.createIndex((r) => r.field, { indexType: BTreeIndex })`) —
-> without it the window can't page lazily and falls back to loading the whole
-> subset. See `examples/board`.
+> without it the window can't page lazily: growing it re-requests the whole
+> window from the start instead of fetching only the next page. See
+> `examples/board`.
 
 ---
 
@@ -435,8 +436,10 @@ class FeedAgent extends Syncable<Env, Claims>()(Agent<Env, State>) {
 ```
 
 The sync API lives behind one facade, `this.sync` (`registerSync`,
-`runSyncedWrite`, `parseAttachment`, `configure`), so the only names the mixin
-adds to your class are `sync` and the four WebSocket/`fetch` handlers. tddc's
+`runSyncedWrite`, `drainAndBroadcast`, `parseAttachment`, `configure`,
+`registry`), so the only public names the mixin adds to your class are `sync`,
+`readSyncSnapshot` (the SSR read — public so DO RPC can reach it), and the four
+WebSocket/`fetch` handlers. tddc's
 sockets carry a reserved tag and a plain attachment, and it claims only the
 `/_sync` path (configurable) — everything else is delegated to your host base, so
 the two protocols never cross. No framework is added to tddc's dependency graph;
