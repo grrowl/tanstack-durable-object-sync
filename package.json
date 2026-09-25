@@ -41,6 +41,7 @@
   },
   "files": [
     "dist",
+    "src",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"

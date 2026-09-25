@@ -121,6 +121,9 @@ While pre-1.0, the public API may change between 0.x releases.
   query loads every matching row; the static `where` filter is eager-mode only;
   `HydrationBoundary` needs a `DbProvider`; and the mixin also adds the public
   `readSyncSnapshot`.
+- Shipped source maps now resolve: the package includes `src/`, which every
+  `.js.map`/`.d.ts.map` references, so go-to-definition lands on the source
+  instead of a missing file.
 
 ## [0.6.0] — 2026-07-27
 
