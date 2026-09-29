@@ -1,10 +1,26 @@
 import { env, runInDurableObject, SELF } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
+import { defineSync } from "../src/server/registry.ts"
 import { createFrameCodec } from "../src/wire/frame-codec.ts"
 import type { ClientFrame, MutOp, ServerFrame } from "../src/wire/frames.ts"
 
 const codec = createFrameCodec()
 const receipt = (frame: ServerFrame): boolean => frame.t === "committed" || frame.t === "rejected"
+const sync = defineSync<unknown>()
+const slugSchema = sync.schema({
+  collections: {
+    aliases: sync.collection<{ slug: string; body: string }>({
+      pk: "slug",
+      mutations: {
+        insert: {
+          execute: ({ op, sql }) => {
+            sql.exec("INSERT INTO aliases(slug, body) VALUES (?, ?)", op.cols.slug, op.cols.body)
+          },
+        },
+      },
+    }),
+  },
+})
 
 async function openWs(room: string): Promise<WebSocket> {
   const response = await SELF.fetch(`https://example.com/sync/${room}`, { headers: { Upgrade: "websocket" } })
@@ -97,6 +113,21 @@ describe("mutation pk agrees with the op key (ADR-0025)", () => {
     expect(deltas).toEqual([])
   })
 
+  it("accepts an update that supplies the same pk", async () => {
+    const room = `pk-matching-update-${crypto.randomUUID()}`
+    const writer = await openWs(room)
+    send(writer, { t: "mut", txId: "seed", collection: "messages", ops: [{ type: "insert", key: "a", cols: { id: "a", body: "seed" } }] })
+    expect((await collectUntil(writer, receipt)).at(-1)!.t).toBe("committed")
+    writer.close()
+
+    const { result, after, deltas } = await mutWithWatcher(room, "pk-match", [
+      { type: "update", key: "a", cols: { id: "a", body: "changed" } },
+    ])
+    expect(result.t).toBe("committed")
+    expect(after.rows).toEqual([{ id: "a", body: "changed" }])
+    expect(deltas).toMatchObject([{ t: "d", key: "a" }])
+  })
+
   it("leaves an omitted insert pk to the author handler", async () => {
     const room = `pk-omitted-${crypto.randomUUID()}`
     const writer = await openWs(room)
@@ -137,6 +168,25 @@ describe("mutation pk agrees with the op key (ADR-0025)", () => {
     send(writer, { t: "mut", txId: "pk-rejected", collection: "messages", ops: [{ type: "insert", key: "a", cols: { id: "a", body: "good" } }] })
     expect((await collectUntil(writer, receipt)).at(-1)).toMatchObject({ t: "rejected", error: { code: "VALIDATION" } })
     expect((await state(room)).rows).toEqual([])
+    writer.close()
+  })
+
+  it("compares the registered collection pk, not a hard-coded id field", async () => {
+    const room = `pk-slug-${crypto.randomUUID()}`
+    const writer = await openWs(room)
+    await runInDurableObject(env.SYNC_DO.get(env.SYNC_DO.idFromName(room)), (instance, storage) => {
+      storage.storage.sql.exec("CREATE TABLE aliases(slug TEXT PRIMARY KEY, body TEXT)")
+      ;(instance as unknown as { registerSync: (schema: typeof slugSchema) => void }).registerSync(slugSchema)
+    })
+
+    send(writer, { t: "mut", txId: "pk-slug-ok", collection: "aliases", ops: [{ type: "insert", key: "a", cols: { slug: "a", id: "wrong", body: "ok" } }] })
+    expect((await collectUntil(writer, receipt)).at(-1)!.t).toBe("committed")
+    send(writer, { t: "mut", txId: "pk-slug-bad", collection: "aliases", ops: [{ type: "insert", key: "c", cols: { slug: "d", id: "c", body: "bad" } }] })
+    expect((await collectUntil(writer, receipt)).at(-1)).toMatchObject({ t: "rejected", error: { code: "VALIDATION" } })
+    const rows = await runInDurableObject(env.SYNC_DO.get(env.SYNC_DO.idFromName(room)), (_instance, storage) =>
+      Array.from(storage.storage.sql.exec("SELECT slug, body FROM aliases ORDER BY slug")),
+    )
+    expect(rows).toEqual([{ slug: "a", body: "ok" }])
     writer.close()
   })
 })
