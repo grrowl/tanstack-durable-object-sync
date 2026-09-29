@@ -15,7 +15,7 @@ describe("flushOne timer hygiene", () => {
     const sent: Array<ServerFrame> = []
     const ws = {} as WebSocket
     let tickFlushes = 0
-    const broadcaster = new Broadcaster((_ws, frame) => sent.push(frame), 20)
+    const broadcaster = new Broadcaster((_ws, frame) => sent.push(frame), () => 20)
     broadcaster.start(() => {
       tickFlushes++
       return [ws]
@@ -41,7 +41,7 @@ describe("flushOne timer hygiene", () => {
     const sent: Array<{ ws: WebSocket; frame: ServerFrame }> = []
     const first = {} as WebSocket
     const second = {} as WebSocket
-    const broadcaster = new Broadcaster((ws, frame) => sent.push({ ws, frame }), 20)
+    const broadcaster = new Broadcaster((ws, frame) => sent.push({ ws, frame }), () => 20)
     broadcaster.start(() => [first, second])
     try {
       broadcaster.enqueue(first, { subId: "s", key: "a", op: "insert", cols: { id: "a" } }, "1")
@@ -66,7 +66,7 @@ describe("flushOne timer hygiene", () => {
     const first = {} as WebSocket
     const departed = {} as WebSocket
     const live = new Set([first, departed])
-    const broadcaster = new Broadcaster(() => {}, 20)
+    const broadcaster = new Broadcaster(() => {}, () => 20)
     broadcaster.start(() => live)
     try {
       broadcaster.enqueue(first, { subId: "s", key: "a", op: "delete" }, "1")
