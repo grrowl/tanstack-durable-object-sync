@@ -189,6 +189,10 @@ export function Syncable<Env = unknown, TUser = unknown>() {
       readonly #codec: FrameCodec = createFrameCodec()
       readonly #subs = new SubscriptionRegistry()
       #writesSinceCompaction = 0
+      /** When this instance last swept expired dedup receipts. In memory on
+       *  purpose: 0 after construction or a hibernation wake, so the first receipt
+       *  then always sweeps (ADR-0009 amendment 2026-09-29). */
+      #lastDedupSweepAt = 0
       readonly #broadcaster: Broadcaster
       readonly #liveWs = new Set<WebSocket>()
       /** txIds whose mut/call handler is running now, each mapped to a promise that
@@ -855,7 +859,10 @@ export function Syncable<Env = unknown, TUser = unknown>() {
       async #oncePerTx(ws: WebSocket, txId: string, run: () => Promise<void>): Promise<void> {
         for (;;) {
           const seen = lookupTx(this.#sql, txId)
-          if (seen) return this.#replayReceipt(ws, txId, seen)
+          if (seen) {
+            this.#replayReceipt(ws, txId, seen)
+            return this.#maybeSweepDedup()
+          }
           const running = this.#inflight.get(txId)
           if (!running) break
           await running
@@ -868,6 +875,18 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           this.#inflight.delete(txId)
           settle()
         }
+        this.#maybeSweepDedup()
+      }
+
+      /** Every answered receipt may add a `_sync_seen_tx` row, so the sweep rides
+       *  receipts, after the reply, at most once per `dedupRetentionMs`. An expired
+       *  receipt lives at most one more window. Not a timer: a quiet DO sweeps
+       *  nothing and adds nothing (ADR-0009 amendment 2026-09-29). */
+      #maybeSweepDedup(): void {
+        const now = Date.now()
+        if (now - this.#lastDedupSweepAt < this.dedupRetentionMs) return
+        this.#lastDedupSweepAt = now
+        sweepDedup(this.#sql, this.dedupRetentionMs, now)
       }
 
       #rejectTx(ws: WebSocket, txId: string, message: string, code?: string): void {
@@ -971,7 +990,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
 
       /**
        * Opportunistic GC: every `compactionEvery` drained mutations, collapse the
-       * change log to latest-op-per-key and sweep expired dedup entries. Deferred
+       * change log to latest-op-per-key and prune it by age. Deferred
        * via `ctx.waitUntil` so it rides just after a burst of work — it never
        * blocks a mutation's response, and (unlike an alarm) never wakes an idle DO.
        */
@@ -982,7 +1001,6 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           (async (): Promise<void> => {
             compactChanges(this.#sql)
             pruneChanges(this.#sql, this.changelogRetentionMs, Date.now())
-            sweepDedup(this.#sql, this.dedupRetentionMs, Date.now())
             // Orphaned subscription rows (socket died without webSocketClose —
             // hard termination): hygiene rides compaction, nothing polls
             // (ADR-0019 D4). Every id-tagged socket carries SYNC_TAG, so the
