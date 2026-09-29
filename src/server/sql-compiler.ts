@@ -154,15 +154,21 @@ function orderByTerm(item: unknown): { col: string; desc: boolean; nullsLast: bo
   throw new UnsupportedPredicateError(`unsupported orderBy clause: ${JSON.stringify(item)}`)
 }
 
-function compileOrderBy(orderBy: unknown): string {
+function compileOrderBy(orderBy: unknown, pk: string): string {
   if (!Array.isArray(orderBy) || orderBy.length === 0) return ""
-  return orderBy
-    .map((item) => {
-      const { col, desc, nullsLast } = orderByTerm(item)
-      if (!IDENT.test(col)) throw new UnsupportedPredicateError(`invalid orderBy column: ${col}`)
-      return `"${col}" ${desc ? "DESC" : "ASC"} NULLS ${nullsLast ? "LAST" : "FIRST"}`
-    })
-    .join(", ")
+  if (!IDENT.test(pk)) throw new UnsupportedPredicateError(`invalid pk column: ${pk}`)
+  const terms = orderBy.map((item) => {
+    const { col, desc, nullsLast } = orderByTerm(item)
+    if (!IDENT.test(col)) throw new UnsupportedPredicateError(`invalid orderBy column: ${col}`)
+    return `"${col}" ${desc ? "DESC" : "ASC"} NULLS ${nullsLast ? "LAST" : "FIRST"}`
+  })
+  // Final tie-break by pk, ascending whatever the order direction: @tanstack/db
+  // breaks value ties by row key ascending (db-ivm `createKeyedComparator`, same in
+  // db-ivm 0.1.19 and 0.1.22), comparing strings with `<`. The pk is TEXT-affinity
+  // (ADR-0001 D9), so SQLite's BINARY collation matches. Without it a LIMIT over
+  // tied rows picks by scan order and the window differs from the client's own.
+  terms.push(`"${pk}" ASC`)
+  return terms.join(", ")
 }
 
 function nonNegInt(n: unknown, label: string): number {
@@ -173,6 +179,8 @@ function nonNegInt(n: unknown, label: string): number {
 }
 
 export interface SubsetQuery {
+  /** The collection's pk column: the final ORDER BY tie-break. */
+  pk: string
   where?: unknown
   orderBy?: unknown
   limit?: number
@@ -191,7 +199,7 @@ export function compileSubsetQuery(tbl: string, opts: SubsetQuery): { sql: strin
     params.push(...w.params)
   }
 
-  const orderBy = compileOrderBy(opts.orderBy)
+  const orderBy = compileOrderBy(opts.orderBy, opts.pk)
   if (orderBy) {
     sql += ` ORDER BY ${orderBy}`
   } else {

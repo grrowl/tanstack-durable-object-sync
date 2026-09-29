@@ -270,3 +270,20 @@ subset. At a non-NULL boundary with `nulls: "last"`, its `whereFrom` is
 `gt(v)` (`lt(v)` descending) `OR isNull OR isUndefined`, and `isNull` is
 outside the predicate floor (ADR-0013): the fetch is refused as an empty page
 and the window stops growing. Pinned as `it.fails`.
+
+## Amendment — 2026-09-29: row-key tie-break and the nulls-last cursor
+
+Two of the open items above are closed.
+
+- **Ties.** Every bounded read ends its `ORDER BY` with the collection's pk,
+  ascending whatever the direction. `@tanstack/db` breaks value ties by row key
+  ascending (`createKeyedComparator` → `compareKeys` in db-ivm; identical in
+  0.8.6's db-ivm 0.1.19 and 0.9.2's 0.1.22), comparing strings with `<`. The pk is
+  TEXT-affinity (ADR-0001 D9), so SQLite's BINARY collation gives the same order
+  (they differ only for astral versus U+E000–U+FFFF characters, as JS compares
+  UTF-16 code units). The snapshot, RPC snapshot, and fetch paths all build their
+  SQL in `compileSubsetQuery`, so one change covers them.
+  `tests/order-by-ties.test.ts` drives the sub and fetch paths.
+- **Nulls-last cursor.** `isNull` and `isUndefined` joined the predicate floor
+  (ADR-0013 amendment, same date), so 0.9.2's `gt(v) OR isNull OR isUndefined`
+  cursor compiles and the window grows.

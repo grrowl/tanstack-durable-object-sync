@@ -388,6 +388,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
         const coll = this.#registry.collections.get(req.collection)
         if (!coll) throw new Error(`readSyncSnapshot: unknown collection '${req.collection}'`)
         const query = compileSubsetQuery(req.collection, {
+          pk: coll.pk,
           where: req.where,
           orderBy: req.orderBy,
           limit: req.limit,
@@ -680,6 +681,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           // No cursor: a plain bounded `where` read.
           if (frame.cursor != null) {
             const tq = compileSubsetQuery(frame.collection, {
+              pk: coll.pk,
               where: andPredicates(frame.where, frame.cursor.whereCurrent),
               orderBy: frame.orderBy,
             })
@@ -687,6 +689,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           }
           const nextWhere = frame.cursor != null ? andPredicates(frame.where, frame.cursor.whereFrom) : frame.where
           const nq = compileSubsetQuery(frame.collection, {
+            pk: coll.pk,
             where: nextWhere,
             orderBy: frame.orderBy,
             limit: frame.limit,
@@ -1053,6 +1056,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
         let query: { sql: string; params: Array<unknown> }
         try {
           query = compileSubsetQuery(frame.collection, {
+            pk: coll.pk,
             where: frame.where,
             orderBy: frame.orderBy,
             limit: frame.limit,

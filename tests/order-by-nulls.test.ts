@@ -174,8 +174,8 @@ describe(`F4 bounded snapshot vs TanStack comparator (@tanstack/db ${version})`,
     }
   })
 
-  // bugbash F4-ties: SQLite's bounded top-k does not use TanStack's row-key tie-break.
-  it.fails("selects the same three NULL rows as TanStack when ties cross the limit", () => {
+  // bugbash F4-ties: the bounded ORDER BY ends in the pk, TanStack's row-key tie-break.
+  it("selects the same three NULL rows as TanStack when ties cross the limit", () => {
     expect(tiedSnapshot).toEqual(tiedExpected)
   })
 

@@ -81,29 +81,38 @@ describe("IR -> SQL compiler (M6)", () => {
 
   it("builds a full subset SELECT with where/orderBy/limit/offset", () => {
     const q = compileSubsetQuery("messages", {
+      pk: "id",
       where: fn("eq", ref("body"), val("x")),
       orderBy: [{ col: "created_at", dir: "desc" }],
       limit: 10,
       offset: 20,
     })
-    expect(q.sql).toBe(`SELECT * FROM "messages" WHERE "body" = ? ORDER BY "created_at" DESC NULLS FIRST LIMIT ? OFFSET ?`)
+    expect(q.sql).toBe(`SELECT * FROM "messages" WHERE "body" = ? ORDER BY "created_at" DESC NULLS FIRST, "id" ASC LIMIT ? OFFSET ?`)
     expect(q.params).toEqual(["x", 10, 20])
   })
 
   it("emits LIMIT -1 when offset is given without a limit (SQLite requirement)", () => {
-    const q = compileSubsetQuery("t", { offset: 5 })
+    const q = compileSubsetQuery("t", { pk: "id", offset: 5 })
     expect(q.sql).toBe(`SELECT * FROM "t" ORDER BY rowid LIMIT -1 OFFSET ?`)
     expect(q.params).toEqual([5])
   })
 
   it("preserves each orderBy clause's null placement", () => {
     const q = compileSubsetQuery("t", {
+      pk: "id",
       orderBy: [
         { expression: ref("body"), compareOptions: { direction: "desc", nulls: "last" } },
         { expression: ref("id"), compareOptions: { direction: "asc" } },
       ],
     })
-    expect(q.sql).toBe(`SELECT * FROM "t" ORDER BY "body" DESC NULLS LAST, "id" ASC NULLS FIRST`)
+    expect(q.sql).toBe(`SELECT * FROM "t" ORDER BY "body" DESC NULLS LAST, "id" ASC NULLS FIRST, "id" ASC`)
+  })
+
+  it("breaks value ties by pk ascending, whatever the order direction (bugbash F4-ties)", () => {
+    // @tanstack/db's createKeyedComparator: value first, then row key ascending.
+    const desc = compileSubsetQuery("t", { pk: "key", orderBy: [{ col: "body", dir: "desc" }], limit: 3 })
+    expect(desc.sql).toBe(`SELECT * FROM "t" ORDER BY "body" DESC NULLS FIRST, "key" ASC LIMIT ?`)
+    expect(() => compileSubsetQuery("t", { pk: "k; DROP", orderBy: [{ col: "body" }] })).toThrow(/pk column/)
   })
 
   it("defaults to ORDER BY rowid when the client sends no orderBy (deterministic snapshot order)", () => {
@@ -111,12 +120,12 @@ describe("IR -> SQL compiler (M6)", () => {
     // as an accident of SQLite's query plan. `rowid` is always available (D9
     // forbids an INTEGER PRIMARY KEY pk) and matches insertion order among
     // currently-live rows.
-    const q = compileSubsetQuery("t", {})
+    const q = compileSubsetQuery("t", { pk: "id" })
     expect(q.sql).toBe(`SELECT * FROM "t" ORDER BY rowid`)
   })
 
   it("rejects a negative limit/offset and an invalid orderBy column", () => {
-    expect(() => compileSubsetQuery("t", { limit: -1 })).toThrow(/non-negative/)
-    expect(() => compileSubsetQuery("t", { orderBy: [{ col: "a; DROP" }] })).toThrow(/orderBy column/)
+    expect(() => compileSubsetQuery("t", { pk: "id", limit: -1 })).toThrow(/non-negative/)
+    expect(() => compileSubsetQuery("t", { pk: "id", orderBy: [{ col: "a; DROP" }] })).toThrow(/orderBy column/)
   })
 })
