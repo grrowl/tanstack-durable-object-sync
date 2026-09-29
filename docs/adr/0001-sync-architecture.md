@@ -180,3 +180,13 @@ interleave so every milestone is end-to-end demonstrable.
 - We inherit the entire client reactive layer from TanStack DB and the
   proven single-stream discipline from Electric, while keeping full DO
   sovereignty over data.
+
+## Clarification — 2026-09-29: D17 and SQLite bigint precision
+
+D17 describes the tagged codec, not arbitrary SQLite column storage. It
+preserves `bigint` on the wire and in library-encoded TEXT (such as persisted
+predicates and dedup results); workerd `SqlStorage` cannot bind a JS `bigint`,
+and reading INTEGER values above `Number.MAX_SAFE_INTEGER` rounds them before
+the codec sees them ([workerd#4195](https://github.com/cloudflare/workerd/issues/4195),
+[issue #10](https://github.com/grrowl/tanstack-durable-object-sync/issues/10)).
+Use TEXT columns for exact large integers and convert at the application edge.

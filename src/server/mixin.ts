@@ -20,7 +20,6 @@
 // reach SQLite through `this.ctx.storage.sql`.
 
 import { DurableObject } from "cloudflare:workers"
-import type { SqlStorage, SqlStorageValue } from "@cloudflare/workers-types"
 import { createFrameCodec, type FrameCodec } from "../wire/frame-codec.ts"
 import type { ClientFrame, ServerFrame } from "../wire/frames.ts"
 import {
@@ -190,6 +189,10 @@ export function Syncable<Env = unknown, TUser = unknown>() {
       readonly #codec: FrameCodec = createFrameCodec()
       readonly #subs = new SubscriptionRegistry()
       #writesSinceCompaction = 0
+      /** When this instance last swept expired dedup receipts. In memory on
+       *  purpose: 0 after construction or a hibernation wake, so the first receipt
+       *  then always sweeps (ADR-0009 amendment 2026-09-29). */
+      #lastDedupSweepAt = 0
       readonly #broadcaster: Broadcaster
       readonly #liveWs = new Set<WebSocket>()
       /** txIds whose mut/call handler is running now, each mapped to a promise that
@@ -214,7 +217,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
         // ONLY our tagged sockets so the broadcaster never touches a host socket.
         const restore = this.#isBareDO ? this.ctx.getWebSockets() : this.ctx.getWebSockets(SYNC_TAG)
         for (const ws of restore) this.#liveWs.add(ws)
-        this.#broadcaster = new Broadcaster((ws, frame) => this.#send(ws, frame), this.tickMs)
+        this.#broadcaster = new Broadcaster((ws, frame) => this.#send(ws, frame), () => this.tickMs)
         this.#broadcaster.start(() => this.#liveWs)
         const self = this
         this.#api = {
@@ -385,6 +388,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
         const coll = this.#registry.collections.get(req.collection)
         if (!coll) throw new Error(`readSyncSnapshot: unknown collection '${req.collection}'`)
         const query = compileSubsetQuery(req.collection, {
+          pk: coll.pk,
           where: req.where,
           orderBy: req.orderBy,
           limit: req.limit,
@@ -559,6 +563,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
        *  `registerSync` (no `initSchema`, no `_sync_subs`): it can have had no
        *  subscriptions, so there is nothing durable to delete. */
       #dropSocketSubs(ws: WebSocket): void {
+        this.#broadcaster.discard(ws)
         this.#subs.removeAll(ws)
         if (this.#compiled) {
           const sid = this.#socketIdFor(ws)
@@ -652,6 +657,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
        *  — a concurrent mutation is either reflected in it or arrives as a delta
        *  AFTER it, never split across the two reads (ADR-0003). */
       #handleFetch(ws: WebSocket, frame: Extract<ClientFrame, { t: "fetch" }>): void {
+        this.#broadcaster.flushOne(ws)
         const coll = this.#registry.collections.get(frame.collection)
         if (!coll) {
           this.#send(ws, { t: "page", fetchId: frame.fetchId, rows: [], seq: "0" })
@@ -675,6 +681,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           // No cursor: a plain bounded `where` read.
           if (frame.cursor != null) {
             const tq = compileSubsetQuery(frame.collection, {
+              pk: coll.pk,
               where: andPredicates(frame.where, frame.cursor.whereCurrent),
               orderBy: frame.orderBy,
             })
@@ -682,6 +689,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           }
           const nextWhere = frame.cursor != null ? andPredicates(frame.where, frame.cursor.whereFrom) : frame.where
           const nq = compileSubsetQuery(frame.collection, {
+            pk: coll.pk,
             where: nextWhere,
             orderBy: frame.orderBy,
             limit: frame.limit,
@@ -725,6 +733,16 @@ export function Syncable<Env = unknown, TUser = unknown>() {
         // lookup, so a resent txId still gets its stored outcome.
         if (f.ops.some((op) => op.key === "")) {
           return this.#rejectTx(ws, f.txId, "mutation op key must be a non-empty string", "VALIDATION")
+        }
+
+        // A supplied pk must be the optimistic key, never a different row's
+        // identity. Check before author handlers; do not rewrite cols (ADR-0025).
+        const collection = this.#registry.collections.get(f.collection)
+        if (collection && f.ops.some((op) =>
+          (op.type === "insert" || op.type === "update") &&
+          op.cols != null && Object.hasOwn(op.cols, collection.pk) && op.cols[collection.pk] !== op.key
+        )) {
+          return this.#rejectTx(ws, f.txId, "mutation cols primary key must match op key", "VALIDATION")
         }
 
         const user = this.#userFor(ws)
@@ -856,7 +874,10 @@ export function Syncable<Env = unknown, TUser = unknown>() {
       async #oncePerTx(ws: WebSocket, txId: string, run: () => Promise<void>): Promise<void> {
         for (;;) {
           const seen = lookupTx(this.#sql, txId)
-          if (seen) return this.#replayReceipt(ws, txId, seen)
+          if (seen) {
+            this.#replayReceipt(ws, txId, seen)
+            return this.#maybeSweepDedup()
+          }
           const running = this.#inflight.get(txId)
           if (!running) break
           await running
@@ -869,6 +890,18 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           this.#inflight.delete(txId)
           settle()
         }
+        this.#maybeSweepDedup()
+      }
+
+      /** Every answered receipt may add a `_sync_seen_tx` row, so the sweep rides
+       *  receipts, after the reply, at most once per `dedupRetentionMs`. An expired
+       *  receipt lives at most one more window. Not a timer: a quiet DO sweeps
+       *  nothing and adds nothing (ADR-0009 amendment 2026-09-29). */
+      #maybeSweepDedup(): void {
+        const now = Date.now()
+        if (now - this.#lastDedupSweepAt < this.dedupRetentionMs) return
+        this.#lastDedupSweepAt = now
+        sweepDedup(this.#sql, this.dedupRetentionMs, now)
       }
 
       #rejectTx(ws: WebSocket, txId: string, message: string, code?: string): void {
@@ -972,7 +1005,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
 
       /**
        * Opportunistic GC: every `compactionEvery` drained mutations, collapse the
-       * change log to latest-op-per-key and sweep expired dedup entries. Deferred
+       * change log to latest-op-per-key and prune it by age. Deferred
        * via `ctx.waitUntil` so it rides just after a burst of work — it never
        * blocks a mutation's response, and (unlike an alarm) never wakes an idle DO.
        */
@@ -983,7 +1016,6 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           (async (): Promise<void> => {
             compactChanges(this.#sql)
             pruneChanges(this.#sql, this.changelogRetentionMs, Date.now())
-            sweepDedup(this.#sql, this.dedupRetentionMs, Date.now())
             // Orphaned subscription rows (socket died without webSocketClose —
             // hard termination): hygiene rides compaction, nothing polls
             // (ADR-0019 D4). Every id-tagged socket carries SYNC_TAG, so the
@@ -1024,6 +1056,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
         let query: { sql: string; params: Array<unknown> }
         try {
           query = compileSubsetQuery(frame.collection, {
+            pk: coll.pk,
             where: frame.where,
             orderBy: frame.orderBy,
             limit: frame.limit,

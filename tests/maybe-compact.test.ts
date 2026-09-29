@@ -5,7 +5,8 @@ import type { ClientFrame, ServerFrame } from "../src/wire/frames.ts"
 
 // WHY: maybeCompact is the opportunistic housekeeping path — it fires only every
 // `compactionEvery` drained mutations and runs compaction + retention prune +
-// dedup sweep under `ctx.waitUntil`. It was previously covered only by calling
+// orphan-sub sweep under `ctx.waitUntil` (the dedup sweep rides receipts
+// instead; see dedup-sweep.test.ts). It was previously covered only by calling
 // the underlying functions directly; the WIRING (does the threshold gate it?
 // does it actually run compaction and the ADR-0009 prune?) was untested. These
 // drive the real WS dispatch → drain → maybeCompact → waitUntil path on a DO

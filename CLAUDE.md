@@ -83,9 +83,14 @@ Each is load-bearing and guarded by an ADR — read it before you touch the area
 - **One decision → one ADR.** Conventional commits (`!` = breaking); end with the
   Co-Authored-By trailer. Commit/push only when asked; `main` is the release
   branch.
-- **Run plans and risky changes past codex (`gpt-5.6-sol`) as an adversary**
-  before committing — it has caught real bugs here (the cursor-fetch race, the
+- **Run plans and risky changes past codex as an adversary** before
+  committing — it has caught real bugs here (the cursor-fetch race, the
   scroll-back `DuplicateKeySyncError`). Use the strongest available model; a
-  weaker adversary is a weaker review. Pipe input in (`git diff | codex exec
-  … -`) or close stdin (`codex exec "…" < /dev/null`) — an open stdin hangs
-  codex forever.
+  weaker adversary is a weaker review. Run it as a bb subthread in your own
+  environment, not `codex exec`:
+  `bb thread spawn --project "$BB_PROJECT_ID" --parent-self --environment
+  "$BB_ENVIRONMENT_ID" --provider codex --model gpt-6-sol --reasoning-level
+  high --title "adversarial review: …" --prompt-file <file>`. The prompt
+  names the diff (`git diff --no-ext-diff <base>...HEAD`), says read-only (no
+  edits, no commits), and asks for findings via `bb thread tell
+  "$BB_THREAD_ID"`.

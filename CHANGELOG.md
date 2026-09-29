@@ -8,6 +8,79 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING (raw clients only):** the server rejects an insert or update
+  whose `cols` carry the primary key with a value different from the op
+  `key`, answering with a `VALIDATION` rejection before `authorize` runs.
+  Before, such a row was stored under the `cols` pk, so its optimistic row
+  never reconciled (ADR-0001 D9). The collection client always sends
+  matching keys and is unaffected. An insert that omits the pk from `cols`
+  is still accepted (ADR-0025 amendment).
+
+### Fixed
+
+- **A subclass `tickMs` override now takes effect.** The coalescer read the
+  tick before subclass fields were set, so it always used 50 ms (ADR-0015
+  amendment).
+- **No empty ticks after a flush, close or error.** Flushing the last socket
+  with pending deltas, or closing or erroring a socket, now cancels the flush
+  timer when nothing else is pending, so the DO can hibernate sooner.
+- **Expired dedup receipts are swept on every answered `mut` or `call`**,
+  including rejections, replays and commands that write nothing. The sweep
+  runs at most once per `dedupRetentionMs`, and always on the first receipt
+  after a wake. Before, it ran only with compaction after drained writes, so
+  a DO that only rejected or ran write-free commands grew `_sync_seen_tx`
+  without bound (ADR-0009 amendment).
+- **Bounded on-demand snapshots place NULLs as TanStack does.** The server's
+  `ORDER BY` now emits `NULLS FIRST` or `NULLS LAST` from each clause's
+  `nulls` (default first), so a descending window over a nullable column no
+  longer drops its NULL rows. Locale collation is still pinned as an expected
+  failure (ADR-0023 amendment).
+- **Bounded reads break ties by pk, ascending**, matching TanStack's row-key
+  tie-break, so a `limit` over tied rows picks the same rows on the server and
+  the client (ADR-0023 amendment).
+- **`isNull` and `isUndefined` join the predicate floor**, so a
+  `nulls: "last"` window on `@tanstack/db` 0.9 can page past its first page.
+  Before, its cursor fetch was refused and read as empty (ADR-0013 amendment).
+- **Dedup retention is a true lower bound.** Receipts are stamped in whole
+  seconds, so the sweep could remove one up to 999 ms early.
+- **A fetch page no longer overtakes a buffered delta.** The server flushes
+  the socket's pending deltas before it reads a page, the same as it does
+  for snapshots (ADR-0023 amendment).
+- **Server type declarations no longer need `@cloudflare/workers-types`.**
+  The shipped `.d.ts` files use the ambient Worker SQL types, so a Worker
+  typed with `wrangler types` and `skipLibCheck: false` no longer fails with
+  TS2307. The pack smoke test now checks both type setups (ADR-0022
+  amendment).
+
+### Tests
+
+- Known bugs are now pinned as expected failures (`it.fails`, tagged
+  `bugbash <ID>`), so each fix flips its tests:
+  - The single client cursor skips changes when the socket drops during a
+    resubscribe round (F1): 30 reconnect-under-drop scenarios, 16 of them red.
+  - Known limitations L1 (no incarnation epoch, ADR-0011) and L2 (mid-tick
+    eviction, ADR-0009).
+  - Refusals read as empty results (F5): 14 wire and app scenarios.
+  - Dedup is scoped by txId alone (L3, ADR-0012 D4).
+- Full-row live deltas for narrow and no-op updates (#28) are pinned as
+  current behaviour.
+- Real-path on-demand scenarios pin the ADR-0023 fixes that were only covered
+  by fake transports: unload mid-snapshot, a below-floor reset across several
+  subsets (bites at the 0.8 floor), `.offset()` windows, and late or
+  overlaid pages.
+- The abandoned-socket fetch test waits for the page to be held instead of
+  sleeping 30 ms, which timed out under full-suite load.
+
+### Documentation
+
+- README gains a Known limitations section: DO SQLite can't bind `bigint`,
+  and INTEGER values above 2^53 round on read (workerd#4195, #10). ADR-0001
+  D17 is qualified to match.
+- ADR-0012 D3 points to ADR-0014, which changed how `handleCall` sanitizes
+  authorize errors.
+
 ## [0.7.0] — 2026-09-25
 
 ### Added

@@ -11,7 +11,7 @@ import type { ServerFrame } from "../src/wire/frames.ts"
 
 function setup() {
   const sent: Array<{ ws: unknown; frame: ServerFrame }> = []
-  const b = new Broadcaster((ws, frame) => sent.push({ ws, frame }), 50)
+  const b = new Broadcaster((ws, frame) => sent.push({ ws, frame }), () => 50)
   const ws = {} as unknown as WebSocket
   return { b, ws, sent }
 }
