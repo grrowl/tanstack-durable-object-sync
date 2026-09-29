@@ -184,8 +184,9 @@ function cutFor(b: Boundary): Cut | undefined {
     case "before-any":
       return { at: () => "before" }
     case "mid":
-      // after the FIRST delta of sub i's catch-up (each applicable one has >1)
-      return { at: (f, s) => (f.t === "d" && f.sub === s.subs[b.i]?.subId ? "after" : false) }
+      // after the FIRST row of sub i's catch-up (each applicable one has >1),
+      // or of its snapshot, should a repair resnapshot instead
+      return { at: (f, s) => ((f.t === "d" || f.t === "snap") && f.sub === s.subs[b.i]?.subId ? "after" : false) }
     case "after":
       return { at: (f, s) => (own(f, s.subs[b.i]?.subId) ? "after" : false) }
     case "broadcast":
@@ -337,10 +338,10 @@ async function scenario(name: string, setName: string, b: Boundary): Promise<voi
         expect(round.frames).toEqual([])
         break
       case "mid":
-        expect([last?.t, last?.sub, ownDelivered(b.i)]).toEqual(["d", round.subs[b.i]!.subId, false])
+        expect([last?.t === "d" || last?.t === "snap", last?.sub, ownDelivered(b.i)]).toEqual([true, round.subs[b.i]!.subId, false])
         break
       case "after":
-        expect([last?.t, last?.sub]).toEqual(["uptodate", round.subs[b.i]!.subId])
+        expect(own(last as ServerFrame, round.subs[b.i]!.subId)).toBe(true)
         break
       case "broadcast":
         expect([last?.t, last?.sub, [1, 2, 3].some(ownDelivered)]).toEqual(["uptodate", undefined, false])
@@ -361,6 +362,16 @@ async function scenario(name: string, setName: string, b: Boundary): Promise<voi
     const want = await server()
     reached.add(name)
     expect(got).toEqual(want)
+
+    // Holding the cursor back forever would also converge (every round replays
+    // from the start): the round must release it, and live delivery resume.
+    const seqNow = await runInDurableObject(stubFor(r), (_i, s) =>
+      String(Array.from(s.storage.sql.exec<{ m: number }>("SELECT max(seq) AS m FROM _sync_changes"))[0]!.m),
+    )
+    expect(t.appliedCursor).toBe(seqNow)
+    await serverExec(r, ["INSERT INTO files(id,name) VALUES('f9','live')"])
+    await waitFor(() => ef.has("f9"))
+    await waitFor(() => BigInt(t.appliedCursor) > BigInt(seqNow))
   } finally {
     t.close()
   }

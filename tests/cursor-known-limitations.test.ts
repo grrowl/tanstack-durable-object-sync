@@ -102,7 +102,10 @@ describe("single-cursor known limitations", () => {
         }
       })
       await evictDurableObject(stubFor(r))
-      expect(sink.rows.has("x")).toBe(false) // premise: x was still buffered when the instance died
+      // Premise: x was still buffered when the instance died. A fix that removes
+      // the buffering window altogether makes L2 moot and fails here: then
+      // retire this pin rather than weaken it.
+      expect(sink.rows.has("x")).toBe(false)
       expect(closed).toBe(false) // premise: the socket survived, so no reconnect will fire
 
       // Delivery resumes on the surviving socket: a later write reaches it.
