@@ -53,6 +53,12 @@ While pre-1.0, the public API may change between 0.x releases.
   - Dedup is scoped by txId alone (L3, ADR-0012 D4).
 - Full-row live deltas for narrow and no-op updates (#28) are pinned as
   current behaviour.
+- Real-path on-demand scenarios pin the ADR-0023 fixes that were only covered
+  by fake transports: unload mid-snapshot, a below-floor reset across several
+  subsets (bites at the 0.8 floor), `.offset()` windows, and late or
+  overlaid pages.
+- The abandoned-socket fetch test waits for the page to be held instead of
+  sleeping 30 ms, which timed out under full-suite load.
 
 ### Documentation
 
