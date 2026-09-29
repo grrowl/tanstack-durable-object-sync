@@ -15,11 +15,13 @@ import type { TestApi } from "./test-worker.ts"
 // "no rows". The only trace is a server-side console.error.
 //
 // These are the scenarios a "refusals fail loud" design must satisfy, one per
-// cause and surface, each `it.fails` until that design lands. They assert the
-// OBSERVABLE contract (an error-typed reply correlated to the request; a load
-// that rejects), not a frame name — the ADR picks those. The passing controls
-// pin the other half: an empty result stays a success, and prove the harness
-// so a `.fails` cannot pass on a broken setup alone.
+// cause and surface, each `it.fails` until that design lands. They assert only
+// what any such design must deliver — a correlated reply that is neither the
+// empty result's nor the below-floor `reset`; a load that rejects — not a frame
+// name or error type; the ADR picks those, and its fix should tighten these to
+// them. The passing tests pin what holds before AND after: an empty result
+// stays a success, and every refusal settles promptly (so a hang cannot hide
+// behind a `.fails`).
 //
 // Existing tests that pin "refusal = empty" as correct today; a fix must
 // supersede them deliberately (not changed here):
@@ -47,11 +49,10 @@ async function openWs(path: string): Promise<WebSocket> {
   return ws
 }
 
-type Correlated = ServerFrame & { fetchId?: string; sub?: string; subId?: string; code?: unknown }
+type Correlated = ServerFrame & { fetchId?: string; sub?: string; subId?: string }
 
 /** Send `f`, resolve with the first frame correlated to it that is not a row
- *  (`snap`/`d`). Never rejects: a missing reply resolves `undefined`, so a
- *  `.fails` below fails on its assertion, not on the harness. */
+ *  (`snap`/`d`). Never rejects: a missing reply resolves `undefined`. */
 function reply(ws: WebSocket, f: ClientFrame, id: string, timeoutMs = 2000): Promise<Correlated | undefined> {
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
@@ -79,68 +80,77 @@ async function seed(ns: DurableObjectNamespace, room: string): Promise<void> {
   })
 }
 
-/** The refusal contract: an error-typed reply carrying a code, not the empty
- *  result's `page`/`snap-end` nor the below-floor `reset`. */
-function expectErrorReply(r: Correlated | undefined): void {
-  expect(r, "no correlated reply").toBeDefined()
-  expect(r!.t).toMatch(/error/)
-  expect(typeof r!.code).toBe("string")
+type FetchBody = Omit<Extract<ClientFrame, { t: "fetch" }>, "t" | "fetchId">
+type SubBody = Omit<Extract<ClientFrame, { t: "sub" }>, "t" | "subId">
+type WireCase = { name: string; kind: "fetch" | "sub"; run: () => Promise<Correlated | undefined> }
+
+// Each case on a fresh LimitsTestDO (maxSubsPerSocket = 2) seeded with 3 rows.
+async function onLimitsSocket<T>(fn: (ws: WebSocket) => Promise<T>): Promise<T> {
+  const room = `f5-wire-${crypto.randomUUID()}`
+  await seed(env.LIMITS_DO, room)
+  const ws = await openWs(`/limits/${room}`)
+  try {
+    return await fn(ws)
+  } finally {
+    ws.close()
+  }
 }
+const fetchCase = (name: string, body: FetchBody): WireCase => ({
+  name: `fetch refused for ${name}`,
+  kind: "fetch",
+  run: () => onLimitsSocket((ws) => reply(ws, { t: "fetch", fetchId: "f1", ...body }, "f1")),
+})
+const subCase = (name: string, body: SubBody): WireCase => ({
+  name: `sub refused for ${name}`,
+  kind: "sub",
+  run: () => onLimitsSocket((ws) => reply(ws, { t: "sub", subId: "s1", ...body }, "s1")),
+})
+const WIRE_CASES: Array<WireCase> = [
+  fetchCase("unknown collection", { collection: "nope" }),
+  fetchCase("malformed cursor (missing whereCurrent)", { collection: "messages", cursor: HALF_CURSOR as never }),
+  fetchCase("unsupported predicate (ilike)", { collection: "messages", where: ILIKE }),
+  subCase("unknown collection", { collection: "nope" }),
+  subCase("unsupported predicate (ilike)", { collection: "messages", where: ILIKE }),
+  {
+    name: "sub refused over maxSubsPerSocket",
+    kind: "sub",
+    run: () =>
+      onLimitsSocket(async (ws) => {
+        await reply(ws, { t: "sub", subId: "s1", collection: "messages" }, "s1")
+        await reply(ws, { t: "sub", subId: "s2", collection: "files" }, "s2")
+        return reply(ws, { t: "sub", subId: "s3", collection: "validated" }, "s3")
+      }),
+  },
+]
 
 describe("F5 wire: a refusal is distinguishable from an empty result", () => {
   it("control: a genuinely empty fetch is `page rows:[]` and a genuinely empty sub is `snap-end`", async () => {
-    const room = `f5-wire-empty-${crypto.randomUUID()}`
-    await seed(env.LIMITS_DO, room)
-    const ws = await openWs(`/limits/${room}`)
     const none = fn("eq", ref("body"), val("none"))
-    const page = await reply(ws, { t: "fetch", fetchId: "f-empty", collection: "messages", where: none }, "f-empty")
-    const snap = await reply(ws, { t: "sub", subId: "s-empty", collection: "messages", where: none }, "s-empty")
-    ws.close()
+    const [page, snap] = await onLimitsSocket(async (ws) => [
+      await reply(ws, { t: "fetch", fetchId: "f-empty", collection: "messages", where: none }, "f-empty"),
+      await reply(ws, { t: "sub", subId: "s-empty", collection: "messages", where: none }, "s-empty"),
+    ])
     expect(page).toMatchObject({ t: "page", rows: [] })
     expect(snap?.t).toBe("snap-end")
   })
 
-  const fetchCases: Array<[string, Omit<Extract<ClientFrame, { t: "fetch" }>, "t" | "fetchId">]> = [
-    ["unknown collection", { collection: "nope" }],
-    ["malformed cursor (missing whereCurrent)", { collection: "messages", cursor: HALF_CURSOR as never }],
-    ["unsupported predicate (ilike)", { collection: "messages", where: ILIKE }],
-  ]
-  for (const [cause, body] of fetchCases) {
-    it.fails(`fetch refused for ${cause}: an error reply correlated by fetchId, not an empty page`, async () => {
-      const room = `f5-wire-fetch-${crypto.randomUUID()}`
-      await seed(env.LIMITS_DO, room)
-      const ws = await openWs(`/limits/${room}`)
-      const r = await reply(ws, { t: "fetch", fetchId: "f1", ...body }, "f1")
-      ws.close()
-      expectErrorReply(r)
-    })
-  }
-
-  const subCases: Array<[string, Omit<Extract<ClientFrame, { t: "sub" }>, "t" | "subId">]> = [
-    ["unknown collection", { collection: "nope" }],
-    ["unsupported predicate (ilike)", { collection: "messages", where: ILIKE }],
-  ]
-  for (const [cause, body] of subCases) {
-    it.fails(`sub refused for ${cause}: an error reply correlated by subId, not a bare reset`, async () => {
-      const room = `f5-wire-sub-${crypto.randomUUID()}`
-      await seed(env.LIMITS_DO, room)
-      const ws = await openWs(`/limits/${room}`)
-      const r = await reply(ws, { t: "sub", subId: "s1", ...body }, "s1")
-      ws.close()
-      expectErrorReply(r)
-    })
-  }
-
-  it.fails("sub refused over maxSubsPerSocket: an error reply correlated by subId, not a bare reset", async () => {
-    const room = `f5-wire-cap-${crypto.randomUUID()}`
-    await seed(env.LIMITS_DO, room) // LimitsTestDO: maxSubsPerSocket = 2
-    const ws = await openWs(`/limits/${room}`)
-    await reply(ws, { t: "sub", subId: "s1", collection: "messages" }, "s1")
-    await reply(ws, { t: "sub", subId: "s2", collection: "files" }, "s2")
-    const r = await reply(ws, { t: "sub", subId: "s3", collection: "validated" }, "s3")
-    ws.close()
-    expectErrorReply(r)
+  it("every refusal gets a prompt, correlated reply (never silence)", async () => {
+    for (const c of WIRE_CASES) expect(await c.run(), c.name).toBeDefined()
   })
+
+  for (const c of WIRE_CASES) {
+    it.fails(`${c.name}: the reply is neither the empty result nor a bare reset`, async () => {
+      const r = await c.run()
+      expect(r, "no correlated reply").toBeDefined()
+      if (c.kind === "fetch") {
+        const { fetchId: _id, seq: _seq, ...shape } = r as Correlated & { seq?: string }
+        expect(shape).not.toEqual({ t: "page", rows: [] }) // today: exactly this
+      } else {
+        expect(r!.t).not.toBe("snap-end")
+        expect(r!.t).not.toBe("reset") // today: `reset`, which also means "below the floor, resnapshot"
+      }
+    })
+  }
 })
 
 function realTransport(path: string): WebSocketTransport<TestApi> {
@@ -162,93 +172,97 @@ async function outcome(p: Promise<unknown>, ms = 1500): Promise<string> {
   ])
 }
 
+// `status` is set for eager collections: a refused eager sub should fail the
+// collection's readiness (markError), the route an eager receipt failure takes.
+type AppCase = { name: string; run: () => Promise<{ o: string; status?: string }> }
+
+async function withTransport<T>(path: "sync" | "limits", fn: (t: WebSocketTransport<TestApi>) => Promise<T>): Promise<T> {
+  const room = `f5-app-${crypto.randomUUID()}`
+  await seed(path === "sync" ? env.SYNC_DO : env.LIMITS_DO, room)
+  const t = realTransport(`/${path}/${room}`)
+  try {
+    return await fn(t)
+  } finally {
+    t.close()
+  }
+}
+const fetchApp = (name: string, body: FetchBody): AppCase => ({
+  name: `transport.fetch with ${name} rejects instead of resolving []`,
+  run: () =>
+    withTransport("sync", async (t) => {
+      await t.connect()
+      return { o: await outcome(t.fetch({ t: "fetch", fetchId: "f1", ...body })) }
+    }),
+})
+const APP_CASES: Array<AppCase> = [
+  {
+    name: "eager collection on an unknown table: preload() rejects and the collection is in error",
+    run: () =>
+      withTransport("sync", async (t) => {
+        const c = createCollection(doCollectionOptions({ transport: t, table: "nope" as "messages", getKey: (r) => r.id }))
+        return { o: await outcome(c.preload()), status: c.status }
+      }),
+  },
+  {
+    name: "eager collection with an unsupported static `where`: preload() rejects and the collection is in error",
+    run: () =>
+      withTransport("sync", async (t) => {
+        const c = createCollection(doCollectionOptions({ transport: t, table: "messages", getKey: (r) => r.id, where: ILIKE }))
+        return { o: await outcome(c.preload()), status: c.status } // today: ready, size 0; the server holds 3 matching rows
+      }),
+  },
+  {
+    name: "eager collection past the sub cap: its preload() rejects and it is in error",
+    run: () =>
+      withTransport("limits", async (t) => {
+        // maxSubsPerSocket = 2; three collections share one socket
+        await createCollection(doCollectionOptions({ transport: t, table: "messages", getKey: (r) => r.id })).preload()
+        await createCollection(doCollectionOptions({ transport: t, table: "files", getKey: (r) => r.id })).preload()
+        const c = createCollection(doCollectionOptions({ transport: t, table: "validated", getKey: (r) => r.id }))
+        return { o: await outcome(c.preload()), status: c.status }
+      }),
+  },
+  {
+    name: "on-demand live query on an unknown table: preload() rejects",
+    run: () =>
+      withTransport("sync", async (t) => {
+        const c = createCollection(doCollectionOptions({ transport: t, table: "nope" as "messages", getKey: (r) => r.id, syncMode: "on-demand" }))
+        return { o: await outcome(createLiveQueryCollection((qb) => qb.from({ n: c })).preload()) }
+      }),
+  },
+  {
+    name: "on-demand live query with an unsupported predicate (ilike): preload() rejects",
+    run: () =>
+      withTransport("sync", async (t) => {
+        const messages = createCollection(doCollectionOptions({ transport: t, table: "messages", getKey: (m) => m.id, syncMode: "on-demand" }))
+        const q = createLiveQueryCollection((qb) => qb.from({ m: messages }).where(({ m }) => ilike(m.body, "%b%")))
+        return { o: await outcome(q.preload()) } // today: ready, size 0; the server holds 3 matching rows
+      }),
+  },
+  fetchApp("an unknown collection", { collection: "nope" }),
+  fetchApp("a malformed cursor", { collection: "messages", cursor: HALF_CURSOR as never }),
+  fetchApp("an unsupported predicate (ilike)", { collection: "messages", where: ILIKE }),
+]
+
 describe("F5 app: a refused load rejects instead of settling ready + empty", () => {
   it("control: an eager collection on a registered table preloads ready with its rows", async () => {
-    const room = `f5-app-ok-${crypto.randomUUID()}`
-    await seed(env.SYNC_DO, room)
-    const t = realTransport(`/sync/${room}`)
-    const c = createCollection(doCollectionOptions({ transport: t, table: "messages", getKey: (r) => r.id }))
-    const o = await outcome(c.preload())
-    t.close()
+    const { o, size } = await withTransport("sync", async (t) => {
+      const c = createCollection(doCollectionOptions({ transport: t, table: "messages", getKey: (r) => r.id }))
+      return { o: await outcome(c.preload()), size: c.size }
+    })
     expect(o).toBe("resolved")
-    expect(c.size).toBe(3)
+    expect(size).toBe(3)
   })
 
-  it.fails("eager collection on an unknown table: preload() rejects and the collection is in error", async () => {
-    const room = `f5-app-eager-unk-${crypto.randomUUID()}`
-    await seed(env.SYNC_DO, room)
-    const t = realTransport(`/sync/${room}`)
-    const c = createCollection(doCollectionOptions({ transport: t, table: "nope" as "messages", getKey: (r) => r.id }))
-    const o = await outcome(c.preload())
-    t.close()
-    expect(o).toMatch(/^rejected/) // today: resolved, status ready, size 0
-    expect(c.status).toBe("error")
+  it("every refused load settles promptly (never hangs)", async () => {
+    for (const c of APP_CASES) expect((await c.run()).o, c.name).not.toBe("pending")
   })
 
-  it.fails("eager collection with an unsupported static `where`: preload() rejects and the collection is in error", async () => {
-    const room = `f5-app-eager-pred-${crypto.randomUUID()}`
-    await seed(env.SYNC_DO, room)
-    const t = realTransport(`/sync/${room}`)
-    const c = createCollection(doCollectionOptions({ transport: t, table: "messages", getKey: (r) => r.id, where: ILIKE }))
-    const o = await outcome(c.preload())
-    t.close()
-    expect(o).toMatch(/^rejected/) // today: resolved, ready, size 0 — the server holds 3 matching rows
-    expect(c.status).toBe("error")
-  })
-
-  it.fails("eager collection past the sub cap: its preload() rejects and it is in error", async () => {
-    const room = `f5-app-eager-cap-${crypto.randomUUID()}`
-    await seed(env.LIMITS_DO, room) // maxSubsPerSocket = 2; three collections share one socket
-    const t = realTransport(`/limits/${room}`)
-    const a = createCollection(doCollectionOptions({ transport: t, table: "messages", getKey: (r) => r.id }))
-    const b = createCollection(doCollectionOptions({ transport: t, table: "files", getKey: (r) => r.id }))
-    const c = createCollection(doCollectionOptions({ transport: t, table: "validated", getKey: (r) => r.id }))
-    await a.preload()
-    await b.preload()
-    const o = await outcome(c.preload())
-    t.close()
-    expect(o).toMatch(/^rejected/) // today: resolved, ready, size 0
-    expect(c.status).toBe("error")
-  })
-
-  it.fails("on-demand live query on an unknown table: preload() rejects", async () => {
-    const room = `f5-app-od-unk-${crypto.randomUUID()}`
-    await seed(env.SYNC_DO, room)
-    const t = realTransport(`/sync/${room}`)
-    const c = createCollection(
-      doCollectionOptions({ transport: t, table: "nope" as "messages", getKey: (r) => r.id, syncMode: "on-demand" }),
-    )
-    const q = createLiveQueryCollection((qb) => qb.from({ n: c }))
-    const o = await outcome(q.preload())
-    t.close()
-    expect(o).toMatch(/^rejected/) // today: resolved, ready, size 0
-  })
-
-  it.fails("on-demand live query with an unsupported predicate (ilike): preload() rejects", async () => {
-    const room = `f5-app-od-pred-${crypto.randomUUID()}`
-    await seed(env.SYNC_DO, room)
-    const t = realTransport(`/sync/${room}`)
-    const messages = createCollection(doCollectionOptions({ transport: t, table: "messages", getKey: (m) => m.id, syncMode: "on-demand" }))
-    const q = createLiveQueryCollection((qb) => qb.from({ m: messages }).where(({ m }) => ilike(m.body, "%b%")))
-    const o = await outcome(q.preload())
-    t.close()
-    expect(o).toMatch(/^rejected/) // today: resolved, ready, size 0 — the server holds 3 matching rows
-  })
-
-  const fetchCases: Array<[string, Omit<Extract<ClientFrame, { t: "fetch" }>, "t" | "fetchId">]> = [
-    ["an unknown collection", { collection: "nope" }],
-    ["a malformed cursor", { collection: "messages", cursor: HALF_CURSOR as never }],
-    ["an unsupported predicate (ilike)", { collection: "messages", where: ILIKE }],
-  ]
-  for (const [cause, body] of fetchCases) {
-    it.fails(`transport.fetch with ${cause} rejects instead of resolving []`, async () => {
-      const room = `f5-app-fetch-${crypto.randomUUID()}`
-      await seed(env.SYNC_DO, room)
-      const t = realTransport(`/sync/${room}`)
-      await t.connect()
-      const o = await outcome(t.fetch({ t: "fetch", fetchId: "f1", ...body }))
-      t.close()
-      expect(o).toMatch(/^rejected/)
+  for (const c of APP_CASES) {
+    it.fails(c.name, async () => {
+      const { o, status } = await c.run()
+      expect(o).toMatch(/^rejected/) // today: resolved
+      if (status !== undefined) expect(status).toBe("error") // today: ready
     })
   }
 })

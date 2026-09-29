@@ -4,22 +4,25 @@ import { describe, expect, it } from "vitest"
 import { createFrameCodec } from "../src/wire/frame-codec.ts"
 import type { ServerFrame } from "../src/wire/frames.ts"
 
-// Issue #28 part (a), bugbash G28a. WHY: a live `d` for an update carries the
-// WHOLE current row, however little changed — including nothing. That is a
-// design property, not an accident:
+// Issue #28 part (a), bugbash G28a. Characterization, not the wire contract
+// (`d.cols` is typed as a partial patch and the client merges it as one):
+// today a live `d` for an update carries the WHOLE current row, however little
+// changed — including nothing. The full row is what lets several existing
+// decisions stay simple:
 //   - capture records only (key, op) and rows hydrate fresh at drain, so a
 //     column an author adds later flows with no trigger change (ADR-0007;
 //     schema-evolution.test.ts);
-//   - the always-emit rule sends a matching row's current state to every
-//     sub with no per-sub membership, and the client applies an update for a
-//     key it lacks as an upsert — move-in (ADR-0002 C4). A column-only patch
-//     would upsert a partial row there;
+//   - the always-emit rule sends a matching row's current state to every sub
+//     with no per-sub membership, and the client applies an update for a key
+//     it lacks as an upsert — move-in, including a bounded (limit) sub's rows
+//     outside its window (ADR-0002 C4). A column-only patch would upsert a
+//     partial row there;
 //   - live deltas are self-contained (ADR-0009's premise), so the broadcaster
 //     may keep only the latest delta per key per tick, and a missed delta
 //     heals at the key's next write.
 // The cost is bandwidth: row size × write rate × subscribers. ADR-0018 D3
-// warns above 1 MiB and points here. Column projection would change the delta
-// contract and needs its own ADR; if it lands, this test is what it supersedes.
+// warns above 1 MiB and names column projection the real fix. A projection
+// change supersedes this test (with its own ADR).
 
 const codec = createFrameCodec()
 const BIG = "x".repeat(300_000)

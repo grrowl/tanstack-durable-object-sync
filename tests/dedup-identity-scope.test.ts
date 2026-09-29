@@ -6,8 +6,10 @@ import type { ClientFrame, ServerFrame } from "../src/wire/frames.ts"
 // bugbash L3 — accepted limitation, deferred by ADR-0012 D4 ("Dedup identity
 // binding deferred"). WHY: `_sync_seen_tx` is keyed by txId alone, so the
 // receipt belongs to whichever socket presented the txId FIRST, whoever that
-// was. Two halves, both `it.fails` until an identity-scoped dedup lands (the
-// ADR sketches a `dedupScope(user)` hook):
+// was. Two halves, both `it.fails` until an identity-scoped dedup lands. They
+// encode the scoping D4 sketches (a `dedupScope(user)` hook): another identity's
+// txId is simply new in your scope, so your frame runs. A design that instead
+// refuses cross-identity collisions would need to re-state them.
 //   1. Read (the half D4 names): another identity presenting your txId gets
 //      your stored receipt, including a command's result.
 //   2. Pre-claim (wider than D4's text): another identity that uses a txId
@@ -68,7 +70,7 @@ describe("dedup is scoped to the identity that owns the txId (ADR-0012 D4, defer
     alice.close()
     bob.close()
     // today: bob gets {committed, result:{echoed:{secret:"alice-only"}}}
-    expect(JSON.stringify(b)).not.toContain("alice-only")
+    expect(b).toMatchObject({ t: "committed", result: { echoed: { secret: "bob" } } })
   })
 
   // bugbash L3 (pre-claim half) — wider than ADR-0012 D4's text.
@@ -82,7 +84,7 @@ describe("dedup is scoped to the identity that owns the txId (ADR-0012 D4, defer
     alice.close()
     bob.close()
     // today: alice gets bob's `committed` receipt and rows are ["bob-row"].
-    // Either her write runs, or she is not told it committed.
-    expect(a.t === "committed" ? rows.includes("alice-row") : true).toBe(true)
+    expect(a.t).toBe("committed")
+    expect(rows).toEqual(["alice-row", "bob-row"])
   })
 })
