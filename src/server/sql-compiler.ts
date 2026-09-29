@@ -125,21 +125,23 @@ export function compileWhere(where: unknown): { sql: string; params: Array<unkno
   return { sql: compileExpr(where, params), params }
 }
 
-/** Extract (column, descending) from an orderBy clause. Accepts @tanstack/db's
- *  OrderByClause ({ expression: PropRef, compareOptions: { direction } }) — the
- *  real wire shape from a live query — or a simple { col, dir }. */
-function orderByTerm(item: unknown): { col: string; desc: boolean } {
+/** Extract (column, descending, nulls last) from an orderBy clause. Accepts @tanstack/db's
+ *  OrderByClause ({ expression: PropRef, compareOptions: { direction, nulls } }) — the
+ *  real wire shape from a live query — or a simple { col, dir }. Nulls default to
+ *  first, as in TanStack's comparator, in either direction. */
+function orderByTerm(item: unknown): { col: string; desc: boolean; nullsLast: boolean } {
   const o = item as {
     expression?: { type?: string; path?: Array<string> }
-    compareOptions?: { direction?: string }
+    compareOptions?: { direction?: string; nulls?: string }
     col?: unknown
     dir?: unknown
   }
   if (o.expression?.type === "ref" && Array.isArray(o.expression.path) && o.expression.path.length > 0) {
     const path = o.expression.path
-    return { col: path[path.length - 1]!, desc: o.compareOptions?.direction === "desc" }
+    const nullsLast = o.compareOptions?.nulls === "last"
+    return { col: path[path.length - 1]!, desc: o.compareOptions?.direction === "desc", nullsLast }
   }
-  if (typeof o.col === "string") return { col: o.col, desc: o.dir === "desc" }
+  if (typeof o.col === "string") return { col: o.col, desc: o.dir === "desc", nullsLast: false }
   throw new UnsupportedPredicateError(`unsupported orderBy clause: ${JSON.stringify(item)}`)
 }
 
@@ -147,9 +149,9 @@ function compileOrderBy(orderBy: unknown): string {
   if (!Array.isArray(orderBy) || orderBy.length === 0) return ""
   return orderBy
     .map((item) => {
-      const { col, desc } = orderByTerm(item)
+      const { col, desc, nullsLast } = orderByTerm(item)
       if (!IDENT.test(col)) throw new UnsupportedPredicateError(`invalid orderBy column: ${col}`)
-      return `"${col}" ${desc ? "DESC" : "ASC"}`
+      return `"${col}" ${desc ? "DESC" : "ASC"} NULLS ${nullsLast ? "LAST" : "FIRST"}`
     })
     .join(", ")
 }
