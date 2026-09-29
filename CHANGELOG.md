@@ -35,9 +35,16 @@ While pre-1.0, the public API may change between 0.x releases.
 - **Bounded on-demand snapshots place NULLs as TanStack does.** The server's
   `ORDER BY` now emits `NULLS FIRST` or `NULLS LAST` from each clause's
   `nulls` (default first), so a descending window over a nullable column no
-  longer drops its NULL rows. Locale collation, NULL tie-breaking and cursor
-  pages past a NULL boundary are still pinned as expected failures (ADR-0023
-  amendment).
+  longer drops its NULL rows. Locale collation is still pinned as an expected
+  failure (ADR-0023 amendment).
+- **Bounded reads break ties by pk, ascending**, matching TanStack's row-key
+  tie-break, so a `limit` over tied rows picks the same rows on the server and
+  the client (ADR-0023 amendment).
+- **`isNull` and `isUndefined` join the predicate floor**, so a
+  `nulls: "last"` window on `@tanstack/db` 0.9 can page past its first page.
+  Before, its cursor fetch was refused and read as empty (ADR-0013 amendment).
+- **Dedup retention is a true lower bound.** Receipts are stamped in whole
+  seconds, so the sweep could remove one up to 999 ms early.
 - **A fetch page no longer overtakes a buffered delta.** The server flushes
   the socket's pending deltas before it reads a page, the same as it does
   for snapshots (ADR-0023 amendment).
