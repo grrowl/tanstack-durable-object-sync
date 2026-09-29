@@ -238,3 +238,14 @@ mount for orders 0.9 cannot express as a cursor.
   fail loud.
 - SQL `ORDER BY` ignores `nulls` and locale collation, so a bounded snapshot
   can choose a different top-k than the client's comparator.
+
+## Amendment — 2026-09-29: fetch flush barrier
+
+The fetch/coalescer follow-up above is resolved: `#handleFetch` now flushes the
+requesting socket's buffered deltas before reading its page, as the subscription
+snapshot path already does. A covered load therefore cannot settle with an old
+held row while its newer delta remains buffered. The page remains an atomic
+read and does not advance the client cursor; the preceding delta boundary
+commits the update first. `tests/fetch-flush-barrier.test.ts` pins both the
+wire order and the held row's value at load settlement through the real DO,
+transport, and on-demand collection.

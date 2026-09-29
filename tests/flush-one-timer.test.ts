@@ -62,7 +62,7 @@ describe("flushOne timer hygiene", () => {
     }
   })
 
-  it("does not keep a tick for sockets that are no longer live", () => {
+  it("ignores departed sockets when a live socket's flush decides whether to keep the tick", () => {
     const first = {} as WebSocket
     const departed = {} as WebSocket
     const live = new Set([first, departed])
