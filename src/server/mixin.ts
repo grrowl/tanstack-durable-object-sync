@@ -727,6 +727,16 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           return this.#rejectTx(ws, f.txId, "mutation op key must be a non-empty string", "VALIDATION")
         }
 
+        // A supplied pk must be the optimistic key, never a different row's
+        // identity. Check before author handlers; do not rewrite cols (ADR-0025).
+        const collection = this.#registry.collections.get(f.collection)
+        if (collection && f.ops.some((op) =>
+          (op.type === "insert" || op.type === "update") &&
+          op.cols != null && Object.hasOwn(op.cols, collection.pk) && op.cols[collection.pk] !== op.key
+        )) {
+          return this.#rejectTx(ws, f.txId, "mutation cols primary key must match op key", "VALIDATION")
+        }
+
         const user = this.#userFor(ws)
 
         // Authorize every op BEFORE the transaction (may be async).
