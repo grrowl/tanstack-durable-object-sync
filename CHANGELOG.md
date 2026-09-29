@@ -16,6 +16,19 @@ While pre-1.0, the public API may change between 0.x releases.
   TS2307. The pack smoke test now checks both type setups (ADR-0022
   amendment).
 
+### Tests
+
+- Known bugs are now pinned as expected failures (`it.fails`, tagged
+  `bugbash <ID>`), so each fix flips its tests:
+  - The single client cursor skips changes when the socket drops during a
+    resubscribe round (F1): 30 reconnect-under-drop scenarios, 16 of them red.
+  - Known limitations L1 (no incarnation epoch, ADR-0011) and L2 (mid-tick
+    eviction, ADR-0009).
+  - Refusals read as empty results (F5): 14 wire and app scenarios.
+  - Dedup is scoped by txId alone (L3, ADR-0012 D4).
+- Full-row live deltas for narrow and no-op updates (#28) are pinned as
+  current behaviour.
+
 ### Documentation
 
 - README gains a Known limitations section: DO SQLite can't bind `bigint`,
