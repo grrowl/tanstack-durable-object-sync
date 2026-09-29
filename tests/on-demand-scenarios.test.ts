@@ -149,18 +149,15 @@ describe("filtered lists on a flaky socket", () => {
     // `dropHolds`), not committed by the release or by qa's boundary.
     expect([...messages.keys()].sort()).toEqual(["m00", "m01", "m02", "m03", "m06"])
 
-    // C5: the socket dies with deltas unread, and the changelog is pruned below
-    // the client's cursor, so the reconnect's resubscribes are both reset.
+    // C5: changes the client never sees (written without a broadcast, as if the
+    // socket had missed them), then the changelog is pruned below the client's
+    // cursor and the socket drops: the reconnect's resubscribes are both reset.
     const subsBefore = frames.length
-    gate.only = undefined
-    gate.hold = true
-    await serverExec(r, "DELETE FROM messages WHERE id = ?", "m01")
-    await serverExec(r, "INSERT INTO messages(id,body) VALUES(?,?)", "x1", "b")
     await runInDurableObject(stubFor(r), (_i, s) => {
+      s.storage.sql.exec("DELETE FROM messages WHERE id = ?", "m01")
+      s.storage.sql.exec("INSERT INTO messages(id,body) VALUES(?,?)", "x1", "b")
       s.storage.sql.exec("DELETE FROM _sync_changes")
     })
-    gate.queue.length = 0 // these deltas die with the socket
-    gate.hold = false
     await dropSocket(r)
     // bugbash C5: every open filter reloads the current server rows. The fix
     // (`truncateAll` on a bootstrapped sub's reset: one truncate, every watch
@@ -180,26 +177,36 @@ describe("filtered lists on a flaky socket", () => {
 
 describe("offset windows through a real live query", () => {
   for (const indexed of [false, true]) {
-    it(`page 2 of a sorted list shows its own rows beside page 1 (index: ${indexed})`, async () => {
+    it(`page 2 of a sorted list shows its own rows beside page 1 and the reverse order (index: ${indexed})`, async () => {
       const r = room(`offset-${indexed}`)
       const t = transportFor(r)
       await seed(r, Array.from({ length: 20 }, (_, i) => pad(i + 1)))
       const messages = onDemand(t)
-      if (indexed) messages.createIndex((m) => m.body, { indexType: BTreeIndex })
-      const page1 = createLiveQueryCollection((q) => q.from({ m: messages }).orderBy(({ m }) => m.body, "asc").limit(3))
+      // Lexical: an order core can express to the source, so it asks for each
+      // window exactly (a locale sort is recovered by loading the whole source
+      // on 0.9, which would hide a shared snapshot).
+      const asc = { direction: "asc", stringSort: "lexical" } as const
+      const desc = { direction: "desc", stringSort: "lexical" } as const
+      if (indexed) messages.createIndex((m) => m.body, { indexType: BTreeIndex, options: { compareOptions: { stringSort: "lexical" } } })
+      const page1 = createLiveQueryCollection((q) => q.from({ m: messages }).orderBy(({ m }) => m.body, asc).limit(3))
       await page1.preload()
       await waitFor(() => page1.size === 3)
       // Core folds a query's offset into the request's limit ({limit: 8}): the
       // adapter never sees a bare offset (it rejects one loudly).
-      const page2 = createLiveQueryCollection((q) => q.from({ m: messages }).orderBy(({ m }) => m.body, "asc").offset(5).limit(3))
+      const page2 = createLiveQueryCollection((q) => q.from({ m: messages }).orderBy(({ m }) => m.body, asc).offset(5).limit(3))
       await page2.preload()
-      // bugbash C7: page 2 is its own request (identity is where + orderBy +
-      // limit, `requestKey`); pre-fix it shared page 1's 3-row snapshot and
-      // showed nothing.
-      await waitFor(() => page2.size === 3)
+      // The same page from the other end: page 2's where and limit, other order.
+      const last2 = createLiveQueryCollection((q) => q.from({ m: messages }).orderBy(({ m }) => m.body, desc).offset(5).limit(3))
+      await last2.preload()
+      // bugbash C7: each window is its own request (identity is where + orderBy
+      // + limit, `requestKey`). Pre-fix page 2 shared page 1's 3-row snapshot
+      // and showed nothing; without orderBy in the key, last2 would share page
+      // 2's ascending snapshot and show 03..01.
+      await waitFor(() => page2.size === 3 && last2.size === 3)
       await sleep(30)
       expect(bodies(page1)).toEqual(["01", "02", "03"])
       expect(bodies(page2)).toEqual(["06", "07", "08"])
+      expect(bodies(last2)).toEqual(["15", "14", "13"])
       // An offset jump: 0.9 fills it. 0.8.x does not (upstream: no request for
       // an unindexed window; one cursor request {limit: 3, offset: 8} for an
       // indexed one, which any exact adapter answers with 09..11), so skip there.
@@ -266,9 +273,10 @@ describe("a paged list: left mid-scroll, then back with a colliding create", () 
     gate.hold = true
     const tx = messages.insert({ id: "m10", body: "99-draft" })
     tx.isPersisted.promise.catch(() => {})
+    paged.clear() // win1's late page carried m10 too
     void grow(win2, 11).catch(() => {}) // six visible (draft + 20..16), so the page reaches "11"
     await waitFor(() => paged.has("m10"))
-    await sleep(20) // installPage ran
+    await sleep(20) // installPage ran (it continues the same fetch resolution)
     // Hold later pages: on 0.9 the rollback (a source change) starts core's
     // full-source recovery fetch, which would re-deliver m10 and mask a
     // regression here with one extra round trip.
