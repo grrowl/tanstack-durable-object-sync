@@ -181,12 +181,11 @@ describe(`F4 bounded snapshot vs TanStack comparator (@tanstack/db ${version})`,
 
   // 0.9.x scrolls an indexed, cursor-expressible window with a cursor fetch.
   // For nulls: "last" its `whereFrom` is `gt(v) OR isNull OR isUndefined`, and
-  // isNull is outside the server's predicate floor (ADR-0013): the fetch is
-  // refused as an empty page and the window never grows. nulls: "first" is the
-  // control: the same path, with a cursor the floor can compile. 0.8.x never
-  // scrolls on setWindow (see on-demand-contracts), so there is nothing to pin.
-  // The scroll and its cursor fetch are asserted in a plain `it`, so the
-  // expected failure below can only be the window's contents.
+  // isNull/isUndefined joined the server's predicate floor for this (ADR-0013
+  // amendment 2026-09-29, bugbash F4-cursor): before, the fetch was refused as an
+  // empty page and the window never grew. nulls: "first" is the control: the same
+  // path, with a cursor the floor always compiled. 0.8.x never scrolls on
+  // setWindow (see on-demand-contracts), so there is nothing to pin.
   for (const nulls of ["first", "last"] as const) {
     const run = version === "0.8.x" ? it.skip : it
     let grown: Array<string | null> | undefined
@@ -225,8 +224,7 @@ describe(`F4 bounded snapshot vs TanStack comparator (@tanstack/db ${version})`,
         t.close()
       }
     })
-    // bugbash F4-cursor: nulls: "last" only.
-    const parity = version === "0.8.x" ? it.skip : nulls === "last" ? it.fails : it
+    const parity = version === "0.8.x" ? it.skip : it
     parity(`the scrolled asc nulls=${nulls} window matches TanStack's order`, () => {
       expect(grown).toEqual(expected)
     })

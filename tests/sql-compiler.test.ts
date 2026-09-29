@@ -41,14 +41,25 @@ describe("IR -> SQL compiler (M6)", () => {
     expect(compileWhere(fn("in", ref("id"), val([])))).toEqual({ sql: `0`, params: [] })
   })
 
-  it("rejects operators outside the floor (ne, ilike, isNull, functions)", () => {
+  it("rejects operators outside the floor (ne, ilike, functions)", () => {
     // `ne` was removed from the floor (ADR-0013): @tanstack/db's evaluator has no
     // `ne` (only `not(eq(...))`), so accepting it in SQL desynced the snapshot and
     // delta paths. It must now be rejected like any other off-floor operator.
     expect(() => compileWhere(fn("ne", ref("body"), val("x")))).toThrow(UnsupportedPredicateError)
     expect(() => compileWhere(fn("ilike", ref("body"), val("x")))).toThrow(UnsupportedPredicateError)
-    expect(() => compileWhere(fn("isNull", ref("body")))).toThrow(UnsupportedPredicateError)
     expect(() => compileWhere(fn("upper", ref("body")))).toThrow(/not supported/)
+  })
+
+  it("compiles isNull to IS NULL and isUndefined to constant-false (ADR-0013 amendment)", () => {
+    expect(compileWhere(fn("isNull", ref("body")))).toEqual({ sql: `"body" IS NULL`, params: [] })
+    expect(compileWhere(fn("isUndefined", ref("body")))).toEqual({ sql: `0`, params: [] })
+    expect(compileWhere(fn("or", fn("gt", ref("body"), val("a")), fn("isNull", ref("body")), fn("isUndefined", ref("body"))))).toEqual({
+      sql: `("body" > ? OR "body" IS NULL OR 0)`,
+      params: ["a"],
+    })
+    // Still validated: a non-column operand is rejected, not silently constant-folded.
+    expect(() => compileWhere(fn("isUndefined", val(1)))).toThrow(/column reference/)
+    expect(() => compileWhere(fn("isNull", ref("a"), ref("b")))).toThrow(/1 argument/)
   })
 
   it("the supported 'not equal' is not(eq(...)), which lowers correctly", () => {

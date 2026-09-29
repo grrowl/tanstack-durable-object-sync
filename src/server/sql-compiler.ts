@@ -90,6 +90,15 @@ function compileExpr(node: unknown, params: Array<unknown>): string {
     if (args.length !== 1) throw new UnsupportedPredicateError("'not' expects 1 argument")
     return `(NOT ${compileExpr(args[0], params)})`
   }
+  if (name === "isNull" || name === "isUndefined") {
+    if (args.length !== 1) throw new UnsupportedPredicateError(`'${name}' expects 1 argument`)
+    const col = column(args[0]) // validate even when the result is constant
+    // A stored column is NULL, never undefined: @tanstack/db's `isUndefined`
+    // (=== undefined) is false for every row hydrated from SQLite, and `isNull`
+    // (=== null) is exactly IS NULL. Needed for the nulls-last cursor's whereFrom
+    // (`gt OR isNull OR isUndefined`). ADR-0013 amendment 2026-09-29.
+    return name === "isNull" ? `${col} IS NULL` : "0"
+  }
   if (name === "in") {
     const arr = isNode(args[1]) && args[1].type === "val" ? (args[1] as { value: unknown }).value : undefined
     if (args.length !== 2 || !Array.isArray(arr)) {
@@ -104,7 +113,7 @@ function compileExpr(node: unknown, params: Array<unknown>): string {
   }
   throw new UnsupportedPredicateError(
     `operator '${name}' is not supported for server-side filtering ` +
-      `(floor: eq, gt, gte, lt, lte, like, in, and, or, not)`,
+      `(floor: eq, gt, gte, lt, lte, like, in, isNull, isUndefined, and, or, not)`,
   )
 }
 
