@@ -26,6 +26,12 @@ While pre-1.0, the public API may change between 0.x releases.
 - **No empty ticks after a flush, close or error.** Flushing the last socket
   with pending deltas, or closing or erroring a socket, now cancels the flush
   timer when nothing else is pending, so the DO can hibernate sooner.
+- **Expired dedup receipts are swept on every answered `mut` or `call`**,
+  including rejections, replays and commands that write nothing. The sweep
+  runs at most once per `dedupRetentionMs`, and always on the first receipt
+  after a wake. Before, it ran only with compaction after drained writes, so
+  a DO that only rejected or ran write-free commands grew `_sync_seen_tx`
+  without bound (ADR-0009 amendment).
 - **A fetch page no longer overtakes a buffered delta.** The server flushes
   the socket's pending deltas before it reads a page, the same as it does
   for snapshots (ADR-0023 amendment).
