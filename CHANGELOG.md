@@ -8,6 +8,16 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING (raw clients only):** the server rejects an insert or update
+  whose `cols` carry the primary key with a value different from the op
+  `key`, answering with a `VALIDATION` rejection before `authorize` runs.
+  Before, such a row was stored under the `cols` pk, so its optimistic row
+  never reconciled (ADR-0001 D9). The collection client always sends
+  matching keys and is unaffected. An insert that omits the pk from `cols`
+  is still accepted (ADR-0025 amendment).
+
 ### Fixed
 
 - **Server type declarations no longer need `@cloudflare/workers-types`.**
