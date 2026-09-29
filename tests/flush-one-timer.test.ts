@@ -11,6 +11,50 @@ async function waitFor(pred: () => boolean, timeoutMs = 3000): Promise<void> {
 }
 
 describe("flushOne timer hygiene", () => {
+  it("discards a dead socket's buffer without cancelling another socket's tick", async () => {
+    const sent: Array<{ ws: WebSocket; frame: ServerFrame }> = []
+    const departed = {} as WebSocket
+    const remaining = {} as WebSocket
+    const broadcaster = new Broadcaster((ws, frame) => sent.push({ ws, frame }), () => 20)
+    broadcaster.start(() => [departed, remaining])
+    try {
+      broadcaster.enqueue(departed, { subId: "s", key: "a", op: "delete" }, "1")
+      broadcaster.enqueue(remaining, { subId: "s", key: "b", op: "delete" }, "2")
+      broadcaster.discard(departed)
+      broadcaster.discard(departed)
+      broadcaster.flushOne(departed)
+      expect(sent).toHaveLength(0)
+      expect(broadcaster.isFlushScheduled).toBe(true)
+      await waitFor(() => sent.some((entry) => entry.ws === remaining && entry.frame.t === "uptodate"))
+      expect(sent.map((entry) => entry.ws)).toEqual([remaining, remaining])
+      expect(broadcaster.isFlushScheduled).toBe(false)
+    } finally {
+      broadcaster.stop()
+    }
+  })
+
+  it("discards the last buffer, disarms its tick, and rearms for new work", async () => {
+    const sent: Array<ServerFrame> = []
+    const ws = {} as WebSocket
+    const broadcaster = new Broadcaster((_ws, frame) => sent.push(frame), () => 20)
+    broadcaster.start(() => [ws])
+    try {
+      broadcaster.enqueue(ws, { subId: "s", key: "old", op: "delete" }, "1")
+      broadcaster.discard(ws)
+      expect(broadcaster.isFlushScheduled).toBe(false)
+      broadcaster.flushOne(ws)
+      expect(sent).toHaveLength(0)
+
+      broadcaster.enqueue(ws, { subId: "s", key: "new", op: "delete" }, "2")
+      expect(broadcaster.isFlushScheduled).toBe(true)
+      await waitFor(() => sent.some((frame) => frame.t === "uptodate"))
+      expect(sent.filter((frame) => frame.t === "d").map((frame) => frame.key)).toEqual(["new"])
+      expect(broadcaster.isFlushScheduled).toBe(false)
+    } finally {
+      broadcaster.stop()
+    }
+  })
+
   it("cancels the last pending socket's tick instead of running an empty flush", async () => {
     const sent: Array<ServerFrame> = []
     const ws = {} as WebSocket
