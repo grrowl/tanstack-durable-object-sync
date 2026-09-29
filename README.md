@@ -457,6 +457,16 @@ show. The conventions, what's verified and how, and the full
 
 ---
 
+## Known limitations
+
+- **Large integers in DO SQLite:** workerd `SqlStorage` cannot bind JS `bigint`,
+  and INTEGER values above `Number.MAX_SAFE_INTEGER` round on read before
+  syncing. For exact values, store decimal strings in TEXT columns and convert
+  at the application edge ([workerd#4195](https://github.com/cloudflare/workerd/issues/4195),
+  [issue #10](https://github.com/grrowl/tanstack-durable-object-sync/issues/10)).
+
+---
+
 ## Non-goals
 
 - **Multi-DO transactions.** A transaction touches collections in one DO.

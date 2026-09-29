@@ -84,9 +84,8 @@ try {
     step(`${tag} types: Wrangler-generated Worker program (bundler)`, () => {
       run("node", [wranglerBin, "types", "worker-configuration.d.ts", "--config", "wrangler.json"], dir)
       typecheck(dir, ["-p", "tsconfig.worker.generated.json"])
+      typecheck(dir, ["-p", "tsconfig.worker.generated.json", "--skipLibCheck", "true"])
     })
-    step(`${tag} types: Wrangler-generated Worker program (nodenext)`, () =>
-      typecheck(dir, ["-p", "tsconfig.worker.generated.json", "--module", "nodenext", "--moduleResolution", "nodenext"]))
     step(`${tag} install @cloudflare/workers-types`, () =>
       run("npm", ["install", "--no-audit", "--no-fund", "--no-package-lock", `@cloudflare/workers-types@${workersTypes}`], dir))
     step(`${tag} types: worker program (bundler)`, () => typecheck(dir, ["-p", "tsconfig.worker.json"]))

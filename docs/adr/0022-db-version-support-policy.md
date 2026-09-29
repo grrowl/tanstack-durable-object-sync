@@ -142,8 +142,21 @@ test green at the new floor, and a recorded reason.
   (go-to-definition lands on source, not a missing file): about +54 kB packed.
 - Known gap, not fixed here: the server `.d.ts` files import
   `@cloudflare/workers-types`, which the package does not declare. The smoke
-  consumer installs it — the documented setup (README, examples) — so the test
-  models that setup rather than proving the import is safe without it.
+  consumer installs it — the example-app setup (not specified in README) —
+  so the test models that setup rather than proving the import is safe without it.
 - GitHub disables scheduled workflows after 60 days without repository
   activity, and sends their failure notifications to whoever last edited the
   cron line. A quiet repo must re-enable the job.
+
+## Amendment — 2026-09-29: Worker type sources in packed consumers
+
+The known gap above is closed. Server declarations use ambient Cloudflare
+`SqlStorage` / `SqlStorageValue` types instead of importing
+`@cloudflare/workers-types`. A Worker may supply these globals either through
+`wrangler types` (`worker-configuration.d.ts`) or through
+`@cloudflare/workers-types`; the library no longer forces one source or silently
+degrades SQL handler types to `any` when consumers skip library checks. The
+pack smoke test type-checks the packed package with `skipLibCheck: false` in
+both setups, including a fresh consumer without workers-types installed. The
+previous reference to README as documenting an explicit workers-types install
+was incorrect: only the examples included that package.

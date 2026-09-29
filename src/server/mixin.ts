@@ -20,7 +20,6 @@
 // reach SQLite through `this.ctx.storage.sql`.
 
 import { DurableObject } from "cloudflare:workers"
-import type { SqlStorage, SqlStorageValue } from "@cloudflare/workers-types"
 import { createFrameCodec, type FrameCodec } from "../wire/frame-codec.ts"
 import type { ClientFrame, ServerFrame } from "../wire/frames.ts"
 import {
