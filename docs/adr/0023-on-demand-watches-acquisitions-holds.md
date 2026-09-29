@@ -264,7 +264,9 @@ SQLite does not break by row key as TanStack does.
 
 Cursor pages are client-built `where` expressions, so this fix does not touch
 them. 0.8.6's `buildCursor` ignores `nulls` (plain `gt`/`lt`, `eq` for ties).
-0.9.2 declines a cursor at a NULL boundary and falls back to a full-subset
-load, but for `nulls: "last"` its `whereFrom` is `gt(v) OR isNull OR
-isUndefined`, and `isNull` is outside the predicate floor (ADR-0013): the fetch
-is refused as an empty page and the window stops growing. Pinned as `it.fails`.
+0.9.2 builds no cursor at a NULL boundary: a page request becomes a prefix load
+(`orderBy` + `limit`, no cursor), and a boundary-tie request loads the full
+subset. At a non-NULL boundary with `nulls: "last"`, its `whereFrom` is
+`gt(v)` (`lt(v)` descending) `OR isNull OR isUndefined`, and `isNull` is
+outside the predicate floor (ADR-0013): the fetch is refused as an empty page
+and the window stops growing. Pinned as `it.fails`.

@@ -185,10 +185,13 @@ describe(`F4 bounded snapshot vs TanStack comparator (@tanstack/db ${version})`,
   // refused as an empty page and the window never grows. nulls: "first" is the
   // control: the same path, with a cursor the floor can compile. 0.8.x never
   // scrolls on setWindow (see on-demand-contracts), so there is nothing to pin.
+  // The scroll and its cursor fetch are asserted in a plain `it`, so the
+  // expected failure below can only be the window's contents.
   for (const nulls of ["first", "last"] as const) {
-    const scroll = version === "0.8.x" ? it.skip : nulls === "last" ? it.fails : it
-    // bugbash F4-cursor (nulls: "last" only)
-    scroll(`grows an indexed asc nulls=${nulls} window by a cursor fetch`, async () => {
+    const run = version === "0.8.x" ? it.skip : it
+    let grown: Array<string | null> | undefined
+    let expected: Array<string | null> | undefined
+    run(`scrolls an indexed asc nulls=${nulls} window with a cursor fetch`, async () => {
       const opts = { direction: "asc", nulls, stringSort: "lexical" } as const
       const all = nullRows.length
       const local = createCollection(localOnlyCollectionOptions<Row>({ id: `s-${crypto.randomUUID()}`, getKey: (row) => row.id, initialData: nullRows }))
@@ -198,11 +201,12 @@ describe(`F4 bounded snapshot vs TanStack comparator (@tanstack/db ${version})`,
       const r = room("scroll")
       await seed(r, nullRows)
       const t = transportFor(r, [])
-      let cursorFetches = 0
+      let cursorPages = 0
       const fetch = t.fetch.bind(t)
-      t.fetch = (frame) => {
-        if (frame.cursor) cursorFetches++
-        return fetch(frame)
+      t.fetch = async (frame) => {
+        const page = await fetch(frame)
+        if (frame.cursor) cursorPages++
+        return page
       }
       const coll = createCollection(doCollectionOptions({ transport: t, table: "messages", getKey: (m: Row) => m.id, syncMode: "on-demand" }))
       coll.createIndex((m) => m.body, { indexType: BTreeIndex, options: { compareOptions: opts } })
@@ -210,14 +214,21 @@ describe(`F4 bounded snapshot vs TanStack comparator (@tanstack/db ${version})`,
       try {
         await got.preload()
         await waitFor(() => got.size === K)
-        const grown = (got as unknown as { utils: { setWindow(w: { offset: number; limit: number }): true | Promise<void> } }).utils.setWindow({ offset: 0, limit: all })
-        if (grown !== true) await grown
-        await waitFor(() => got.size === all)
-        expect(cursorFetches).toBeGreaterThan(0)
-        expect(bodies(got)).toEqual(bodies(want))
+        const scrolled = (got as unknown as { utils: { setWindow(w: { offset: number; limit: number }): true | Promise<void> } }).utils.setWindow({ offset: 0, limit: all })
+        expect(scrolled).not.toBe(true)
+        await scrolled
+        expect(cursorPages).toBeGreaterThan(0)
+        grown = bodies(got)
+        expected = bodies(want)
+        expect(expected).toHaveLength(all)
       } finally {
         t.close()
       }
+    })
+    // bugbash F4-cursor: nulls: "last" only.
+    const parity = version === "0.8.x" ? it.skip : nulls === "last" ? it.fails : it
+    parity(`the scrolled asc nulls=${nulls} window matches TanStack's order`, () => {
+      expect(grown).toEqual(expected)
     })
   }
 })
