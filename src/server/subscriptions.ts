@@ -10,7 +10,6 @@
 // client's operator semantics exactly (no second predicate implementation).
 
 import { compileSingleRowExpression, toBooleanPredicate } from "@tanstack/db"
-import type { SqlStorage } from "@cloudflare/workers-types"
 import { decode as decodeValue, encode as encodeValue } from "../wire/codec.ts"
 import { UnsupportedPredicateError } from "./sql-compiler.ts"
 

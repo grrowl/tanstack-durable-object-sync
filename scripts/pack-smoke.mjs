@@ -14,8 +14,8 @@
 //     rendering an SSR snapshot from a Durable Object. The vitest pool cannot
 //     see module-scope restrictions (it evaluates inside a request); this can.
 //
-// The consumer installs @cloudflare/workers-types itself — the documented setup
-// (README, examples). Our server .d.ts files import it without declaring it.
+// Type-check both supported Worker type setups: generated Wrangler globals
+// without workers-types installed, and the explicit workers-types package.
 
 import { execFileSync } from "node:child_process"
 import { cpSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
@@ -66,18 +66,27 @@ try {
 
   for (const spec of [...new Set(specs)]) {
     const dir = join(work, `consumer-${spec.replace(/[^\w.-]/g, "_")}`)
-    for (const f of ["src", "tsconfig.worker.json", "tsconfig.browser.json", "wrangler.json"]) {
+    for (const f of ["src", "tsconfig.worker.json", "tsconfig.worker.generated.json", "tsconfig.browser.json", "wrangler.json"]) {
       cpSync(join(fixture, f), join(dir, f), { recursive: true })
     }
     writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "tddc-smoke-consumer", private: true, type: "module" }))
     const tag = `[@tanstack/db ${spec}]`
     step(`${tag} install`, () => {
       run("npm", ["install", "--no-audit", "--no-fund", "--no-package-lock", tarball,
-        `@tanstack/db@${spec}`, `@cloudflare/workers-types@${workersTypes}`], dir)
+        `@tanstack/db@${spec}`], dir)
+      if (existsSync(join(dir, "node_modules/@cloudflare/workers-types"))) {
+        throw new Error("generated-types consumer unexpectedly installed @cloudflare/workers-types")
+      }
       const got = JSON.parse(readFileSync(join(dir, "node_modules/@tanstack/db/package.json"), "utf8")).version
       if (/^\d+\.\d+\.\d+$/.test(spec) && got !== spec) throw new Error(`installed @tanstack/db ${got}, wanted ${spec}`)
       console.log(`  resolved @tanstack/db ${got}`)
     })
+    step(`${tag} types: Wrangler-generated Worker program (bundler)`, () => {
+      run("node", [wranglerBin, "types", "worker-configuration.d.ts", "--config", "wrangler.json"], dir)
+      typecheck(dir, ["-p", "tsconfig.worker.generated.json"])
+    })
+    step(`${tag} install @cloudflare/workers-types`, () =>
+      run("npm", ["install", "--no-audit", "--no-fund", "--no-package-lock", `@cloudflare/workers-types@${workersTypes}`], dir))
     step(`${tag} types: worker program (bundler)`, () => typecheck(dir, ["-p", "tsconfig.worker.json"]))
     step(`${tag} types: worker program (nodenext)`, () =>
       typecheck(dir, ["-p", "tsconfig.worker.json", "--module", "nodenext", "--moduleResolution", "nodenext"]))

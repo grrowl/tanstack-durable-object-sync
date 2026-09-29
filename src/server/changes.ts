@@ -9,8 +9,6 @@
 // No before-image column: move-in/move-out is computed at emit time from the
 // current row + the subscription predicate (ADR-0002 C4).
 
-import type { SqlStorage, SqlStorageValue } from "@cloudflare/workers-types"
-
 export const SYNC_PREFIX = "_sync_"
 
 export type ChangeOp = "insert" | "update" | "delete"

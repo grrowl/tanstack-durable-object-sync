@@ -6,7 +6,6 @@
 // current client can still retry an old txId, so this table is swept on its
 // own time-based horizon (M7), not tied to the compaction floor.
 
-import type { SqlStorage } from "@cloudflare/workers-types"
 import { decode as decodeValue, encode as encodeValue } from "../wire/codec.ts"
 
 export interface SeenTx {
