@@ -90,6 +90,17 @@ function compileExpr(node: unknown, params: Array<unknown>): string {
     if (args.length !== 1) throw new UnsupportedPredicateError("'not' expects 1 argument")
     return `(NOT ${compileExpr(args[0], params)})`
   }
+  if (name === "isNull" || name === "isUndefined") {
+    if (args.length !== 1) throw new UnsupportedPredicateError(`'${name}' expects 1 argument`)
+    const col = column(args[0])
+    // A stored column is NULL, never undefined: @tanstack/db's `isUndefined`
+    // (=== undefined) is false for every row hydrated from SQLite, and `isNull`
+    // (=== null) is exactly IS NULL. Needed for the nulls-last cursor's whereFrom
+    // (`gt OR isNull OR isUndefined`). ADR-0013 amendment 2026-09-29.
+    // Only a column the table lacks is undefined in JS (true there, false here); the
+    // schema is author-owned and shared with the client, so that is out of contract.
+    return name === "isNull" ? `${col} IS NULL` : "0"
+  }
   if (name === "in") {
     const arr = isNode(args[1]) && args[1].type === "val" ? (args[1] as { value: unknown }).value : undefined
     if (args.length !== 2 || !Array.isArray(arr)) {
@@ -104,7 +115,7 @@ function compileExpr(node: unknown, params: Array<unknown>): string {
   }
   throw new UnsupportedPredicateError(
     `operator '${name}' is not supported for server-side filtering ` +
-      `(floor: eq, gt, gte, lt, lte, like, in, and, or, not)`,
+      `(floor: eq, gt, gte, lt, lte, like, in, isNull, isUndefined, and, or, not)`,
   )
 }
 
@@ -145,15 +156,21 @@ function orderByTerm(item: unknown): { col: string; desc: boolean; nullsLast: bo
   throw new UnsupportedPredicateError(`unsupported orderBy clause: ${JSON.stringify(item)}`)
 }
 
-function compileOrderBy(orderBy: unknown): string {
+function compileOrderBy(orderBy: unknown, pk: string): string {
   if (!Array.isArray(orderBy) || orderBy.length === 0) return ""
-  return orderBy
-    .map((item) => {
-      const { col, desc, nullsLast } = orderByTerm(item)
-      if (!IDENT.test(col)) throw new UnsupportedPredicateError(`invalid orderBy column: ${col}`)
-      return `"${col}" ${desc ? "DESC" : "ASC"} NULLS ${nullsLast ? "LAST" : "FIRST"}`
-    })
-    .join(", ")
+  if (!IDENT.test(pk)) throw new UnsupportedPredicateError(`invalid pk column: ${pk}`)
+  const terms = orderBy.map((item) => {
+    const { col, desc, nullsLast } = orderByTerm(item)
+    if (!IDENT.test(col)) throw new UnsupportedPredicateError(`invalid orderBy column: ${col}`)
+    return `"${col}" ${desc ? "DESC" : "ASC"} NULLS ${nullsLast ? "LAST" : "FIRST"}`
+  })
+  // Final tie-break by pk, ascending whatever the order direction: @tanstack/db
+  // breaks value ties by row key ascending (db-ivm `createKeyedComparator`, same in
+  // db-ivm 0.1.19 and 0.1.22), comparing strings with `<`. Forced to BINARY: the pk
+  // may declare another collation (NOCASE), which would order `a` before `B`. Without it a LIMIT over
+  // tied rows picks by scan order and the window differs from the client's own.
+  terms.push(`"${pk}" COLLATE BINARY ASC`)
+  return terms.join(", ")
 }
 
 function nonNegInt(n: unknown, label: string): number {
@@ -164,6 +181,8 @@ function nonNegInt(n: unknown, label: string): number {
 }
 
 export interface SubsetQuery {
+  /** The collection's pk column: the final ORDER BY tie-break. */
+  pk: string
   where?: unknown
   orderBy?: unknown
   limit?: number
@@ -182,7 +201,7 @@ export function compileSubsetQuery(tbl: string, opts: SubsetQuery): { sql: strin
     params.push(...w.params)
   }
 
-  const orderBy = compileOrderBy(opts.orderBy)
+  const orderBy = compileOrderBy(opts.orderBy, opts.pk)
   if (orderBy) {
     sql += ` ORDER BY ${orderBy}`
   } else {

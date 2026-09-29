@@ -186,6 +186,41 @@ describe("SQL/JS predicate parity (ADR-0013)", () => {
     expect(snap).toEqual(["lo", "up"])
   })
 
+  // isNull (bugbash F4-cursor): a nulls-last cursor's whereFrom is
+  // `gt(v) OR isNull(col) OR isUndefined(col)`. SQL IS NULL and JS `=== null` agree
+  // because the delta path evaluates rows hydrated from SQLite, where a NULL column
+  // is `null` whether the write omitted it or sent it explicitly.
+  it("isNull: only the NULL row matches on both paths", async () => {
+    const where = fn("isNull", ref("body"))
+    const snap = await snapshotMembers("pp-isnull-snap", where)
+    const delta = await deltaMembers("pp-isnull-delta", where)
+    const deltaExplicit = await deltaMembers("pp-isnull-delta-explicit", where, true)
+    expect(snap, `isNull mismatch — snap=${snap} delta=${delta}`).toEqual(delta)
+    expect(delta, `isNull null-spelling mismatch — omit=${delta} explicit=${deltaExplicit}`).toEqual(deltaExplicit)
+    expect(snap).toEqual(["n1"])
+  })
+
+  // isUndefined: SQLite has no undefined and hydration yields null, so it matches
+  // nothing on either path — including the NULL row.
+  it("isUndefined: matches no stored row on either path, NULL included", async () => {
+    const where = fn("isUndefined", ref("body"))
+    const snap = await snapshotMembers("pp-isundef-snap", where)
+    const delta = await deltaMembers("pp-isundef-delta", where)
+    const deltaExplicit = await deltaMembers("pp-isundef-delta-explicit", where, true)
+    expect(snap, `isUndefined mismatch — snap=${snap} delta=${delta}`).toEqual(delta)
+    expect(delta, `isUndefined null-spelling mismatch — omit=${delta} explicit=${deltaExplicit}`).toEqual(deltaExplicit)
+    expect(snap).toEqual([])
+  })
+
+  // The nulls-last cursor shape TanStack 0.9 emits, composed as a whole.
+  it("gt OR isNull OR isUndefined: the cursor whereFrom agrees across paths", async () => {
+    const where = fn("or", fn("gt", ref("body"), val("a")), fn("isNull", ref("body")), fn("isUndefined", ref("body")))
+    const snap = await snapshotMembers("pp-cursor-snap", where)
+    const delta = await deltaMembers("pp-cursor-delta", where)
+    expect(snap, `cursor mismatch — snap=${snap} delta=${delta}`).toEqual(delta)
+    expect(snap).toEqual(["lo", "n1", "x"])
+  })
+
   // in: SQL NULL IN (...) → NULL → n1 excluded; JS .includes(null) → false. "HELLO" not in list.
   it("in: NULL body excluded, exact match only (no case folding)", async () => {
     const where = fn("in", ref("body"), val(["hello", "x"]))
