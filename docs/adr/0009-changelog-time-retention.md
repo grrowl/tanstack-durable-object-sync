@@ -187,3 +187,38 @@ untouched (`dedupRetentionMs` stays separate).
   batch (`appliedSeq` advances on the next delivery without a contiguity check).
   This exists today, independent of retention; pruning neither causes nor worsens
   it. Not addressed here.
+
+## Amendment — 2026-09-29: the dedup sweep rides receipts, not compaction
+
+§1 put `sweepDedup` inside `maybeCompact`, which runs only when a drain finds
+CDC rows. But `_sync_seen_tx` rows come from answered receipts, not drains. A DO
+that only rejects mutations, replays receipts, or runs commands that write
+nothing adds a row per frame and never sweeps (bug bash 2026-09-29, F7).
+
+`sweepDedup` moves out of `maybeCompact`. It now runs after every answered
+`mut`/`call` receipt (new outcome or replay), after the reply is sent, behind
+one gate held in memory: at most one sweep per `dedupRetentionMs`. The gate
+starts at 0, so the first receipt after construction or a hibernation wake
+always sweeps. No new knob, no idle timer, no alarm, and no write per receipt
+beyond `recordTx`.
+
+- **Why in memory.** A persisted counter would add an UPSERT to every receipt.
+  An in-memory counter would reset on each wake, so a quiet DO that hibernates
+  between receipts would never reach its threshold. A time gate that reopens on
+  wake has neither problem.
+- **Why time, not a count.** `DELETE … WHERE ts < ?` scans the whole table
+  (there is no index on `ts`). Under a count cadence the scans per hour grow with
+  traffic, and so does each scan. Under a time gate a DO that stays awake scans
+  once per window, whatever the traffic. A DO that wakes per receipt scans once
+  per wake, but it is quiet, so its table is small.
+- **Why the window is `dedupRetentionMs`.** Retention is a lower bound: a retry
+  inside the window is deduped (ADR-0002 C5, ADR-0021). Sweeping less often only
+  keeps rows longer. An expired receipt now lives at most one more window, so the
+  table holds at most about two windows of receipts.
+- **Server-originated writes** (`runSyncedWrite`) no longer sweep dedup. They add
+  no receipts, so they add no rows to sweep.
+- A DO that receives nothing sweeps nothing. Its table does not grow either.
+
+Tests: `tests/dedup-sweep.test.ts` drives each receipt path through real
+sockets and polls the table. It also pins the gate: closed within the window,
+reopened by a wake (`evictDurableObject`) or by elapsed time.
