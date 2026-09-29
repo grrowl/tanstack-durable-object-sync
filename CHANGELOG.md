@@ -20,6 +20,15 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ### Fixed
 
+- **A subclass `tickMs` override now takes effect.** The coalescer read the
+  tick before subclass fields were set, so it always used 50 ms (ADR-0015
+  amendment).
+- **No empty ticks after a flush, close or error.** Flushing the last socket
+  with pending deltas, or closing or erroring a socket, now cancels the flush
+  timer when nothing else is pending, so the DO can hibernate sooner.
+- **A fetch page no longer overtakes a buffered delta.** The server flushes
+  the socket's pending deltas before it reads a page, the same as it does
+  for snapshots (ADR-0023 amendment).
 - **Server type declarations no longer need `@cloudflare/workers-types`.**
   The shipped `.d.ts` files use the ambient Worker SQL types, so a Worker
   typed with `wrangler types` and `skipLibCheck: false` no longer fails with
