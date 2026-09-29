@@ -75,7 +75,7 @@ describe("IR -> SQL compiler (M6)", () => {
       limit: 10,
       offset: 20,
     })
-    expect(q.sql).toBe(`SELECT * FROM "messages" WHERE "body" = ? ORDER BY "created_at" DESC LIMIT ? OFFSET ?`)
+    expect(q.sql).toBe(`SELECT * FROM "messages" WHERE "body" = ? ORDER BY "created_at" DESC NULLS FIRST LIMIT ? OFFSET ?`)
     expect(q.params).toEqual(["x", 10, 20])
   })
 
@@ -83,6 +83,16 @@ describe("IR -> SQL compiler (M6)", () => {
     const q = compileSubsetQuery("t", { offset: 5 })
     expect(q.sql).toBe(`SELECT * FROM "t" ORDER BY rowid LIMIT -1 OFFSET ?`)
     expect(q.params).toEqual([5])
+  })
+
+  it("preserves each orderBy clause's null placement", () => {
+    const q = compileSubsetQuery("t", {
+      orderBy: [
+        { expression: ref("body"), compareOptions: { direction: "desc", nulls: "last" } },
+        { expression: ref("id"), compareOptions: { direction: "asc" } },
+      ],
+    })
+    expect(q.sql).toBe(`SELECT * FROM "t" ORDER BY "body" DESC NULLS LAST, "id" ASC NULLS FIRST`)
   })
 
   it("defaults to ORDER BY rowid when the client sends no orderBy (deterministic snapshot order)", () => {
