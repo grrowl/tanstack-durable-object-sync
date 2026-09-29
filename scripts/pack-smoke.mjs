@@ -84,7 +84,6 @@ try {
     step(`${tag} types: Wrangler-generated Worker program (bundler)`, () => {
       run("node", [wranglerBin, "types", "worker-configuration.d.ts", "--config", "wrangler.json"], dir)
       typecheck(dir, ["-p", "tsconfig.worker.generated.json"])
-      typecheck(dir, ["-p", "tsconfig.worker.generated.json", "--skipLibCheck", "true"])
     })
     step(`${tag} install @cloudflare/workers-types`, () =>
       run("npm", ["install", "--no-audit", "--no-fund", "--no-package-lock", `@cloudflare/workers-types@${workersTypes}`], dir))
