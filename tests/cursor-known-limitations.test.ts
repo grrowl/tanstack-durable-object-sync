@@ -111,8 +111,9 @@ describe("single-cursor known limitations", () => {
       const server = await serverIds(r)
       await settle(() => JSON.stringify([...sink.rows.keys()].sort()) === JSON.stringify(server))
 
+      const client = [...sink.rows.keys()].sort()
       reached.add("L2")
-      expect([...sink.rows.keys()].sort()).toEqual(server)
+      expect(client).toEqual(server)
     } finally {
       t.close()
     }
@@ -164,8 +165,9 @@ describe("single-cursor known limitations", () => {
       await waitFor(() => sink.terminals.slice(mark).some((e) => e === "uptodate(own)" || e === "snap-end"))
       await settle(() => JSON.stringify([...sink.rows.keys()].sort()) === JSON.stringify(server))
 
+      const client = [...sink.rows.keys()].sort()
       reached.add("L1")
-      expect([...sink.rows.keys()].sort()).toEqual(server)
+      expect(client).toEqual(server)
     } finally {
       t.close()
     }

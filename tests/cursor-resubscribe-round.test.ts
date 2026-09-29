@@ -208,7 +208,7 @@ function isRed(b: Boundary, set: ChangeSet): boolean {
     case "after":
       return set.affects.some((j) => j > b.i)
     case "broadcast":
-      return set.affects.some((j) => j >= 1)
+      return true // the live write (a8) is itself a change the unfinished a* watch misses
   }
 }
 
@@ -304,8 +304,6 @@ async function scenario(name: string, setName: string, b: Boundary): Promise<voi
     await waitFor(() => sockets[0]!.subs.length === 4)
     expect(sockets[0]!.subs.map((s) => s.collection)).toEqual([...TABLE_OF])
     expect(client()).toEqual(await server()) // bootstrapped, converged
-    const c0 = BigInt(t.appliedCursor)
-    expect(c0).toBeGreaterThan(0n)
 
     // Drop; hold the reconnect until the offline changes are in.
     gate = new Promise<void>((res) => (release = res))
@@ -330,11 +328,24 @@ async function scenario(name: string, setName: string, b: Boundary): Promise<voi
     } else {
       await waitFor(() => round.dropped)
     }
-    // The cut landed where the scenario says: a boundary that advanced the
-    // cursor did so, and one before any terminal did not.
-    const cursorAtCut = BigInt(t.appliedCursor)
-    if (b.kind === "before-any" || (b.kind === "mid" && b.i === 0)) expect(cursorAtCut).toBe(c0)
-    else expect(cursorAtCut).toBeGreaterThan(c0)
+    // The cut landed where the scenario says, judged by what was delivered —
+    // not by the cursor, which a fix may well hold back.
+    const last = round.frames.at(-1) as { t: string; sub?: string } | undefined
+    const ownDelivered = (i: number): boolean => round.frames.some((f) => own(f, round.subs[i]?.subId))
+    switch (b.kind) {
+      case "before-any":
+        expect(round.frames).toEqual([])
+        break
+      case "mid":
+        expect([last?.t, last?.sub, ownDelivered(b.i)]).toEqual(["d", round.subs[b.i]!.subId, false])
+        break
+      case "after":
+        expect([last?.t, last?.sub]).toEqual(["uptodate", round.subs[b.i]!.subId])
+        break
+      case "broadcast":
+        expect([last?.t, last?.sub, [1, 2, 3].some(ownDelivered)]).toEqual(["uptodate", undefined, false])
+        break
+    }
 
     // One clean reconnect: wait for every sub's own terminal on it.
     if (b.kind !== "none") await waitFor(() => sockets.length >= 3)
@@ -346,8 +357,10 @@ async function scenario(name: string, setName: string, b: Boundary): Promise<voi
     expect(final.dropped).toBe(false)
     expect(sockets.length).toBe(b.kind === "none" ? 2 : 3)
 
+    const got = client()
+    const want = await server()
     reached.add(name)
-    expect(client()).toEqual(await server())
+    expect(got).toEqual(want)
   } finally {
     t.close()
   }
