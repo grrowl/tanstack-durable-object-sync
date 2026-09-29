@@ -652,6 +652,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
        *  — a concurrent mutation is either reflected in it or arrives as a delta
        *  AFTER it, never split across the two reads (ADR-0003). */
       #handleFetch(ws: WebSocket, frame: Extract<ClientFrame, { t: "fetch" }>): void {
+        this.#broadcaster.flushOne(ws)
         const coll = this.#registry.collections.get(frame.collection)
         if (!coll) {
           this.#send(ws, { t: "page", fetchId: frame.fetchId, rows: [], seq: "0" })
