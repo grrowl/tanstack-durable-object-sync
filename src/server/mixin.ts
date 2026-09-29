@@ -213,7 +213,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
         // ONLY our tagged sockets so the broadcaster never touches a host socket.
         const restore = this.#isBareDO ? this.ctx.getWebSockets() : this.ctx.getWebSockets(SYNC_TAG)
         for (const ws of restore) this.#liveWs.add(ws)
-        this.#broadcaster = new Broadcaster((ws, frame) => this.#send(ws, frame), this.tickMs)
+        this.#broadcaster = new Broadcaster((ws, frame) => this.#send(ws, frame), () => this.tickMs)
         this.#broadcaster.start(() => this.#liveWs)
         const self = this
         this.#api = {
@@ -558,6 +558,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
        *  `registerSync` (no `initSchema`, no `_sync_subs`): it can have had no
        *  subscriptions, so there is nothing durable to delete. */
       #dropSocketSubs(ws: WebSocket): void {
+        this.#broadcaster.discard(ws)
         this.#subs.removeAll(ws)
         if (this.#compiled) {
           const sid = this.#socketIdFor(ws)
@@ -651,6 +652,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
        *  — a concurrent mutation is either reflected in it or arrives as a delta
        *  AFTER it, never split across the two reads (ADR-0003). */
       #handleFetch(ws: WebSocket, frame: Extract<ClientFrame, { t: "fetch" }>): void {
+        this.#broadcaster.flushOne(ws)
         const coll = this.#registry.collections.get(frame.collection)
         if (!coll) {
           this.#send(ws, { t: "page", fetchId: frame.fetchId, rows: [], seq: "0" })

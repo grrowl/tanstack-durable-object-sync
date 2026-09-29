@@ -4,8 +4,8 @@
 // streaming token field) to one delta per tick.
 //
 // Hibernation-native: the flush timer is armed on demand by enqueue() and
-// cleared by flushAll(). A quiet broadcaster holds no timer, so the DO is free
-// to hibernate (held timers would prevent it).
+// cleared when the live sockets have no pending work. A quiet broadcaster holds
+// no timer, so the DO is free to hibernate (held timers would prevent it).
 //
 // The C1 ordering invariant (ADR-0002): the originating socket of a mutation is
 // flushed via flushOne() BEFORE its `committed` receipt, so its deltas precede
@@ -30,7 +30,7 @@ export class Broadcaster {
 
   constructor(
     private readonly rawSend: RawSend,
-    private readonly tickMs: number = 50,
+    private readonly tickMs: () => number = () => 50,
   ) {}
 
   /** True while a tick flush is pending — exposed for hibernation assertions. */
@@ -74,11 +74,26 @@ export class Broadcaster {
     }
     m.clear()
     this.rawSend(ws, { t: "uptodate", seq: this.latestCursor })
+    this.clearTimerIfIdle()
+  }
+
+  discard(ws: WebSocket): void {
+    this.pending.delete(ws)
+    this.clearTimerIfIdle()
   }
 
   flushAll(wss: Iterable<WebSocket>): void {
-    for (const ws of wss) this.flushOne(ws)
     this.clearTimer()
+    for (const ws of wss) this.flushOne(ws)
+  }
+
+  private clearTimerIfIdle(): void {
+    if (this.flushTimer && this.getAllWs) {
+      for (const socket of this.getAllWs()) {
+        if (this.pending.get(socket)?.size) return
+      }
+      this.clearTimer()
+    }
   }
 
   private armFlush(): void {
@@ -87,7 +102,7 @@ export class Broadcaster {
       this.flushTimer = null
       const get = this.getAllWs
       if (get) this.flushAll(get())
-    }, this.tickMs)
+    }, this.tickMs())
   }
 
   private clearTimer(): void {
