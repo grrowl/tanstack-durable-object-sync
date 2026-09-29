@@ -178,4 +178,46 @@ describe(`F4 bounded snapshot vs TanStack comparator (@tanstack/db ${version})`,
   it.fails("selects the same three NULL rows as TanStack when ties cross the limit", () => {
     expect(tiedSnapshot).toEqual(tiedExpected)
   })
+
+  // 0.9.x scrolls an indexed, cursor-expressible window with a cursor fetch.
+  // For nulls: "last" its `whereFrom` is `gt(v) OR isNull OR isUndefined`, and
+  // isNull is outside the server's predicate floor (ADR-0013): the fetch is
+  // refused as an empty page and the window never grows. nulls: "first" is the
+  // control: the same path, with a cursor the floor can compile. 0.8.x never
+  // scrolls on setWindow (see on-demand-contracts), so there is nothing to pin.
+  for (const nulls of ["first", "last"] as const) {
+    const scroll = version === "0.8.x" ? it.skip : nulls === "last" ? it.fails : it
+    // bugbash F4-cursor (nulls: "last" only)
+    scroll(`grows an indexed asc nulls=${nulls} window by a cursor fetch`, async () => {
+      const opts = { direction: "asc", nulls, stringSort: "lexical" } as const
+      const all = nullRows.length
+      const local = createCollection(localOnlyCollectionOptions<Row>({ id: `s-${crypto.randomUUID()}`, getKey: (row) => row.id, initialData: nullRows }))
+      const want = createLiveQueryCollection((q) => q.from({ m: local }).orderBy(({ m }) => m.body, opts).limit(all))
+      await want.preload()
+
+      const r = room("scroll")
+      await seed(r, nullRows)
+      const t = transportFor(r, [])
+      let cursorFetches = 0
+      const fetch = t.fetch.bind(t)
+      t.fetch = (frame) => {
+        if (frame.cursor) cursorFetches++
+        return fetch(frame)
+      }
+      const coll = createCollection(doCollectionOptions({ transport: t, table: "messages", getKey: (m: Row) => m.id, syncMode: "on-demand" }))
+      coll.createIndex((m) => m.body, { indexType: BTreeIndex, options: { compareOptions: opts } })
+      const got = createLiveQueryCollection((q) => q.from({ m: coll }).orderBy(({ m }) => m.body, opts).limit(K))
+      try {
+        await got.preload()
+        await waitFor(() => got.size === K)
+        const grown = (got as unknown as { utils: { setWindow(w: { offset: number; limit: number }): true | Promise<void> } }).utils.setWindow({ offset: 0, limit: all })
+        if (grown !== true) await grown
+        await waitFor(() => got.size === all)
+        expect(cursorFetches).toBeGreaterThan(0)
+        expect(bodies(got)).toEqual(bodies(want))
+      } finally {
+        t.close()
+      }
+    })
+  }
 })
