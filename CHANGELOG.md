@@ -8,6 +8,22 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Server type declarations no longer need `@cloudflare/workers-types`.**
+  The shipped `.d.ts` files use the ambient Worker SQL types, so a Worker
+  typed with `wrangler types` and `skipLibCheck: false` no longer fails with
+  TS2307. The pack smoke test now checks both type setups (ADR-0022
+  amendment).
+
+### Documentation
+
+- README gains a Known limitations section: DO SQLite can't bind `bigint`,
+  and INTEGER values above 2^53 round on read (workerd#4195, #10). ADR-0001
+  D17 is qualified to match.
+- ADR-0012 D3 points to ADR-0014, which changed how `handleCall` sanitizes
+  authorize errors.
+
 ## [0.7.0] — 2026-09-25
 
 ### Added
