@@ -278,10 +278,11 @@ Two of the open items above are closed.
 - **Ties.** Every bounded read ends its `ORDER BY` with the collection's pk,
   ascending whatever the direction. `@tanstack/db` breaks value ties by row key
   ascending (`createKeyedComparator` → `compareKeys` in db-ivm; identical in
-  0.8.6's db-ivm 0.1.19 and 0.9.2's 0.1.22), comparing strings with `<`. The pk is
-  TEXT-affinity (ADR-0001 D9), so SQLite's BINARY collation gives the same order
-  (they differ only for astral versus U+E000–U+FFFF characters, as JS compares
-  UTF-16 code units). The snapshot, RPC snapshot, and fetch paths all build their
+  0.8.6's db-ivm 0.1.19 and 0.9.2's 0.1.22), comparing strings with `<`. The
+  term is `COLLATE BINARY` explicitly, since a pk may declare another collation
+  (NOCASE would order `a` before `B`). BINARY matches JS code-unit order except
+  for astral versus U+E000–U+FFFF characters (JS compares UTF-16 code units,
+  SQLite UTF-8 bytes): a known residual divergence. The snapshot, RPC snapshot, and fetch paths all build their
   SQL in `compileSubsetQuery`, so one change covers them.
   `tests/order-by-ties.test.ts` drives the sub and fetch paths.
 - **Nulls-last cursor.** `isNull` and `isUndefined` joined the predicate floor

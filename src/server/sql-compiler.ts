@@ -92,11 +92,13 @@ function compileExpr(node: unknown, params: Array<unknown>): string {
   }
   if (name === "isNull" || name === "isUndefined") {
     if (args.length !== 1) throw new UnsupportedPredicateError(`'${name}' expects 1 argument`)
-    const col = column(args[0]) // validate even when the result is constant
+    const col = column(args[0])
     // A stored column is NULL, never undefined: @tanstack/db's `isUndefined`
     // (=== undefined) is false for every row hydrated from SQLite, and `isNull`
     // (=== null) is exactly IS NULL. Needed for the nulls-last cursor's whereFrom
     // (`gt OR isNull OR isUndefined`). ADR-0013 amendment 2026-09-29.
+    // Only a column the table lacks is undefined in JS (true there, false here); the
+    // schema is author-owned and shared with the client, so that is out of contract.
     return name === "isNull" ? `${col} IS NULL` : "0"
   }
   if (name === "in") {
@@ -164,10 +166,10 @@ function compileOrderBy(orderBy: unknown, pk: string): string {
   })
   // Final tie-break by pk, ascending whatever the order direction: @tanstack/db
   // breaks value ties by row key ascending (db-ivm `createKeyedComparator`, same in
-  // db-ivm 0.1.19 and 0.1.22), comparing strings with `<`. The pk is TEXT-affinity
-  // (ADR-0001 D9), so SQLite's BINARY collation matches. Without it a LIMIT over
+  // db-ivm 0.1.19 and 0.1.22), comparing strings with `<`. Forced to BINARY: the pk
+  // may declare another collation (NOCASE), which would order `a` before `B`. Without it a LIMIT over
   // tied rows picks by scan order and the window differs from the client's own.
-  terms.push(`"${pk}" ASC`)
+  terms.push(`"${pk}" COLLATE BINARY ASC`)
   return terms.join(", ")
 }
 

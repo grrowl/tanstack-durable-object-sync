@@ -87,7 +87,7 @@ describe("IR -> SQL compiler (M6)", () => {
       limit: 10,
       offset: 20,
     })
-    expect(q.sql).toBe(`SELECT * FROM "messages" WHERE "body" = ? ORDER BY "created_at" DESC NULLS FIRST, "id" ASC LIMIT ? OFFSET ?`)
+    expect(q.sql).toBe(`SELECT * FROM "messages" WHERE "body" = ? ORDER BY "created_at" DESC NULLS FIRST, "id" COLLATE BINARY ASC LIMIT ? OFFSET ?`)
     expect(q.params).toEqual(["x", 10, 20])
   })
 
@@ -105,13 +105,13 @@ describe("IR -> SQL compiler (M6)", () => {
         { expression: ref("id"), compareOptions: { direction: "asc" } },
       ],
     })
-    expect(q.sql).toBe(`SELECT * FROM "t" ORDER BY "body" DESC NULLS LAST, "id" ASC NULLS FIRST, "id" ASC`)
+    expect(q.sql).toBe(`SELECT * FROM "t" ORDER BY "body" DESC NULLS LAST, "id" ASC NULLS FIRST, "id" COLLATE BINARY ASC`)
   })
 
   it("breaks value ties by pk ascending, whatever the order direction (bugbash F4-ties)", () => {
     // @tanstack/db's createKeyedComparator: value first, then row key ascending.
     const desc = compileSubsetQuery("t", { pk: "key", orderBy: [{ col: "body", dir: "desc" }], limit: 3 })
-    expect(desc.sql).toBe(`SELECT * FROM "t" ORDER BY "body" DESC NULLS FIRST, "key" ASC LIMIT ?`)
+    expect(desc.sql).toBe(`SELECT * FROM "t" ORDER BY "body" DESC NULLS FIRST, "key" COLLATE BINARY ASC LIMIT ?`)
     expect(() => compileSubsetQuery("t", { pk: "k; DROP", orderBy: [{ col: "body" }] })).toThrow(/pk column/)
   })
 

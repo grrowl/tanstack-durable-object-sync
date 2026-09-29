@@ -109,7 +109,11 @@ against `evaluators.ts` in both 0.8.6 and 0.9.2 (identical):
 - `isUndefined(x)` is `x === undefined`. A stored column is never undefined (SQLite
   has no such value; hydration yields `null`), so it is false for every stored row.
   SQL: the constant `0`, like the empty `in`. The operand is still validated as a
-  plain column reference.
+  plain column reference. Residual: `=== undefined` is TRUE for a property the row
+  lacks, i.e. a column the table does not have; there SQL says false. Unknown
+  columns are out of contract (the schema is author-owned and shared with the
+  client, and SQLite reads an unresolvable quoted name as a string literal, so
+  no operator fails loud on one).
 
 The floor is now `{ eq, gt, gte, lt, lte, like, in, isNull, isUndefined, and, or,
 not }`. `tests/predicate-parity.test.ts` pins both operators, and the composed
