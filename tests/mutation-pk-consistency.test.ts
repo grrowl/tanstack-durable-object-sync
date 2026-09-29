@@ -160,7 +160,7 @@ describe("mutation pk agrees with the op key (ADR-0025)", () => {
     writer.close()
   })
 
-  it("replays a recorded pk rejection before checking a corrected duplicate", async () => {
+  it("persists a pk rejection and replays it for a corrected duplicate", async () => {
     const room = `pk-rejected-dedup-${crypto.randomUUID()}`
     const writer = await openWs(room)
     send(writer, { t: "mut", txId: "pk-rejected", collection: "messages", ops: [{ type: "insert", key: "a", cols: { id: "b", body: "bad" } }] })
