@@ -86,6 +86,7 @@ Each is load-bearing and guarded by an ADR — read it before you touch the area
 - **Run plans and risky changes past codex (`gpt-5.6-sol`) as an adversary**
   before committing — it has caught real bugs here (the cursor-fetch race, the
   scroll-back `DuplicateKeySyncError`). Use the strongest available model; a
-  weaker adversary is a weaker review. Pipe input in (`git diff | codex exec
-  … -`) or close stdin (`codex exec "…" < /dev/null`) — an open stdin hangs
-  codex forever.
+  weaker adversary is a weaker review. Pipe input in with the prompt as the
+  only argument (`git diff --no-ext-diff | codex exec "…"`; codex appends
+  stdin to the prompt, and rejects a trailing `-` after a prompt), or close
+  stdin (`codex exec "…" < /dev/null`) — an open stdin hangs codex forever.
