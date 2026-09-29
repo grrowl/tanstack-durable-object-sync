@@ -559,6 +559,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
        *  `registerSync` (no `initSchema`, no `_sync_subs`): it can have had no
        *  subscriptions, so there is nothing durable to delete. */
       #dropSocketSubs(ws: WebSocket): void {
+        this.#broadcaster.discard(ws)
         this.#subs.removeAll(ws)
         if (this.#compiled) {
           const sid = this.#socketIdFor(ws)

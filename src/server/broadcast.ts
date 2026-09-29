@@ -74,17 +74,26 @@ export class Broadcaster {
     }
     m.clear()
     this.rawSend(ws, { t: "uptodate", seq: this.latestCursor })
+    this.clearTimerIfIdle()
+  }
+
+  discard(ws: WebSocket): void {
+    this.pending.delete(ws)
+    this.clearTimerIfIdle()
+  }
+
+  flushAll(wss: Iterable<WebSocket>): void {
+    this.clearTimer()
+    for (const ws of wss) this.flushOne(ws)
+  }
+
+  private clearTimerIfIdle(): void {
     if (this.flushTimer && this.getAllWs) {
       for (const socket of this.getAllWs()) {
         if (this.pending.get(socket)?.size) return
       }
       this.clearTimer()
     }
-  }
-
-  flushAll(wss: Iterable<WebSocket>): void {
-    this.clearTimer()
-    for (const ws of wss) this.flushOne(ws)
   }
 
   private armFlush(): void {
