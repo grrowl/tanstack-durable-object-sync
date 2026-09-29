@@ -30,7 +30,7 @@ export class Broadcaster {
 
   constructor(
     private readonly rawSend: RawSend,
-    private readonly tickMs: number = 50,
+    private readonly tickMs: number | (() => number) = 50,
   ) {}
 
   /** True while a tick flush is pending — exposed for hibernation assertions. */
@@ -87,7 +87,7 @@ export class Broadcaster {
       this.flushTimer = null
       const get = this.getAllWs
       if (get) this.flushAll(get())
-    }, this.tickMs)
+    }, typeof this.tickMs === "function" ? this.tickMs() : this.tickMs)
   }
 
   private clearTimer(): void {

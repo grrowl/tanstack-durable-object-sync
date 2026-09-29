@@ -214,7 +214,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
         // ONLY our tagged sockets so the broadcaster never touches a host socket.
         const restore = this.#isBareDO ? this.ctx.getWebSockets() : this.ctx.getWebSockets(SYNC_TAG)
         for (const ws of restore) this.#liveWs.add(ws)
-        this.#broadcaster = new Broadcaster((ws, frame) => this.#send(ws, frame), this.tickMs)
+        this.#broadcaster = new Broadcaster((ws, frame) => this.#send(ws, frame), () => this.tickMs)
         this.#broadcaster.start(() => this.#liveWs)
         const self = this
         this.#api = {
