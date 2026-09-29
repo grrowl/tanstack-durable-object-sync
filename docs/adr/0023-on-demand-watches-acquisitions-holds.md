@@ -249,3 +249,22 @@ read and does not advance the client cursor; the preceding delta boundary
 commits the update first. `tests/fetch-flush-barrier.test.ts` pins both the
 wire order and the held row's value at load settlement through the real DO,
 transport, and on-demand collection.
+
+## Amendment — 2026-09-29: bounded snapshot NULL placement
+
+The `nulls` half of the ORDER BY follow-up is fixed: each SQLite sort term
+explicitly uses the requested `NULLS FIRST` or `NULLS LAST`, and `NULLS FIRST`
+when the clause names none. `@tanstack/db` 0.8.6 and 0.9.2 both default to
+`nulls: "first"` in either direction, while SQLite's default puts NULLs last
+in a `DESC` sort, so a descending window used to drop its NULL rows.
+`tests/order-by-nulls.test.ts` compares the real DO's bounded snapshot with
+TanStack's own answer. The locale-collation half remains open (pinned as
+`it.fails`), as does top-k selection among NULL ties crossing the limit, which
+SQLite does not break by row key as TanStack does.
+
+Cursor pages are client-built `where` expressions, so this fix does not touch
+them. 0.8.6's `buildCursor` ignores `nulls` (plain `gt`/`lt`, `eq` for ties).
+0.9.2 declines a cursor at a NULL boundary and falls back to a full-subset
+load, but for `nulls: "last"` its `whereFrom` is `gt(v) OR isNull OR
+isUndefined`, and `isNull` is outside the predicate floor (ADR-0013): the fetch
+is refused as an empty page and the window stops growing. Pinned as `it.fails`.
