@@ -32,6 +32,12 @@ While pre-1.0, the public API may change between 0.x releases.
   after a wake. Before, it ran only with compaction after drained writes, so
   a DO that only rejected or ran write-free commands grew `_sync_seen_tx`
   without bound (ADR-0009 amendment).
+- **Bounded on-demand snapshots place NULLs as TanStack does.** The server's
+  `ORDER BY` now emits `NULLS FIRST` or `NULLS LAST` from each clause's
+  `nulls` (default first), so a descending window over a nullable column no
+  longer drops its NULL rows. Locale collation, NULL tie-breaking and cursor
+  pages past a NULL boundary are still pinned as expected failures (ADR-0023
+  amendment).
 - **A fetch page no longer overtakes a buffered delta.** The server flushes
   the socket's pending deltas before it reads a page, the same as it does
   for snapshots (ADR-0023 amendment).
