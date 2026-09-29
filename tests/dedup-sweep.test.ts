@@ -155,9 +155,13 @@ describe("dedup sweep rides answered receipts (bugbash F7)", () => {
     const ws = await openWs("maint", room)
     expect((await insert(ws, "rej-1", "FORBIDDEN")).t).toBe("rejected") // sweeps; gate closes
     await seedExpired(stub, "old")
+    // Mark the instance: if it were evicted during the sleep, the wake would
+    // reopen the gate and this test would pass without testing elapsed time.
+    await runInDurableObject(stub, (instance) => void ((instance as { marker?: string }).marker = room))
     await new Promise((r) => setTimeout(r, 1100)) // MAINT_DO dedupRetentionMs = 1 s
     expect((await insert(ws, "rej-2", "FORBIDDEN")).t).toBe("rejected")
     await waitForSweep(stub, "old", "rej-2")
+    expect(await runInDurableObject(stub, (instance) => (instance as { marker?: string }).marker)).toBe(room)
     ws.close()
   })
 })
