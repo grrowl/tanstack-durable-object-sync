@@ -125,6 +125,18 @@ While pre-1.0, the public API may change between 0.x releases.
   typed with `wrangler types` and `skipLibCheck: false` no longer fails with
   TS2307. The pack smoke test now checks both type setups (ADR-0022
   amendment).
+- **A query on a column the table does not have is refused.** This holds for
+  a `sub`, a `fetch` and `readSyncSnapshot` whose `where` or `orderBy` names
+  such a column. A `sub` gets `reset` with nothing registered, a `fetch` gets
+  an empty page, and `readSyncSnapshot` rejects (over RPC with a plain `Error`
+  whose message starts with `UnsupportedPredicateError:`). The server logs one
+  line. Until refusals are made loud, the app sees such a query as no results.
+  A name in another letter case than the declared one (`BODY` for `body`) and
+  `rowid` are refused too. Before, SQLite read an unknown name as a string, so
+  the snapshot held every row or none and disagreed with the deltas. A
+  subscription restored on wake whose predicate names a column that a
+  migration dropped closes its socket with 1011, so the client reconnects and
+  that query is refused (ADR-0013 amendment 2026-11-17).
 
 ### Tests
 

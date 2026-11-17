@@ -94,13 +94,18 @@ function isNode(x: unknown): x is Node {
   return typeof x === "object" && x !== null && typeof (x as { type?: unknown }).type === "string"
 }
 
-function column(node: unknown): string {
+/** Validate a column reference, record its name in `names`, and quote it. The
+ *  quoting alone does not make an unknown name fail: SQLite reads a double quoted
+ *  name that matches no column as a string. The caller checks `names` against
+ *  the table (ADR-0013 amendment 2026-11-17). */
+function column(node: unknown, names: Set<string>): string {
   if (!isNode(node) || node.type !== "ref") throw new UnsupportedPredicateError("expected a column reference")
   if (node.path.length !== 1) {
     throw new UnsupportedPredicateError(`nested/aliased column paths are not supported: [${node.path.join(", ")}]`)
   }
   const name = node.path[0]!
   if (!IDENT.test(name)) throw new UnsupportedPredicateError(`invalid column name: ${name}`)
+  names.add(name)
   return `"${name}"`
 }
 
@@ -201,7 +206,7 @@ function orHeight(parts: Array<Compiled>): number {
   return parts.reduce((h, p, i) => (i === 0 ? p.height : 1 + Math.max(h, p.height)), 0)
 }
 
-function compileExpr(node: unknown, params: Array<unknown>): Compiled {
+function compileExpr(node: unknown, params: Array<unknown>, names: Set<string>): Compiled {
   if (!isNode(node) || node.type !== "func") {
     throw new UnsupportedPredicateError(
       `expected a boolean function expression${isNode(node) ? `, got '${node.type}'` : ""}`,
@@ -225,11 +230,11 @@ function compileExpr(node: unknown, params: Array<unknown>): Compiled {
         throw new UnsupportedPredicateError(`'like' pattern is over ${MAX_LIKE_PATTERN_BYTES} bytes`)
       }
     }
-    return { sql: `${column(args[0])} ${COMPARATORS[name]} ${literal(args[1], params)}`, height: 2 }
+    return { sql: `${column(args[0], names)} ${COMPARATORS[name]} ${literal(args[1], params)}`, height: 2 }
   }
   if (name === "and" || name === "or") {
     if (args.length === 0) throw new UnsupportedPredicateError(`'${name}' expects at least one argument`)
-    const parts = args.map((a) => compileExpr(a, params))
+    const parts = args.map((a) => compileExpr(a, params, names))
     return {
       sql: `(${parts.map((p) => p.sql).join(` ${name.toUpperCase()} `)})`,
       height: orHeight(parts),
@@ -239,18 +244,18 @@ function compileExpr(node: unknown, params: Array<unknown>): Compiled {
   }
   if (name === "not") {
     if (args.length !== 1) throw new UnsupportedPredicateError("'not' expects 1 argument")
-    const inner = compileExpr(args[0], params)
+    const inner = compileExpr(args[0], params, names)
     return { sql: `(NOT ${inner.sql})`, height: 1 + inner.height, subquery: inner.subquery }
   }
   if (name === "isNull" || name === "isUndefined") {
     if (args.length !== 1) throw new UnsupportedPredicateError(`'${name}' expects 1 argument`)
-    const col = column(args[0])
+    const col = column(args[0], names)
     // A stored column is NULL, never undefined: @tanstack/db's `isUndefined`
     // (=== undefined) is false for every row hydrated from SQLite, and `isNull`
     // (=== null) is exactly IS NULL. Needed for the nulls-last cursor's whereFrom
     // (`gt OR isNull OR isUndefined`). ADR-0013 amendment 2026-09-29.
-    // Only a column the table lacks is undefined in JS (true there, false here); the
-    // schema is author-owned and shared with the client, so that is out of contract.
+    // Only a column the table lacks is undefined in JS (true there, false here), and
+    // such a query is refused (ADR-0013 amendment 2026-11-17).
     return name === "isNull" ? { sql: `${col} IS NULL`, height: 2 } : { sql: "0", height: 1 }
   }
   if (name === "in") {
@@ -258,7 +263,7 @@ function compileExpr(node: unknown, params: Array<unknown>): Compiled {
     if (args.length !== 2 || !Array.isArray(arr)) {
       throw new UnsupportedPredicateError("'in' expects a column and an array literal")
     }
-    return compileIn(column(args[0]), arr, params)
+    return compileIn(column(args[0], names), arr, params)
   }
   throw new UnsupportedPredicateError(
     `operator '${name}' is not supported for server-side filtering ` +
@@ -280,7 +285,7 @@ export function andPredicates(a: unknown, b: unknown): unknown {
 /** Compile a `where` IR to a SQL boolean expression + bound params. */
 export function compileWhere(where: unknown): { sql: string; params: Array<unknown> } {
   const params: Array<unknown> = []
-  return { sql: compileExpr(where, params).sql, params }
+  return { sql: compileExpr(where, params, new Set()).sql, params }
 }
 
 /** Extract (column, descending, nulls last) from an orderBy clause. Accepts @tanstack/db's
@@ -303,7 +308,7 @@ function orderByTerm(item: unknown): { col: string; desc: boolean; nullsLast: bo
   throw new UnsupportedPredicateError(`unsupported orderBy clause: ${JSON.stringify(item)}`)
 }
 
-function compileOrderBy(orderBy: unknown, pk: string): string {
+function compileOrderBy(orderBy: unknown, pk: string, names: Set<string>): string {
   if (!Array.isArray(orderBy) || orderBy.length === 0) return ""
   if (!IDENT.test(pk)) throw new UnsupportedPredicateError(`invalid pk column: ${pk}`)
   if (orderBy.length + 1 > MAX_ORDER_BY_TERMS) {
@@ -312,6 +317,7 @@ function compileOrderBy(orderBy: unknown, pk: string): string {
   const terms = orderBy.map((item) => {
     const { col, desc, nullsLast } = orderByTerm(item)
     if (!IDENT.test(col)) throw new UnsupportedPredicateError(`invalid orderBy column: ${col}`)
+    names.add(col)
     return `"${col}" ${desc ? "DESC" : "ASC"} NULLS ${nullsLast ? "LAST" : "FIRST"}`
   })
   // Final tie-break by pk, ascending whatever the order direction: @tanstack/db
@@ -340,14 +346,20 @@ export interface SubsetQuery {
   offset?: number
 }
 
-/** Compile a full subset SELECT for a collection table (validated identifier). */
-export function compileSubsetQuery(tbl: string, opts: SubsetQuery): { sql: string; params: Array<unknown> } {
+/** Compile a full subset SELECT for a collection table (validated identifier).
+ *  `columns` lists every column the `where` and `orderBy` name, for the caller to
+ *  check against the table: this module has no handle on SQLite. */
+export function compileSubsetQuery(
+  tbl: string,
+  opts: SubsetQuery,
+): { sql: string; params: Array<unknown>; columns: Array<string> } {
   if (!IDENT.test(tbl)) throw new UnsupportedPredicateError(`invalid table name: ${tbl}`)
   let sql = `SELECT * FROM "${tbl}"`
   const params: Array<unknown> = []
+  const names = new Set<string>()
 
   if (opts.where != null) {
-    const w = compileExpr(opts.where, params)
+    const w = compileExpr(opts.where, params, names)
     const depth = depthBound(w)
     if (depth > MAX_EXPR_HEIGHT) {
       throw new UnsupportedPredicateError(
@@ -357,7 +369,7 @@ export function compileSubsetQuery(tbl: string, opts: SubsetQuery): { sql: strin
     sql += ` WHERE ${w.sql}`
   }
 
-  const orderBy = compileOrderBy(opts.orderBy, opts.pk)
+  const orderBy = compileOrderBy(opts.orderBy, opts.pk, names)
   if (orderBy) {
     sql += ` ORDER BY ${orderBy}`
   } else {
@@ -399,5 +411,5 @@ export function compileSubsetQuery(tbl: string, opts: SubsetQuery): { sql: strin
   if (params.some(valueTooLarge)) {
     throw new UnsupportedPredicateError(`a bound value is ${MAX_VALUE_BYTES} bytes or more`)
   }
-  return { sql, params }
+  return { sql, params, columns: [...names] }
 }
