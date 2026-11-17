@@ -248,36 +248,75 @@ refused on purpose") and `tests/sqlite-limits.test.ts`.
 D1 checked only that a `sub`'s `since` was a string, and `#handleSub` read it
 with `Number()`. So `"1e400"` became `Infinity`, passed every comparison, and was
 answered `uptodate` at the current position: the client was told it was up to
-date and was sent nothing. `"abc"` became `NaN` and got a snapshot. A well formed
-`since` past the current position was also answered `uptodate`, although this
-object never gave out that position.
+date and was sent nothing. `"abc"` became `NaN` and got a snapshot.
 
-**What `since` must look like.** A position is a SQLite INTEGER in
-`_sync_changes.seq`, so its largest value is 2^63 - 1, which has 19 digits. The
-library's client only ever sends a position back as the server wrote it
-(`String` of a number) or as `String` of a bigint, both of which give the plain
-decimal form. So D1 now requires `since`, when present, to match
+### Decision 1: what `since` must look like
+
+A position is a SQLite INTEGER in `_sync_changes.seq`, so its largest value is
+2^63 - 1, which has 19 digits. D1 now requires `since`, when present, to match
 `^(0|[1-9][0-9]{0,18})$`: digits only, no sign, no leading zero, at most 19
 digits (`POSITION` in `src/server/mixin.ts`). Any other `since` makes the frame
 malformed, and D1 applies: it is dropped with a log line and no reply, and
-nothing of the sub is registered or stored.
+nothing of the sub is registered or stored. We drop rather than refuse with a
+`reset` because a malformed `since` is a shape error, like a `since` that is
+not a string, and the library's client never sends one (decision 3).
 
-**What a value past the end gets.** The server reads its own positions as
-numbers (`currentSeq`, `minChangeSeq`), so it compares `since` as a number too.
-Up to 2^53 that is exact. A 19 digit value above that is not exact, but it is
-still above every position the server can hold as a number, so it compares
-correctly as past the end. A well formed `since` above the current position now
-falls through to `reset` and a snapshot, as a `since` below the log's floor
-already did. That position cannot have come from this object: its storage was
-reset, or the client is wrong. Either way the client must start again from a
-snapshot.
+The server reads its own positions as numbers (`currentSeq`, `minChangeSeq`), so
+it compares `since` as a number too. Up to 2^53 that is exact. A 19 digit value
+above that is not exact, but it is still above every position the server can
+hold as a number, so it is correctly found to be past the end.
+
+### Decision 2: a `since` past the current position gets `reset` and a snapshot
+
+A well formed `since` above the current position cannot be a position this
+object gave out. It happens when the object's storage was recreated and its
+positions started again, while a client kept its cursor, or its SSR meta, from
+before. Such a `since` used to be answered `uptodate`, so the client kept the
+old object's rows for ever. It now falls through to `reset` and a snapshot,
+exactly as a `since` below the log's floor already did. This is a change of
+behaviour on its own, separate from decision 1, and each kind of subscription in
+`src/client/do-collection.ts` already handles that `reset`:
+
+- **An eager sub** (`makeHandler`, `onReset`): it truncates the collection in
+  one sync transaction, and the snapshot that follows repopulates it. A hydrated
+  eager collection sends its dehydrated cursor as `since`, so this is the path
+  that replaces the old object's hydrated rows.
+- **An on-demand watch** (`onReset`, the bootstrapped branch): a watch first
+  subscribes with no `since`, so it can only meet this on a reconnect, when the
+  transport resumes it from its cursor. It truncates every subset
+  (`truncateAll`), and upstream's truncate replay reloads each demand with fresh
+  subs, as for a reconnect below the floor.
+- **The hydrated catch-up** of an on-demand collection (`#hydrate#`, `onReset`):
+  it truncates every subset, unsubscribes before the trailing snapshot arrives,
+  and marks the collection ready. The live queries' subs then load from the new
+  object.
+
+`tests/ssr-cursor-form.test.ts` pins the eager sub and the hydrated catch-up
+through the real client, with rows rendered from one object and hydrated
+against another whose log is shorter. The watch's path is the one a reconnect
+below the floor already takes, and is read from the code.
+
+### Decision 3: the client sends `since` only in the plain form
+
+A cursor in SSR meta is checked by `parseSyncMeta`, which accepted any string
+`BigInt` parses, such as `" 5"`, `"05"` or `"0x5"`, and the eager and on-demand
+paths sent it on as `since` unchanged. The server always writes the plain form,
+so only meta that was changed on the way can hold another spelling. But after
+decision 1 such meta would leave the collection with a sub the server never
+answers, after `markReady`, so it would silently stop receiving updates.
+`parseSyncMeta` now returns the plain form (`String(BigInt(cursor))`), and
+refuses a cursor above the largest the server accepts (`MAX_CURSOR`, 19 nines,
+in `src/client/transport.ts`) as it refuses a negative or unparseable one: the
+hydrate call throws, and sync start takes the safe route of a snapshot that
+reconciles the rows. `seedCursor` refuses a cursor above that bound too. Everything else the
+client sends as `since` is `appliedCursor`, which is `String` of a bigint taken
+from the server's own positions.
 
 **Breaking for raw clients only.** A raw client that sends any other spelling of
 a number (`"01"`, `"1.0"`, `"1e3"`, a space) now gets no reply for that `sub`.
-The library's client is unaffected; the whole suite passes on the locked
-`@tanstack/db` and on the floor.
 
-Pinned by `tests/since-shape.test.ts`.
+Pinned by `tests/since-shape.test.ts`, `tests/ssr-cursor-form.test.ts`, and the
+sync meta tests in `tests/ssr-adapter.test.ts` and `tests/ssr-cursor.test.ts`.
 
 ## Amendment 2026-11-17: ids and names have a length limit
 

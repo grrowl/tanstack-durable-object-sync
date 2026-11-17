@@ -309,3 +309,17 @@ describe("transport cursor bootstrap (SSR hydration, ADR-0011 D3)", () => {
     t.close()
   })
 })
+
+describe("seedCursor and the server's `since` (ADR-0012 amendment 2026-11-17)", () => {
+  // The transport resumes from `appliedCursor`, the plain form of what it holds,
+  // so any spelling BigInt reads is sent plainly. A cursor past the largest
+  // `since` the server accepts would be sent and dropped with no reply, so it
+  // is refused like a malformed one.
+  it("claims the plain form, and refuses a cursor past 19 digits", () => {
+    const t = makeTransport(`seed-form-${crypto.randomUUID()}`)
+    t.seedCursor(" 05 ")
+    expect(t.appliedCursor).toBe("5")
+    expect(() => makeTransport("unused").seedCursor("1" + "0".repeat(19))).toThrow(/largest position/)
+    t.close()
+  })
+})

@@ -85,6 +85,11 @@ export interface Transport<Api = unknown> {
  *  constant changes with an ADR note. Mirrors the server's ADR-0012 default. */
 const MAX_FRAME_BYTES = 1_048_576
 
+/** The largest position the server accepts as a `since`: 19 digits, the length
+ *  of SQLite's largest INTEGER. The server drops a `since` past it with no
+ *  reply (ADR-0012 amendment 2026-11-17), so a cursor past it is refused here. */
+export const MAX_CURSOR = 9_999_999_999_999_999_999n
+
 export class MutationRejectedError extends Error {
   constructor(
     message: string,
@@ -363,6 +368,7 @@ export class WebSocketTransport<Api = unknown> {
    */
   seedCursor(cursor: string): void {
     const c = BigInt(cursor) // malformed cursor throws — fail loud, never guess
+    if (c > MAX_CURSOR) throw new Error(`cursor past the largest position: ${cursor}`)
     if (c <= 0n) return // "0" honestly means: no resume point to claim
     if (c >= this.appliedSeq && this.appliedSeq !== 0n) return // never grow the claim
     const wasLive = this.appliedSeq !== 0n && this.ws !== null
