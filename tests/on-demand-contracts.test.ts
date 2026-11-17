@@ -6,6 +6,7 @@ import { doCollectionOptions } from "../src/client/do-collection.ts"
 import { type SubHandler, WebSocketTransport, type WebSocketLike } from "../src/client/transport.ts"
 import { createFrameCodec } from "../src/wire/frame-codec.ts"
 import type { TestApi } from "./test-worker.ts"
+import { settled } from "./settled.ts"
 
 // WHY: an on-demand collection is the union of the subsets its live queries
 // acquire, kept live by the DO's subscriptions (ADR-0023). These drive the REAL
@@ -197,7 +198,7 @@ describe("the board regression: a tied, expressible-order window (0.9 prefix-and
       await win.preload()
       await waitFor(() => win.size === 8)
 
-      await messages.insert({ id: "new1", body: "99" }).isPersisted.promise
+      await settled(messages.insert({ id: "new1", body: "99" }))
       await sleep(50) // the commit batch and `committed` have both landed
       expect(messages.get("new1")).toMatchObject({ body: "99" })
       expect(bodies(win)[0]).toBe("99")
@@ -416,7 +417,7 @@ describe("more ownership edges", () => {
     expect(messages.get("m00")).toMatchObject({ body: "x2" }) // the overlay still shows it
     gate.hold = false
     for (const deliver of gate.queue.splice(0)) deliver()
-    await tx.isPersisted.promise
+    await settled(tx)
     // The release's deletes are sync writes, which core applies once the
     // persisting user transaction settles: then nothing holds either row.
     await waitFor(() => messages.get("m00") === undefined && messages.get("m01") === undefined)
@@ -435,8 +436,8 @@ describe("more ownership edges", () => {
     const q = createLiveQueryCollection((qb) => qb.from({ m: messages }).where(({ m }) => gt(m.body, "")))
     await q.preload()
     await waitFor(() => q.size === 1)
-    await messages.delete("m00").isPersisted.promise
-    await messages.insert({ id: "m00", body: "again" }).isPersisted.promise
+    await settled(messages.delete("m00"))
+    await settled(messages.insert({ id: "m00", body: "again" }))
     await waitFor(() => (messages.get("m00") as { body?: string } | undefined)?.body === "again")
     expect(q.toArray.map((m) => m.body)).toEqual(["again"])
     t.close()
@@ -463,7 +464,7 @@ describe("more ownership edges", () => {
     await sleep(60) // the snapshot has arrived and its commit is queued
     gate.hold = false
     for (const deliver of gate.queue.splice(0)) deliver()
-    await tx.isPersisted.promise
+    await settled(tx)
     await loaded
     expect(visibleAtSettle).toBe(true)
     t.close()

@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest"
 import { doCollectionOptions } from "../src/client/do-collection.ts"
 import { WebSocketTransport, type WebSocketLike } from "../src/client/transport.ts"
 import type { TestApi } from "./test-worker.ts"
+import { settled } from "./settled.ts"
 
 // WHY: the real proof of the stack — a genuine @tanstack/db createCollection,
 // driven by our adapter + transport, against a real DO in workerd (not spy
@@ -43,7 +44,7 @@ describe("end-to-end: createCollection + adapter + transport + DO", () => {
     expect(messages.get("seed")).toMatchObject({ id: "seed", body: "hi" })
 
     const tx = messages.insert({ id: "a", body: "yo" })
-    await tx.isPersisted.promise
+    await settled(tx)
     expect(messages.get("a")).toMatchObject({ id: "a", body: "yo" })
 
     t.close()
@@ -59,7 +60,7 @@ describe("end-to-end: createCollection + adapter + transport + DO", () => {
     const b = createCollection(doCollectionOptions({ transport: tb, table: "messages", getKey: (r) => r.id }))
     await Promise.all([a.preload(), b.preload()])
 
-    await a.insert({ id: "x", body: "from-a" }).isPersisted.promise
+    await settled(a.insert({ id: "x", body: "from-a" }))
 
     // B receives x via a live delta (coalescer tick), with no local write.
     const start = Date.now()

@@ -5,6 +5,7 @@ import { doCollectionOptions } from "../src/client/do-collection.ts"
 import { type SubHandler, WebSocketTransport, type WebSocketLike } from "../src/client/transport.ts"
 import type { ClientFrame } from "../src/wire/frames.ts"
 import type { TestApi } from "./test-worker.ts"
+import { settled } from "./settled.ts"
 
 // WHY: on-demand loads ONLY the subsets live queries request, instead of
 // syncing the whole collection. These pin: distinct `where`s become distinct
@@ -483,7 +484,7 @@ describe("on-demand loadSubset (M11) — against the DO", () => {
     await kept.preload()
 
     // Insert a row OUTSIDE the loaded subset (body !== "keep").
-    await messages.insert({ id: "z", body: "other" }).isPersisted.promise
+    await settled(messages.insert({ id: "z", body: "other" }))
 
     // It must not linger in the collection: the out-of-subset row is retired
     // (synthetic delete to the loaded sub; empty-commit backstop).

@@ -7,6 +7,7 @@ import { MutationRejectedError, WebSocketTransport, type WebSocketLike } from ".
 import { createFrameCodec } from "../src/wire/frame-codec.ts"
 import type { ClientFrame, MutOp, ServerFrame } from "../src/wire/frames.ts"
 import type { TestApi } from "./test-worker.ts"
+import { settled } from "./settled.ts"
 
 // WHY: a `mut` op's key is the row's pk, and the pk is client-supplied TEXT
 // (ADR-0001 D9 / 0007). `""` is never a real row identity, so the server refuses
@@ -225,7 +226,7 @@ describe("empty op key, at client altitude (ADR-0025)", () => {
     expect(coll.get("")).toMatchObject({ body: "empty pk" })
 
     const outcome = await Promise.race([
-      tx.isPersisted.promise.then(
+      settled(tx).then(
         () => ({ settled: "resolved" as const, err: undefined as unknown }),
         (err: unknown) => ({ settled: "rejected" as const, err }),
       ),

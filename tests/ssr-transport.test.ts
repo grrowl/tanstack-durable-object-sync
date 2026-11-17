@@ -3,6 +3,7 @@ import { env, runInDurableObject } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
 import { doCollectionOptions } from "../src/client/do-collection.ts"
 import { SsrReadOnlyError, SsrSnapshotTransport, type SnapshotRead } from "../src/client/ssr-transport.ts"
+import { settled } from "./settled.ts"
 
 // WHY (ADR-0011 D2): server rendering must run the SAME collection adapter the
 // browser runs — one code path, swapped at the transport seam — with one
@@ -86,6 +87,6 @@ describe("SsrSnapshotTransport (server-side render path, ADR-0011 D2)", () => {
     await messages.preload()
 
     const tx = messages.insert({ id: "x", body: "nope" })
-    await expect(tx.isPersisted.promise).rejects.toThrow(SsrReadOnlyError)
+    await expect(settled(tx)).rejects.toThrow(SsrReadOnlyError)
   })
 })

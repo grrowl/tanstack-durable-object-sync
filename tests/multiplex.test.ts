@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest"
 import { doCollectionOptions } from "../src/client/do-collection.ts"
 import { WebSocketTransport, type WebSocketLike } from "../src/client/transport.ts"
 import type { TestApi } from "./test-worker.ts"
+import { settled } from "./settled.ts"
 
 // WHY: a session typically watches several tables of one DO at once. The design
 // multiplexes all of them over a SINGLE WebSocket (transport demuxes by subId,
@@ -31,8 +32,8 @@ describe("multi-collection multiplexing over one WS (M8)", () => {
     const files = createCollection(doCollectionOptions({ transport, table: "files", getKey: (r) => r.id }))
     await Promise.all([messages.preload(), files.preload()])
 
-    await messages.insert({ id: "m1", body: "hi" }).isPersisted.promise
-    await files.insert({ id: "f1", name: "doc" }).isPersisted.promise
+    await settled(messages.insert({ id: "m1", body: "hi" }))
+    await settled(files.insert({ id: "f1", name: "doc" }))
 
     expect(messages.get("m1")).toMatchObject({ id: "m1", body: "hi" })
     expect(files.get("f1")).toMatchObject({ id: "f1", name: "doc" })
