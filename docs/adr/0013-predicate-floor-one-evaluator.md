@@ -134,23 +134,27 @@ wake restore use the JS evaluator only, so they were not.
 
 **SQLite's limits in a Durable Object.** workerd's `SqliteDatabase::setupSecurity`
 (`src/workerd/util/sqlite.c++`) sets them; Cloudflare's Durable Objects limits page
-lists the same numbers. The ones a compiled query can reach:
+lists the same numbers. The ones a query can reach:
 
 | Limit | Value | How it fails |
 | --- | --- | --- |
 | `SQLITE_LIMIT_VARIABLE_NUMBER` | 100 bound parameters | `too many SQL variables` |
 | `SQLITE_LIMIT_EXPR_DEPTH` | an expression tree 100 deep | `Expression tree is too large` |
 | `SQLITE_LIMIT_SQL_LENGTH` | 100 000 bytes of SQL | `statement too long` |
-| `SQLITE_LIMIT_LENGTH` | one string value | `string or blob too big` |
+| `SQLITE_LIMIT_LENGTH` | one string or blob value, and one row | `string or blob too big` |
+| `SQLITE_LIMIT_COLUMN` | 100, which also caps ORDER BY terms | `too many terms in ORDER BY clause` |
 | `SQLITE_LIMIT_LIKE_PATTERN_LENGTH` | 50 bytes | `LIKE or GLOB pattern too complex`, only when the LIKE is evaluated on a row |
 
 For `SQLITE_LIMIT_LENGTH`, workerd's main branch sets 8 MiB + 34 (`MAX_ROW_LENGTH`
 in `sqlite.h`), but the workerd this package is tested on (1.20260721.1) rejects a
-plain string over 2 200 000 bytes and a `json_each` list of exactly 2 200 000
-bytes. The other limits in that function cannot be reached by a compiled query: it
-uses no compound select, no function with more than one argument, and no more
-than 100 columns. A query is at most 100 000 bytes of SQL, so its program stays far
-below `SQLITE_LIMIT_VDBE_OP` (250 000 instructions).
+string over 2 200 000 bytes. A `json_each` list whose one value is nearly the whole
+list already fails at exactly 2 200 000 bytes; a list of that size made of small
+values still runs. The other limits in that function cannot be reached: a query
+uses no compound select and no function with more than one argument, and at most
+100 000 bytes of SQL keeps its program far below `SQLITE_LIMIT_VDBE_OP` (250 000
+instructions; argued, not tested). Two more throws a query could reach are not
+SQLite limits: workerd cannot bind a bigint, and a `limit` or `offset` of 2^63 or
+more binds as a REAL SQLite will not take (`datatype mismatch`).
 
 **What was measured in workerd** (vitest-pool-workers 0.18.7):
 
@@ -197,24 +201,45 @@ below `SQLITE_LIMIT_VDBE_OP` (250 000 instructions).
    evaluator and refuses nothing, which matters while a refusal still reads as an
    empty result on the client. Before this change these values bound as text
    (`'true'`, a Date's `toString()`) or a blob and disagreed, or threw (bigint).
-3. **Every limit in the table is refused when the query is compiled.**
-   `compileSubsetQuery` refuses (`UnsupportedPredicateError`, so `reset`, an
-   empty page, or a rejected `readSyncSnapshot`) a statement that binds more than
-   100 values in total (every list, comparison literal, `limit` and `offset`
-   counts), whose `where` is more than 100 levels deep, whose SQL is over 100 000
-   bytes, or that binds a string of 2 200 000 bytes or more; and a `like` pattern
-   over 50 bytes. The depth is computed with SQLite's own rule (a leaf is 1, any
-   other node 1 + its tallest child, `a OR b OR c` parsed left-deep), except for
-   the `in` terms, whose heights were measured: a `json_each` term is 5, one level
-   more than the rule gives, and a bound-list term is 4. The value edge is one
-   byte early for a plain string, because a `json_each` list of exactly
-   2 200 000 bytes already fails. A LIKE pattern over 50 bytes is refused even
-   where SQLite would never evaluate it.
+3. **Every limit in the table is refused when the query is compiled, on a safe
+   bound.** The checks are one-sided: the compiler never accepts a statement that
+   SQLite rejects for a limit, and it may refuse a little early. `compileSubsetQuery`
+   refuses (`UnsupportedPredicateError`, so `reset`, an empty page, or a rejected
+   `readSyncSnapshot`) a statement that binds more than 100 values in total (every
+   list, comparison literal, `limit` and `offset` counts); whose SQL is over 100 000
+   bytes; that binds a string or bytes of 2 200 000 bytes or more; that has more
+   than 99 `orderBy` terms (the pk tie-break makes 100); whose `limit` or `offset`
+   is 2^63 or more; or that compares with a bigint (not dropped as `in` drops one:
+   `gt` and `lt` do compare a bigint with a number in the evaluator). A `like`
+   pattern over 50 bytes is refused even where SQLite would never evaluate it. A
+   predicate whose stored form (`_sync_subs.where_ir`) is over the value cap is
+   refused too, before the sub is added (ADR-0012 amendment).
 
-   What this refuses that ran before: an `or` of 100 or more comparisons (depth,
-   or the parameter count past 100), and an `or` of 97 to 99 one-value `in` terms
-   (each guarded `in` term is two levels deeper than the old `col IN (?)`; 96 still
-   runs). Everything else it refuses used to throw from SQLite.
+   Depth cannot be computed exactly, for two reasons. SQLite adds one level to a
+   whole `where` that holds a subquery anywhere (here, a `json_each` term), not
+   only on the path through it. And a MULTI-INDEX OR plan rebuilds the other
+   top-level conjuncts as one left-deep AND and wraps it again, so the depth
+   depends on the table's own indexes. So the compiler refuses when a bound
+   exceeds 100: the tallest top-level conjunct (conjuncts flattened through nested
+   `and`s), plus the number of conjuncts, plus one, plus one more when the `where`
+   holds a `json_each` term. Conjunct heights use SQLite's rule (a leaf is 1, any
+   other node 1 + its tallest child, `a OR b OR c` parsed left-deep); a guarded
+   `in` term is 4. The tree's own height never exceeds tallest + count - 1, and
+   the review measured the rebuilt plan at tallest + count. Measured in workerd
+   (`tests/sqlite-limits.test.ts`, on tables with and without secondary indexes):
+   no accepted statement in 665 280 fuzzed predicates is rejected, and most shapes
+   are refused 2 or 3 levels early. The worst case is one tall conjunct beside
+   many short ones, where the bound adds what SQLite needs only the larger of: an
+   `or` of 30 `eq` terms beside an `or(…)` and k `isNull` terms is accepted up to
+   k = 66 and runs in SQLite up to k = 96, 30 levels early. Real predicates are
+   nowhere near 100 levels.
+
+   What this refuses that ran before: an `or` of 98 or 99 comparisons (97 still
+   runs), an `or` of 95 to 99 one-value `in` terms (94 still runs; the guarded
+   term is deeper than the old `col IN (?)`), other shapes within a few levels of
+   100, a flat `and` that is tall and wide together (as above), and a LIKE pattern
+   over 50 bytes that SQLite would never have evaluated. Everything else it
+   refuses used to throw from SQLite.
 
 **Not changed, recorded here.** The comparators (`eq`, `gt`, …) still bind one
 value with SQLite's affinity conversion, so `eq(text_col, 1)` still matches "1.0",
@@ -232,6 +257,9 @@ every kind of list value against columns of each affinity, with and without
 `not`, at 99, 100, 101 and 3 000 values, inside larger predicates, and through the
 DO's snapshot and delta paths, and that every mix of kinds keeps the pk index. It
 passes on @tanstack/db 0.8.6 and 1.0.0-rc.1.5. `tests/sqlite-limits.test.ts`
-compiles queries on both sides of each limit, across shapes, and requires the
-compiler to accept a query exactly when SQLite runs it.
-`tests/long-in-lists.test.ts` drives every path that runs the compiled SQL.
+takes each limit across its edge in families of shapes, on tables with and
+without secondary indexes, and requires that no accepted statement is rejected
+by SQLite, that every family crosses its own edge, and that early refusal stays
+within a stated slack; it also runs a deterministic fuzz of 89 376 predicates
+(about 13 seconds). `tests/long-in-lists.test.ts` drives every path that runs the
+compiled SQL.

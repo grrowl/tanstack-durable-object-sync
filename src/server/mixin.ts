@@ -39,10 +39,17 @@ import {
 import { Broadcaster } from "./broadcast.ts"
 import { decodeResult, encodeResult, lookupTx, recordTx, type SeenTx, sweepDedup } from "./dedup.ts"
 import { compileSchema, type CompiledSync, type SyncSchema, ValidationError } from "./registry.ts"
-import { andPredicates, compileSubsetQuery, UnsupportedPredicateError } from "./sql-compiler.ts"
+import {
+  andPredicates,
+  compileSubsetQuery,
+  isSqliteLimitError,
+  UnsupportedPredicateError,
+  valueTooLarge,
+} from "./sql-compiler.ts"
 import {
   deletePersistedSocketSubs,
   deletePersistedSub,
+  encodeWhere,
   loadPersistedSubs,
   persistSub,
   SubscriptionRegistry,
@@ -697,8 +704,10 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           rows.push(...Array.from(this.#sql.exec(nq.sql, ...nq.params)))
           this.#send(ws, { t: "page", fetchId: frame.fetchId, rows, seq })
         } catch (e) {
-          if (e instanceof UnsupportedPredicateError) {
-            console.error(`fetch '${frame.fetchId}' on '${frame.collection}' rejected: ${e.message}`)
+          // A statement SQLite still rejects for one of its limits is refused like
+          // the compiler's own checks: it is deterministic, a retry cannot help.
+          if (e instanceof UnsupportedPredicateError || isSqliteLimitError(e)) {
+            console.error(`fetch '${frame.fetchId}' on '${frame.collection}' rejected: ${errorMessage(e)}`)
             this.#send(ws, { t: "page", fetchId: frame.fetchId, rows: [], seq })
             return
           }
@@ -1071,6 +1080,15 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           }
           throw e
         }
+        // The predicate's stored form (`_sync_subs.where_ir`) must fit SQLite's
+        // value cap too: tagged values (Dates, bigints) can make it far larger
+        // than the compiled query's own parameters.
+        const whereIr = encodeWhere(frame.where)
+        if (whereIr !== null && valueTooLarge(whereIr)) {
+          console.error(`sub '${frame.subId}' on '${frame.collection}' rejected: predicate too large to store`)
+          this.#refuseSub(ws, frame.subId)
+          return
+        }
 
         // C1′ (ADR-0011, generalizing ADR-0002 C1): what follows is a synchronous
         // cursor-advancing emission — a snapshot's `snap-end` or a catch-up's
@@ -1100,7 +1118,13 @@ export function Syncable<Env = unknown, TUser = unknown>() {
         // after `add` succeeds — a rejected predicate must not persist.
         {
           const sid = this.#socketIdFor(ws)
-          if (sid) persistSub(this.#sql, sid, frame.subId, frame.collection, frame.where)
+          try {
+            if (sid) persistSub(this.#sql, sid, frame.subId, frame.collection, whereIr)
+          } catch (e) {
+            if (!isSqliteLimitError(e)) throw e
+            this.#refuseOverLimit(ws, frame, e)
+            return
+          }
         }
         const seq = String(currentSeq(this.#sql))
 
@@ -1121,12 +1145,27 @@ export function Syncable<Env = unknown, TUser = unknown>() {
         // Every row is read before this sub's first frame (the fallback's `reset`
         // included), so a read that throws has sent the client nothing to undo
         // (a reset before `snap-end` is taken as holding no rows, ADR-0023 D5).
-        const rows = Array.from(this.#sql.exec(query.sql, ...query.params)) as Array<Record<string, SqlStorageValue>>
+        let rows: Array<Record<string, SqlStorageValue>>
+        try {
+          rows = Array.from(this.#sql.exec(query.sql, ...query.params)) as Array<Record<string, SqlStorageValue>>
+        } catch (e) {
+          if (!isSqliteLimitError(e)) throw e
+          this.#refuseOverLimit(ws, frame, e)
+          return
+        }
         if (since > 0) this.#send(ws, { t: "reset", sub: frame.subId })
         for (const row of rows) {
           this.#send(ws, { t: "snap", sub: frame.subId, key: row[coll.pk], row, seq })
         }
         this.#send(ws, { t: "snap-end", sub: frame.subId, seq })
+      }
+
+      /** The backstop behind the compiler's limit checks (ADR-0012 amendment
+       *  2026-11-17): SQLite rejected one of this sub's statements for one of its
+       *  limits. That is deterministic for the statement, so it is a refusal. */
+      #refuseOverLimit(ws: WebSocket, frame: Extract<ClientFrame, { t: "sub" }>, e: unknown): void {
+        console.error(`sub '${frame.subId}' on '${frame.collection}' refused at a SQLite limit: ${errorMessage(e)}`)
+        this.#refuseSub(ws, frame.subId)
       }
 
       /** Refuse a sub on purpose with `reset`. Nothing of the subId stays

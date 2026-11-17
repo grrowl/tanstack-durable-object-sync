@@ -25,12 +25,15 @@ export class UnsupportedPredicateError extends Error {
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/
 // SQLite limits in a Durable Object, set by workerd's `SqliteDatabase::setupSecurity`
 // (Cloudflare's Durable Objects limits page lists the same). A query over one is
-// refused when it is compiled, so none of them throws from SQLite (ADR-0013
-// amendment 2026-11-17). Each edge is pinned in workerd by tests/sqlite-limits.test.ts.
+// refused when it is compiled (ADR-0013 amendment 2026-11-17). The checks are
+// one-sided: they never accept a statement SQLite rejects for a limit, and may
+// refuse a little early. tests/sqlite-limits.test.ts pins that in workerd.
 /** SQLITE_LIMIT_VARIABLE_NUMBER: bound parameters per statement. */
 const MAX_BOUND_PARAMS = 100
 /** SQLITE_LIMIT_EXPR_DEPTH: height of an expression tree. */
 const MAX_EXPR_HEIGHT = 100
+/** SQLITE_LIMIT_COLUMN: also caps the terms of an ORDER BY. */
+const MAX_ORDER_BY_TERMS = 100
 /** SQLITE_LIMIT_SQL_LENGTH: bytes in one statement. */
 const MAX_SQL_BYTES = 100_000
 /** SQLITE_LIMIT_LENGTH: a bound string must be shorter than this many bytes.
@@ -42,6 +45,33 @@ const MAX_VALUE_BYTES = 2_200_000
  *  throws when the LIKE is evaluated on a row, so this is refused up front. */
 const MAX_LIKE_PATTERN_BYTES = 50
 const utf8Bytes = (s: string): number => new TextEncoder().encode(s).length
+
+/** True when a value bound as one SQL parameter would be over SQLITE_LIMIT_LENGTH:
+ *  a string by its UTF-8 bytes, bytes by their length. */
+export function valueTooLarge(v: unknown): boolean {
+  if (typeof v === "string") return v.length >= MAX_VALUE_BYTES / 3 && utf8Bytes(v) >= MAX_VALUE_BYTES
+  if (v instanceof ArrayBuffer || ArrayBuffer.isView(v)) return v.byteLength >= MAX_VALUE_BYTES
+  return false
+}
+
+/** SQLite's messages for a statement over one of its limits, as workerd reports
+ *  them. Deterministic for a given statement, so a retry cannot help: the
+ *  compiler's checks come first, and these are the backstop (ADR-0012 amendment
+ *  2026-11-17). tests/sqlite-limits.test.ts provokes each one for real. */
+const SQLITE_LIMIT_ERRORS = [
+  "too many SQL variables", // SQLITE_LIMIT_VARIABLE_NUMBER
+  "Expression tree is too large", // SQLITE_LIMIT_EXPR_DEPTH
+  "statement too long", // SQLITE_LIMIT_SQL_LENGTH
+  "string or blob too big", // SQLITE_LIMIT_LENGTH
+  "too many terms in ORDER BY clause", // SQLITE_LIMIT_COLUMN
+  "LIKE or GLOB pattern too complex", // SQLITE_LIMIT_LIKE_PATTERN_LENGTH
+]
+
+/** True for an error SQLite gives for a statement over one of its limits. */
+export function isSqliteLimitError(e: unknown): boolean {
+  const message = e instanceof Error ? e.message : String(e)
+  return SQLITE_LIMIT_ERRORS.some((m) => message.includes(m))
+}
 const COMPARATORS: Record<string, string> = {
   eq: "=",
   gt: ">",
@@ -74,19 +104,23 @@ function column(node: unknown): string {
 
 function literal(node: unknown, params: Array<unknown>): string {
   if (!isNode(node) || node.type !== "val") throw new UnsupportedPredicateError("comparison value must be a literal")
+  // workerd cannot bind a bigint (README: not supported in Durable Object storage).
+  // Not dropped as `in` drops it: `gt`/`lt` compare a bigint with a number.
+  if (typeof node.value === "bigint") throw new UnsupportedPredicateError("a bigint comparison value is not supported")
   params.push(node.value)
   return "?"
 }
 
-/** Compiled SQL for one expression, with its height in SQLite's expression tree
- *  (SQLite's `exprSetHeight`: a leaf is 1, any other node 1 + its tallest child;
- *  `a OR b OR c` is parsed left-deep, so each further operand adds one). The
- *  heights of the `in` terms are measured, not derived: a `json_each` term
- *  counts one more than this rule gives. tests/sqlite-limits.test.ts holds the
- *  model to SQLite's verdict across shapes. */
+/** Compiled SQL for one expression, with what the depth bound needs: its height
+ *  in SQLite's expression tree (`exprSetHeight`: a leaf is 1, any other node 1 +
+ *  its tallest child; `a OR b OR c` is parsed left-deep, so each further operand
+ *  adds one), the heights of its conjuncts when it is an `and` (flattened through
+ *  nested `and`s), and whether it holds a subquery. */
 interface Compiled {
   sql: string
   height: number
+  conjuncts?: Array<number>
+  subquery?: boolean
 }
 
 /** `col IN list` without one bound parameter per value: Durable Object SQLite
@@ -120,15 +154,16 @@ function compileIn(col: string, list: Array<unknown>, params: Array<unknown>): C
   }
   const textGuard = `typeof(${col}) IN ('text', 'null')`
   const numberGuard = `typeof(${col}) IN ('integer', 'real', 'null')`
-  // Heights measured in workerd: a `json_each` term is 5, a bound-list term 4.
+  // AND(col IN …, typeof(col) IN …): 1 + typeof's 3 = 4. A `json_each` term also
+  // marks the `where` as holding a subquery (see `depthBound`).
   const terms: Array<Compiled> = []
   if (texts.length > 0) {
     params.push(JSON.stringify(texts))
-    terms.push({ sql: `(${col} IN (SELECT value FROM json_each(?)) AND ${textGuard})`, height: 5 })
+    terms.push({ sql: `(${col} IN (SELECT value FROM json_each(?)) AND ${textGuard})`, height: 4, subquery: true })
   }
   if (ints.length > 0) {
     params.push(JSON.stringify(ints))
-    terms.push({ sql: `(${col} IN (SELECT value FROM json_each(?)) AND ${numberGuard})`, height: 5 })
+    terms.push({ sql: `(${col} IN (SELECT value FROM json_each(?)) AND ${numberGuard})`, height: 4, subquery: true })
   }
   if (others.length > 0) {
     params.push(...others)
@@ -136,7 +171,24 @@ function compileIn(col: string, list: Array<unknown>, params: Array<unknown>): C
   }
   // Nothing can match: false, or NULL for a NULL column (as above).
   if (terms.length === 0) return { sql: `CASE WHEN ${col} IS NULL THEN NULL ELSE 0 END`, height: 3 }
-  return terms.length === 1 ? terms[0]! : { sql: `(${terms.map((t) => t.sql).join(" OR ")})`, height: orHeight(terms) }
+  if (terms.length === 1) return terms[0]!
+  return { sql: `(${terms.map((t) => t.sql).join(" OR ")})`, height: orHeight(terms), subquery: hasSubquery(terms) }
+}
+
+const hasSubquery = (parts: Array<Compiled>): boolean => parts.some((p) => p.subquery)
+
+/** A height no plan of this `where` exceeds in SQLite (one-sided; ADR-0013
+ *  amendment 2026-11-17). Two things add depth beyond the tree's own height:
+ *  - a MULTI-INDEX OR plan rebuilds the other top-level conjuncts as one
+ *    left-deep AND and wraps it again, which can reach the tallest conjunct plus
+ *    the number of conjuncts, whatever the table's indexes; the bound allows one
+ *    more;
+ *  - a `where` holding a subquery (`json_each`) is one level taller as a whole.
+ *  The tree's own height never exceeds tallest conjunct + count - 1. */
+function depthBound(w: Compiled): number {
+  const conjuncts = w.conjuncts ?? [w.height]
+  const tallest = conjuncts.reduce((a, b) => Math.max(a, b), 0)
+  return tallest + conjuncts.length + 1 + (w.subquery ? 1 : 0)
 }
 
 /** Height of `a OR b OR c` (or AND): left-deep, so each further operand adds one. */
@@ -173,12 +225,17 @@ function compileExpr(node: unknown, params: Array<unknown>): Compiled {
   if (name === "and" || name === "or") {
     if (args.length === 0) throw new UnsupportedPredicateError(`'${name}' expects at least one argument`)
     const parts = args.map((a) => compileExpr(a, params))
-    return { sql: `(${parts.map((p) => p.sql).join(` ${name.toUpperCase()} `)})`, height: orHeight(parts) }
+    return {
+      sql: `(${parts.map((p) => p.sql).join(` ${name.toUpperCase()} `)})`,
+      height: orHeight(parts),
+      conjuncts: name === "and" ? parts.flatMap((p) => p.conjuncts ?? [p.height]) : undefined,
+      subquery: hasSubquery(parts),
+    }
   }
   if (name === "not") {
     if (args.length !== 1) throw new UnsupportedPredicateError("'not' expects 1 argument")
     const inner = compileExpr(args[0], params)
-    return { sql: `(NOT ${inner.sql})`, height: 1 + inner.height }
+    return { sql: `(NOT ${inner.sql})`, height: 1 + inner.height, subquery: inner.subquery }
   }
   if (name === "isNull" || name === "isUndefined") {
     if (args.length !== 1) throw new UnsupportedPredicateError(`'${name}' expects 1 argument`)
@@ -244,6 +301,9 @@ function orderByTerm(item: unknown): { col: string; desc: boolean; nullsLast: bo
 function compileOrderBy(orderBy: unknown, pk: string): string {
   if (!Array.isArray(orderBy) || orderBy.length === 0) return ""
   if (!IDENT.test(pk)) throw new UnsupportedPredicateError(`invalid pk column: ${pk}`)
+  if (orderBy.length + 1 > MAX_ORDER_BY_TERMS) {
+    throw new UnsupportedPredicateError(`orderBy has ${orderBy.length} terms; Durable Object SQLite allows ${MAX_ORDER_BY_TERMS - 1} beside the pk`)
+  }
   const terms = orderBy.map((item) => {
     const { col, desc, nullsLast } = orderByTerm(item)
     if (!IDENT.test(col)) throw new UnsupportedPredicateError(`invalid orderBy column: ${col}`)
@@ -259,8 +319,9 @@ function compileOrderBy(orderBy: unknown, pk: string): string {
 }
 
 function nonNegInt(n: unknown, label: string): number {
-  if (typeof n !== "number" || !Number.isInteger(n) || n < 0) {
-    throw new UnsupportedPredicateError(`${label} must be a non-negative integer`)
+  // SQLite needs an integer: 2^63 and above bind as a REAL it cannot convert.
+  if (typeof n !== "number" || !Number.isInteger(n) || n < 0 || n >= 2 ** 63) {
+    throw new UnsupportedPredicateError(`${label} must be a non-negative integer under 2^63`)
   }
   return n
 }
@@ -282,9 +343,10 @@ export function compileSubsetQuery(tbl: string, opts: SubsetQuery): { sql: strin
 
   if (opts.where != null) {
     const w = compileExpr(opts.where, params)
-    if (w.height > MAX_EXPR_HEIGHT) {
+    const depth = depthBound(w)
+    if (depth > MAX_EXPR_HEIGHT) {
       throw new UnsupportedPredicateError(
-        `predicate is ${w.height} levels deep; Durable Object SQLite allows ${MAX_EXPR_HEIGHT}`,
+        `predicate may be ${depth} levels deep; Durable Object SQLite allows ${MAX_EXPR_HEIGHT}`,
       )
     }
     sql += ` WHERE ${w.sql}`
@@ -329,10 +391,8 @@ export function compileSubsetQuery(tbl: string, opts: SubsetQuery): { sql: strin
   if (sql.length > MAX_SQL_BYTES) {
     throw new UnsupportedPredicateError(`query is ${sql.length} bytes; Durable Object SQLite allows ${MAX_SQL_BYTES}`)
   }
-  for (const p of params) {
-    if (typeof p === "string" && p.length >= MAX_VALUE_BYTES / 3 && utf8Bytes(p) >= MAX_VALUE_BYTES) {
-      throw new UnsupportedPredicateError(`a bound value is ${MAX_VALUE_BYTES} bytes or more`)
-    }
+  if (params.some(valueTooLarge)) {
+    throw new UnsupportedPredicateError(`a bound value is ${MAX_VALUE_BYTES} bytes or more`)
   }
   return { sql, params }
 }

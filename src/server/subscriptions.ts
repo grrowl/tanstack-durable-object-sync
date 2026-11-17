@@ -123,15 +123,22 @@ export interface PersistedSub {
   where: unknown
 }
 
-/** Upsert one subscription row. A re-sub on an existing subId replaces (the
- *  same semantics as SubscriptionRegistry.add / ADR-0012's cap accounting). */
-export function persistSub(sql: SqlStorage, socketId: string, subId: string, collection: string, where: unknown): void {
+/** A predicate's stored form for `where_ir`: the value codec, or null when
+ *  unfiltered. Encoded before the sub is accepted, so its size can be checked. */
+export function encodeWhere(where: unknown): string | null {
+  return where === undefined || where === null ? null : encodeValue(where)
+}
+
+/** Upsert one subscription row, with its predicate already `encodeWhere`d. A
+ *  re-sub on an existing subId replaces (the same semantics as
+ *  SubscriptionRegistry.add / ADR-0012's cap accounting). */
+export function persistSub(sql: SqlStorage, socketId: string, subId: string, collection: string, whereIr: string | null): void {
   sql.exec(
     "INSERT OR REPLACE INTO _sync_subs(socket_id, sub_id, collection, where_ir) VALUES (?, ?, ?, ?)",
     socketId,
     subId,
     collection,
-    where === undefined || where === null ? null : encodeValue(where),
+    whereIr,
   )
 }
 

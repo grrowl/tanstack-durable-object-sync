@@ -464,6 +464,12 @@ show. The conventions, what's verified and how, and the full
   syncing. For exact values, store decimal strings in TEXT columns and convert
   at the application edge ([workerd#4195](https://github.com/cloudflare/workerd/issues/4195),
   [issue #10](https://github.com/grrowl/tanstack-durable-object-sync/issues/10)).
+- **`like` patterns over 50 bytes:** SQLite in a Durable Object accepts a LIKE
+  pattern of at most 50 bytes (`SQLITE_LIMIT_LIKE_PATTERN_LENGTH`, set by workerd;
+  Cloudflare's Durable Objects limits page lists it). A longer pattern is refused,
+  so a search box that builds `%term%` stops matching at 49 ASCII characters, or
+  about 17 CJK characters. Until refusals fail loud, a refused query reads as no
+  results.
 
 ---
 
