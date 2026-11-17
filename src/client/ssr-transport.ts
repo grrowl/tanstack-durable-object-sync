@@ -105,14 +105,21 @@ export class SsrSnapshotTransport<Api = unknown> implements Transport<Api> {
     return Promise.reject(new SsrReadOnlyError("mutation"))
   }
 
-  /** A cursor-less fetch is a covered on-demand request (ADR-0023 D2): the same
-   *  where/orderBy/limit read a subscribe makes, so one snapshot read answers it,
-   *  and its rows dehydrate under the MIN cursor like any other read's. A cursor
-   *  fetch (load more) has no snapshot-read equivalent and fails loud (ADR-0011
-   *  amendment 2026-11-17). */
-  fetch(frame: Extract<ClientFrame, { t: "fetch" }>): Promise<Array<unknown>> {
-    if (frame.cursor != null) return Promise.reject(new SsrReadOnlyError("cursor fetch"))
-    return this.read(frame.collection, frame.where, frame.orderBy, frame.limit)
+  /** A render refuses writes, never reads (ADR-0011 amendment 2026-11-17).
+   *  A fetch without a cursor (a covered on-demand request, ADR-0023 D2) is the
+   *  same where/orderBy/limit read a subscribe makes. A fetch with a cursor is
+   *  the server's two reads (ADR-0003): the boundary ties, unbounded, then the
+   *  next page, bounded. Here they are two reads at two positions; a render has
+   *  no delta stream to slot them into, and both join the MIN cursor, so the
+   *  hydration catch-up replays whatever changed between them. A row in both
+   *  is written once (installPage). */
+  async fetch(frame: Extract<ClientFrame, { t: "fetch" }>): Promise<Array<unknown>> {
+    const { collection, where, cursor, orderBy, limit } = frame
+    if (cursor == null) return this.read(collection, where, orderBy, limit)
+    const and = (a: unknown, b: unknown): unknown => (a == null ? b : { type: "func", name: "and", args: [plain(a), plain(b)] })
+    const ties = await this.read(collection, and(where, cursor.whereCurrent), orderBy)
+    const page = await this.read(collection, and(where, cursor.whereFrom), orderBy, limit)
+    return [...ties, ...page]
   }
 
   seedCursor(): void {
