@@ -158,21 +158,38 @@ repeats while the cause persists, and every open succeeds.
 
 ### Decision
 
-A connection proves healthy by **staying open for at least 30 seconds**. The
-transport records the time when it installs a socket. When that socket closes
-unexpectedly, the transport compares the time: if the socket lived at least
-30 s, the counter goes back to 0 before the next attempt is counted, so a
-later blip retries at the first-attempt delay as before. Otherwise the close
-counts as one more failed attempt, the same as a failed open. A successful
-open no longer resets anything. The check runs once, at close, so it needs no
-timer.
+A connection proves healthy by **staying open for at least 5 seconds**. The
+transport records the time when it installs a socket. When that socket goes
+away without `close()`, the transport compares the time: if the socket lived
+at least 5 s, the counter goes back to 0, so the next attempt is attempt 1.
+Otherwise the counter is left as it is, and the next attempt counts on from
+it, the same as after a failed open. A successful open resets nothing. The
+check runs once, when the socket goes away, so it needs no timer.
 
-The counter also goes back to 0 when a run of retries ends: on a terminal stop
-(the policy returned `null`), on `close()`, and when the last unsubscribe
-cancels a pending reconnect. The next run, whether an app-driven `connect()`
-after re-auth, a revived transport (ADR-0020), or a new `subscribe`, starts at
-attempt 1 as it did before. Without this a policy that gives up after N
-attempts would give up at once on the next run.
+Every way the current socket goes away is judged the same:
+
+- an unexpected close while subscriptions are active, which then schedules a
+  reconnect;
+- an unexpected close with no subscriptions left, which does not reconnect.
+  Its lifetime still counts, so a connection that worked for hours does not
+  leave the count of an older outage for the next session;
+- a cursor-regress reconnect (`forceReconnect`), which abandons the socket
+  without a close event and still bypasses the policy.
+
+The counter also goes back to 0 when the transport stops retrying: on a
+terminal stop (the policy returned `null`) and on `close()`. The next run, an
+app-driven `connect()` after re-auth or a revived transport (ADR-0020), starts
+at attempt 1. Without this a policy that gives up after N attempts would give
+up at once on the next run. This is a small change from before. Before, the
+next run started at 1 only if its first dial opened. A dial that failed to
+open was attempt N + 1. Now it is attempt 1 either way.
+
+A moment with zero subscriptions is not a new run, and does not reset the
+counter. An on-demand app releases one query and loads the next on each route
+change, so during an outage the count passes through zero on every
+navigation. Resetting there would restart the fast retries on each click, and
+a policy that gives up after N attempts would never give up while the user
+navigates.
 
 ### The candidates
 
@@ -192,48 +209,108 @@ on a call the app makes whenever it connects.
   must track subscriptions added or removed during the batch, and it says
   nothing about the first connection, which has no resubscribe batch.
 - **The connection stayed open for a minimum time.** One timestamp per socket
-  and one comparison at close. Every loop whose connections die before the
-  threshold grows to the policy's cap. A loop whose connections outlive the
-  threshold cannot dial faster than once per threshold, whatever the server
-  does. This is the simplest rule and the only one of the three that stops
-  every loop above. It is the decision.
+  and one comparison when it goes away. This is the simplest rule and the only
+  one of the three that stops every loop above. It is the decision.
 
-### Where 30 seconds comes from
+A rule with no constant does not work. "Reset when the socket outlived the
+delay before it" fails because full jitter can draw a delay near 0 at any
+attempt, so a server that closes at once still resets often and loops hot.
+Stopping a close on accept needs an absolute floor.
 
-It is the default policy's cap. With the threshold equal to the cap, no
-reconnect cycle runs faster than about one dial per 30 s once the counter has
-grown: a cycle whose sockets die young reaches the cap, and a cycle whose
-sockets live 30 s or longer is already that slow. A shorter threshold would
-leave a server that closes just after it free to loop faster than the cap.
+### Where 5 seconds comes from
 
-The cost falls on a connection that drops more than once within 30 s of
-opening, for example on a flapping mobile link. Each such drop now doubles the
-delay's ceiling instead of returning it to 250 ms. That is the backoff doing its job:
-a link that cannot hold a socket for 30 s is failing. The threshold is fixed,
-not an option, because no app has needed another value. A custom policy still
-sees every attempt number and can shape its own delays.
+The faults this guards against (a throw on the first frame, a failed
+resubscribe, a failed replayed write) close the socket within the first round
+trips. 5 s is the default confirmation timeout, the time the transport gives
+a parked write to be answered after a reconnect. A socket that outlived it has
+got past the work it was sent at open.
+
+It is a separate constant, not `timeoutMs`. Apps set `timeoutMs` for other
+reasons, from tens of milliseconds to a minute. Tying the threshold to it would
+let an app that shortens its confirmation timeout reopen the hot loop without
+knowing, and let one that lengthens it pay the flapping cost below. Nothing in
+the transport bounds the resubscribe batch by `timeoutMs` either.
+
+The bound, with both of its limits. Under the default policy, a server whose
+sockets die within 5 s drives the counter to the cap, where each delay is
+uniform from 0 to 30 s with a mean of 15 s, about four dials a minute per
+client. A server that closes each socket just after 5 s gets one dial per
+5 s plus a delay of at most 250 ms, about twelve a minute per client. That is
+the worst any server can do to a quiet client. It is not a bound on dials an
+app causes: a mutation, fetch or subscribe while disconnected dials at once,
+outside the policy, as it did before this change.
+
+### The cost
+
+From a simulation of one hour, default policy, every dial succeeding, a link
+that drops each socket at the same age:
+
+| socket lifetime | connected share | drops whose delay exceeds 5 s |
+|---|---|---|
+| 1 s | 6% | 81% |
+| 3 s | 17% | 81% |
+| 6 s | 98.0% | 0% |
+| 10 s | 98.8% | 0% |
+| 15 s | 99.2% | 0% |
+| 20 s | 99.4% | 0% |
+| 29 s | 99.6% | 0% |
+
+Before this change every row was about 99%. A link that cannot hold a socket
+for 5 s now backs off to the cap, the same as a broken server, because the two
+look the same from the client. A link that holds sockets longer than 5 s is
+untouched.
+
+A single blip soon after a long outage also pays. After two minutes of failed
+dials the counter is about 15. If the first socket after the outage drops
+within 5 s, the next delay is uniform from 0 to 30 s, mean 15 s. If it drops
+after 5 s, the delay is at most 250 ms, as before.
+
+For a write in flight at a drop, ADR-0021 parks it for `timeoutMs` (5 s by
+default) from the first drop. When the delay exceeds that, the write settles
+with `ConnectionLostError` instead of being answered by the replay. That
+happens in a server loop and on a link that drops sockets younger than 5 s,
+for about four drops in five once the counter is high. It does not happen on a
+link whose sockets live longer than 5 s.
+
+A custom policy keeps its signature but sees different numbers. It now counts
+every socket that went away within 5 s of opening, not only failed dials, so a
+policy of the shape "give up after N attempts" can give up on a working link
+that drops sockets younger than 5 s: `onClosed` fires, parked writes fail with
+`ConnectionLostError`, and the transport stays down until the app calls
+`connect()`. The policy is not given the socket's lifetime, so it cannot tell
+a young close from a healthy one or choose its own threshold.
+
+### The clock
+
+The rule reads `Date.now()`, the wall clock, on purpose. When a device sleeps
+or a background tab is frozen, the close is seen late and the socket looks
+old, so the counter resets and the wake retries at the first-attempt delay,
+which is what a user wants. `performance.now()` can stop during suspension and
+would make every wake look young. A step of the wall clock can make one close
+look healthy or young once, which changes the outcome of that one
+comparison. A server cannot cause any of this.
 
 ### What does not change
 
-- The policy keeps its signature. A custom policy sees larger attempt numbers
-  in the looping case and nothing else.
-- Terminal stops, `onClosed`, and the tracked reconnect timer are unchanged.
+- Terminal stops, `onClosed`, and the tracked reconnect timer.
 - A demand-driven connect (a mutation, fetch, or subscribe in the reconnect
-  window) still dials at once and still supersedes the pending timer. Its
-  socket is judged at close like any other.
-- A cursor-regress reconnect (`forceReconnect`) still bypasses the policy and
-  consumes no attempt. It no longer resets the counter either.
+  window) still dials at once and still supersedes the pending timer. It does
+  not reset the counter; its socket is judged when it goes away, like any
+  other.
+- A cursor-regress reconnect still bypasses the policy and consumes no
+  attempt.
 - The parked write deadline of ADR-0021 is a separate timer that starts at
-  the first drop. It is not touched. In a looping case the longer delays make
-  it more likely that a parked write settles with `ConnectionLostError` before
-  a replay answers, which is the outcome ADR-0021 defines for that case.
+  the first drop. It is not touched; the cost above is about how often a
+  reconnect now comes later than it.
 
 ### A later design
 
 A proposed design (ADR-0026, not accepted) holds the cursor through a
 resubscribe round and wants an abandoned round not to reset the backoff. This
-rule gives that without knowing about rounds. Resets now happen only at a
-close after 30 s and when a run of retries ends, so a socket abandoned within
-30 s never resets the counter, whatever path abandons it. A round abandoned
-after 30 s does reset it, but such a cycle already dials no faster than the
-cap.
+rule gives that without knowing about rounds. The counter resets only when a
+socket that lived 5 s goes away, and when the transport stops retrying, so a
+socket abandoned within 5 s never resets it, whatever path abandons it. A
+round abandoned after 5 s does reset it, but such a cycle already dials no
+faster than once per 5 s per client. One condition belongs to that design: it
+must abandon a round through the reconnect policy. A path that bypasses the
+policy, as `forceReconnect` does, would skip the backoff entirely.
