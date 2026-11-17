@@ -138,6 +138,32 @@ describe("assertSyncCompatible (ADR-0007, D9) — real-table introspection", () 
     })
   })
 
+  // The fix ADR-0007 gives an app: rename the column in a migration before
+  // registerSync. RENAME COLUMN works for a generated column too, with rows; drop
+  // and add does not for a STORED one ("cannot add a STORED column").
+  it("a refused column renamed with RENAME COLUMN, rows and all, then registers", async () => {
+    await withSql((sql) => {
+      for (const [t, ddl, col] of [
+        ["v", "rowid TEXT GENERATED ALWAYS AS (upper(body)) VIRTUAL", "rowid"],
+        ["s", "rowid TEXT GENERATED ALWAYS AS (upper(body)) STORED", "rowid"],
+        ["p", "__proto__ TEXT", "__proto__"],
+        ["g", "__proto__ TEXT GENERATED ALWAYS AS (body) STORED", "__proto__"],
+      ] as const) {
+        sql.exec(`CREATE TABLE ${t} (id TEXT PRIMARY KEY, body TEXT, ${ddl})`)
+        sql.exec(`INSERT INTO ${t} (id, body) VALUES ('a', 'x'), ('b', 'y')`)
+        expect(() => assertSyncCompatible(sql, t, "id")).toThrow()
+        sql.exec(`ALTER TABLE ${t} RENAME COLUMN ${col} TO renamed`)
+        expect(() => assertSyncCompatible(sql, t, "id")).not.toThrow()
+        expect(Array.from(sql.exec(`SELECT count(*) AS c FROM ${t}`))[0]!.c).toBe(2)
+      }
+      // Why not drop and add: on a table with rows a STORED column cannot be added.
+      sql.exec("CREATE TABLE d (id TEXT PRIMARY KEY, body TEXT, rowid TEXT GENERATED ALWAYS AS (upper(body)) STORED)")
+      sql.exec("INSERT INTO d (id, body) VALUES ('a', 'x')")
+      sql.exec("ALTER TABLE d DROP COLUMN rowid")
+      expect(() => sql.exec("ALTER TABLE d ADD COLUMN loud TEXT GENERATED ALWAYS AS (upper(body)) STORED")).toThrow(/STORED/)
+    })
+  })
+
   it("accepts __PROTO__: the name is compared exactly, as a row's keys are", async () => {
     await withSql((sql) => {
       sql.exec("CREATE TABLE t (id TEXT PRIMARY KEY, __PROTO__ TEXT)")
