@@ -313,8 +313,8 @@ the `exportSyncMeta`/`importSyncMeta`/`mergeSyncMeta` sync hooks, shipped in
 `@tanstack/db` 0.8.0). Why/how trade-offs
 live in [ADR-0011](./docs/adr/0011-ssr-dehydrate-hydrate.md).
 
-On the worker, render through a **per-request** `DbClient` backed by one
-snapshot read per subscription — no WebSocket from the render path:
+On the worker, render through a **per-request** `DbClient` backed by snapshot
+reads (one per subscription or fetch) — no WebSocket from the render path:
 
 ```ts
 // Route loader / server handler (per request!)
@@ -352,10 +352,25 @@ const messages = db.collection(
 )
 ```
 
-Mutations during SSR throw (`SsrReadOnlyError`). `readSyncSnapshot` is callable
-by any worker holding the DO binding, and its required `request` argument runs
-through `parseAttachment` — **one auth gate for both the socket and the read
-path**, so a tenant check in `parseAttachment` can't be bypassed by SSR.
+A render refuses writes and answers every read: mutations during SSR throw
+(`SsrReadOnlyError`), and every request an on-demand collection makes is read
+from the DO, as the browser's socket would answer it. That includes what
+`@tanstack/db` asks for on its own, so a render reads what the browser reads.
+
+> [!WARNING]
+> On `@tanstack/db` 0.9 and later, a limited on-demand query ordered by text
+> with the default sort (this includes `orderBy(id)`: the primary key is TEXT)
+> makes `@tanstack/db` ask for **every matching row** after the first page. In a
+> render those rows are read, held and dehydrated into the HTML. Top 10 of
+> 100 000 matching rows read 100 010 rows and dehydrated 100 000. With
+> `stringSort: "lexical"` (see the note on text ordering below) the same render
+> read 11 rows and dehydrated 10, with or without an index. ADR-0011 has the
+> measurements.
+
+`readSyncSnapshot` is callable by any worker holding the DO binding, and its
+required `request` argument runs through `parseAttachment` — **one auth gate
+for both the socket and the read path**, so a tenant check in `parseAttachment`
+can't be bypassed by SSR.
 
 ---
 

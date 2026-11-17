@@ -354,59 +354,136 @@ decision, not drift:
   source-collection hydration is exactly the D3 path. The example app is the
   right home for that surface.
 
-## Amendment 2026-11-17: the snapshot transport answers a covered fetch
+## Amendment 2026-11-17: a render refuses writes, never reads
 
 **What changed underneath D2.** D2 says `fetch` throws `SsrReadOnlyError`. When
-it was written, every fetch was a cursor fetch (load more, ADR-0003). ADR-0023
-D2 later made an on-demand request that an open or pending watch covers load
-its rows with a fetch that has no cursor. The snapshot transport still refused
-every fetch, so in one render a covered query went to `error`, whether it was
-mounted in the same tick as its cover or after the cover loaded. A list and a
-detail row of one table is enough. On `@tanstack/db` 0.9 and later a single
-query with `orderBy` and `limit` hits it too, because core sends its
-full-source and tie requests as covered requests. Reproduced on 0.8.6 (two
-queries), 0.9.2 and 1.0.0-rc.1.5 (both shapes). The error also said "cursor
-fetch" for a request that was not one.
+it was written, every fetch was a cursor fetch for load more (ADR-0003). Since
+then an on-demand collection fetches in more cases. A request that an open or
+pending watch covers loads its rows with a fetch that has no cursor (ADR-0023
+D2). And `@tanstack/db` 0.9 and later send more plain subset requests on a first
+load: a boundary tie request, a full-source request, and, for an underfilled
+window with an index and an order it can express as a cursor, a request with a
+cursor. The adapter answers the first two with a covered fetch and the third
+with a cursor fetch. The snapshot transport refused every fetch, so a render
+failed for ordinary pages: a list and a detail row of one table (0.8.6, 0.9.2
+and 1.0.0-rc.1.5), and on 0.9 and later a single query with `orderBy` and
+`limit`. The browser answered the same requests and was `ready`.
 
-**Decision.** `SsrSnapshotTransport.fetch` answers a fetch without a cursor
-with one snapshot read of the same collection, `where`, `orderBy` and `limit`.
-On the server that is the same read the WebSocket path makes for it: both
-`readSyncSnapshot` and the cursor-less branch of the `fetch` handler compile
-those three fields with `compileSubsetQuery`. The read's position joins the
-render's MIN cursor like any other read. A fetch with a cursor still rejects
-with `SsrReadOnlyError("cursor fetch")`: the snapshot read takes no cursor, and
-the cursor fetch's ties-plus-page read (ADR-0003) has no snapshot equivalent.
-SSR stays read-only. What it refuses is writes and load more, not reads.
+**Decision.** A render refuses writes, never reads. `sendMut` still throws
+`SsrReadOnlyError`. `SsrSnapshotTransport.fetch` answers every fetch through the
+same `read` it uses for a subscribe, with no change to the `read` request and no
+server change:
 
-**The D3 cursor rule for the rows a covered query adds.** The adapter installs
-a covered fetch's rows insert-if-absent and attributes them to the covering
-watch (ADR-0023 D2, D3), and they dehydrate with every other row. The fetch
-reads after its cover's read, so at the same or a later position. MIN keeps the
-exported cursor at the earliest read, and the hydrated collection's unfiltered
-catch-up (D3, on-demand) replays every change from there, including changes to
-rows the fetch read later. Replay is idempotent, so nothing is skipped or
-doubled. `tests/ssr-hydration.test.ts` pins this with a row written between the
-two reads; `tests/ssr-transport.test.ts` pins both mount orders, the single
-ordered query, the MIN, and the cursor fetch refusal.
+- A fetch without a cursor is one read of its collection, `where`, `orderBy`
+  and `limit`. On the server that is the read the WebSocket path makes for it:
+  `readSyncSnapshot` and the `fetch` handler both compile those fields with
+  `compileSubsetQuery`.
+- A fetch with a cursor is the server's two reads (ADR-0003): first
+  `and(where, whereCurrent)` without a limit (the boundary ties), then
+  `and(where, whereFrom)` with the limit (the next page), both in the request's
+  order. The rows are returned ties first, as the server returns them.
 
-**A refused predicate fails loud.** `readSyncSnapshot` throws on an unsupported
-predicate, so a covered load whose predicate the DO refuses rejects during SSR,
-where the WebSocket path answers an empty page. That matches how a subscribe's
-read already fails during SSR.
+Every read's position joins the render's MIN cursor (D2).
+
+**Two positions for one cursor fetch.** ADR-0003 reads both halves at one
+position because a page lands in a live delta stream: a delete applied between
+the two reads could be undone by the later merge. A render has no delta stream.
+Its rows go only into the dehydrated state, both reads join the MIN cursor, and
+the hydration catch-up replays every change after the earlier one. Two effects
+remain, both inside the render, both repaired on hydration:
+
+- A row that moves past the boundary between the two reads is returned by both.
+  The adapter writes a key once per page (ADR-0003, dated note): the first copy,
+  from the earlier read, wins, and the catch-up brings the newer value. Without
+  that, `@tanstack/db` 1.0 fails the load with a duplicate sync insert; 0.9.2
+  keeps the later copy without an error.
+- A row that moves onto the boundary value, or joins at it, between the two
+  reads is returned by neither. The render does not show it, and the catch-up
+  brings it on hydration.
+
+On the WebSocket path the skip changes nothing. The server reads both halves in
+one synchronous turn, and `col = ?` never matches a row that `col > ?`,
+`col < ?` or `col IS NULL` matches, so a page never repeats a key. Only an app
+whose `getKey` does not return the primary key, which is outside the contract
+(ADR-0001 D9, ADR-0007), could get one; such a page used to fail on 1.0 and now
+keeps the first row.
+
+**Rows a render may read.** A render now reads what the browser reads, so it
+also reads what core asks for. On 0.9 and later, an order core cannot express
+as a cursor makes it ask for the full matching subset after the first page:
+any string order under the default `locale` sort (the primary key is always
+TEXT, so `orderBy(id)` is one), and a boundary value that is NULL. In a render
+those rows are read, held and dehydrated into the page's HTML, and the browser
+reads them again over the socket. Measured with the real DO for
+`where(body = "keep").orderBy(id).limit(10)` over 100 000 matching rows (rows
+read per request, then rows dehydrated; 0.9.2 and 1.0.0-rc.1.5 gave the same
+numbers):
+
+| order | 0.9.2 and 1.0.0-rc.1.5 | 0.8.6 |
+| --- | --- | --- |
+| default sort, with or without an index | 10, then 100 000; 100 000 dehydrated | 10; 10 dehydrated |
+| `stringSort: "lexical"`, without an index | 10, then a 1 row tie; 10 dehydrated | 10; 10 dehydrated |
+| `stringSort: "lexical"`, with an index | 10, then a 1 row tie; 10 dehydrated | 10; 10 dehydrated |
+
+Growing that window to 20 during the render read 20 rows and a 1 row tie
+without an index, and a 1 row tie, a 10 row cursor page and a 1 row tie with
+one (0.9.2 and 1.0.0-rc.1.5). On 0.8.6 it read a 1 row tie and a 10 row cursor
+page with an index, and nothing without one (0.8.x does not grow an unindexed
+window). Before this amendment the default sort case on 0.9 and later read 10
+rows and then failed. The browser holds the same full subset, so a cap in the render would
+show a different result from the browser; the cost is documented, not capped.
+`stringSort: "lexical"` is what keeps it bounded; the index is not needed for
+that. A tie group is read whole, as ADR-0003 already records.
+
+**A refused predicate.** `readSyncSnapshot` throws when the DO refuses a
+predicate (outside the floor, ADR-0013) or SQLite refuses the statement for
+one of its limits, where the WebSocket path answers an empty page or a refused
+sub. An app sees different results on the two sides. The render fails:
+`preload()` rejects with a plain `Error` naming the refusal, and the query is
+in `error`. The browser shows rows: a covered request's empty page resolves the
+load, and the query evaluates its predicate over the rows its cover holds; an
+uncovered request settles with no rows. This was so for an uncovered request
+before this amendment, and is now so for a covered one. (Verified by the
+adversarial review on 0.8.6, 0.9.2 and 1.0.0-rc.1.5 for an unsupported
+predicate; the SQLite limit case follows the same code path, by reading.)
+
+**The D3 cursor rule for rows a render adds by fetching.** The adapter installs
+fetched rows insert-if-absent and attributes them to the covering watch
+(ADR-0023 D2, D3), and they dehydrate with every other row. MIN keeps the
+exported cursor at the earliest read of the render, whatever collection made
+it (one transport, one cursor), and the on-demand catch-up (D3) replays every
+change from there. Replay is idempotent, so nothing is skipped or doubled.
+
+**Pinned.** `tests/ssr-transport.test.ts`: a covered query in both mount
+orders, whose row only its fetch can bring; a covered fetch's own `orderBy`; a
+default sort window that only the full-source request corrects; a tie request;
+a cursor request in a first load; the row in both halves; a window that moves
+during the render; two collections on one transport; and the reads each fetch
+shape makes. `tests/ssr-hydration.test.ts`: a covered query's row written
+between two reads, and a cursor request whose two reads have writes between
+them, each through dehydrate and hydrate to convergence.
 
 **Rejected.**
 
 - *The adapter does not treat a request as covered when the transport cannot
-  fetch*, so the request opens its own watch and a snapshot read answers it.
-  This needs a new capability member on `Transport` (or the adapter knowing the
-  SSR class), and it makes the render take a different path from the browser
-  for the same query. D2 rests on one adapter code path swapped at the
-  transport seam. More surface and two paths, for the same rows.
+  fetch.* This needs a new capability member on `Transport` (or the adapter
+  knowing the SSR class), makes the render take a different path from the
+  browser for the same query, and does nothing for a cursor request. D2 rests
+  on one adapter code path swapped at the transport seam.
 - *The adapter falls back to its own watch when the fetch rejects with
   `SsrReadOnlyError`.* The adapter would learn an SSR error type, every covered
   request would pay a rejected fetch first, and the rule for when a covered
   fetch falls back on an error would be decided here as a side effect of SSR.
-  That rule deserves its own decision.
-
-The chosen fix changes only the snapshot transport. The adapter and the
-WebSocket transport are unchanged.
+- *Refuse a cursor fetch as load more.* Core sends one inside a first load, so
+  the refusal failed renders the browser serves.
+- *Read a cursor fetch at one position by adding the cursor to the `read`
+  request.* Most faithful to ADR-0003, but an app whose `read` rebuilds the
+  request, or a DO deployed before the client, would drop the cursor and return
+  the first page again without any error.
+- *The snapshot transport removes repeated keys.* It does not know the key, so
+  it would need `getKey` or the primary key as new public surface, for one race.
+- *Count the ties, then read `and(where, or(whereCurrent, whereFrom))` once with
+  the ties added to the limit.* One position for the rows, but subtle: ties
+  that join between the two reads shorten the page, which core may take as an
+  underfilled window.
+- *Accept the race as a limit.* It leaves a failed render the app cannot avoid.
