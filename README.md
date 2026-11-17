@@ -390,6 +390,23 @@ browser-verified.
 > window from the start instead of fetching only the next page. See
 > `examples/board`.
 
+> [!NOTE]
+> Ordering a limited query by a **text** column? The server sorts text by bytes,
+> because SQLite in a Durable Object has no locale collation, while
+> `@tanstack/db` sorts strings by locale unless you say otherwise. The first
+> window the server returns can then differ from the one the client would pick
+> (by bytes `Banana` comes before `apple`). The client either loads the whole
+> matching subset to correct the window, or keeps the wrong one, depending on
+> its `@tanstack/db` version. Ask for lexical order on such a query and the two
+> sides use the same order, so only the window is loaded:
+>
+> ```ts
+> q.from({ m: messages }).orderBy(({ m }) => m.author, { direction: "asc", stringSort: "lexical" }).limit(20)
+> ```
+>
+> One rare difference remains, for characters outside the Basic Multilingual
+> Plane. See ADR-0023.
+
 ---
 
 ## Common patterns and recipes
@@ -464,6 +481,17 @@ show. The conventions, what's verified and how, and the full
   syncing. For exact values, store decimal strings in TEXT columns and convert
   at the application edge ([workerd#4195](https://github.com/cloudflare/workerd/issues/4195),
   [issue #10](https://github.com/grrowl/tanstack-durable-object-sync/issues/10)).
+- **A `txId` works like a password inside one Durable Object.** The server
+  remembers every mutation and command by its `txId` alone. A connection that
+  presents another connection's `txId` receives that connection's stored reply,
+  including a command's result. A connection that uses a `txId` first makes the
+  owner's later write with the same `txId` answer `committed` without running.
+  The built-in clients use random UUIDs, and the server never sends a `txId` to
+  another connection, so an attacker would need a leaked or guessed id and a
+  connection to the same Durable Object. Do not pass a predictable `id` to
+  `createTransaction` or `transport.sendMut`, and do not show client error
+  messages (some contain the `txId`) to other users. If commands return secrets,
+  do not put users who distrust each other in one Durable Object (ADR-0012 D4).
 
 ---
 

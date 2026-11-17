@@ -288,3 +288,69 @@ Two of the open items above are closed.
 - **Nulls-last cursor.** `isNull` and `isUndefined` joined the predicate floor
   (ADR-0013 amendment, same date), so 0.9.2's `gt(v) OR isNull OR isUndefined`
   cursor compiles and the window grows.
+
+## Amendment 2026-11-17: text ordering by locale is an accepted limit
+
+The locale half of the ORDER BY follow-up is not fixed, and we decided not to
+fix it. This records the limit, the reasons, and what each client version does.
+
+**The limit.** The server orders text by bytes (SQLite `BINARY`). `@tanstack/db`
+compares strings with `localeCompare` unless the query sets `stringSort`, and
+`locale` is the default. A bounded read (a `sub` snapshot or a `fetch` page with
+`orderBy` and `limit`) over a text column can therefore return a different first
+window than the client would pick. With `apple, Banana, cherry, Date, eel, Fig`
+and a limit of 3, ascending, the server returns `Banana, Date, Fig` and the
+client wants `apple, Banana, cherry`. With `stringSort: "lexical"` the two orders
+agree (the client compares code units with `<`), apart from the astral-character
+residual described in the row-key tie-break amendment above.
+
+**Why it is not fixed.**
+
+- SQLite in a Durable Object has no locale collation. We tried it in workerd:
+  `COLLATE icu_en`, `COLLATE unicode` and `COLLATE en_US` each fail with "no such
+  collation sequence", `load_extension` is not authorized, and `SqlStorage` (in
+  `@cloudflare/workers-types`) has no call that registers a collation. `NOCASE`
+  works, but it is not a locale order.
+- The only fix that gives the right rows is to leave the limit off the server
+  query when the order may be a locale order over text. The request does not say
+  whether the column holds text, and `locale` is the default for every query. A
+  rule that drops the bound for every default sort would make the common case of
+  ordering by a date string, or by a number, load every row. A rule that looks at
+  the column's type needs its own design and ADR.
+- It would only help one client version, because the others already correct the
+  window themselves (below).
+
+**What each supported version does when `stringSort` is not set.** The
+published source of each version was read, and the files are named below.
+
+- `@tanstack/db` 0.8.6. `query/live/collection-subscriber.js` (lines 215 to 228)
+  sends the bounded request with `limit: offset + limit` and the order, and
+  nothing checks the string order. Later pages use a plain `gt` or `lt` cursor
+  (`utils/cursor.js`, lines 3 to 11). The first window is kept, so it can be
+  wrong. Measured with a limit of 3 over 8 rows: window `Banana, Date, Fig`, wanted
+  `apple, Banana, cherry`, 3 of 8 rows loaded.
+- `@tanstack/db` 0.9.2. The same bounded request goes out first
+  (`query/live/ordered-source-loader.js`, `loadPage`, line 210). When it settles,
+  `loadBoundary` (lines 303 to 311) calls `canExpressCursorOrder`
+  (`utils/cursor.js`, lines 37 to 46), which is false for a string unless
+  `stringSort` is `lexical`, and then calls `loadFullSource`. The final window is
+  right and the cost is the whole subset. Measured the same way: right window, 8 of 8 rows
+  loaded. With `lexical`: right window, 3 of 8 rows.
+- `@tanstack/db` 1.0.0-rc.1.5 (the version this repo develops against). The same
+  steps as 0.9.2: `query/live/ordered-source-loader.js` (lines 371 and 437) and
+  `utils/cursor.js` (line 35). `tests/order-by-nulls.test.ts` passes on it with
+  the final window right. The number of rows loaded was not measured on it.
+
+Not measured on any version: how long the wrong first window shows on 0.9.2 and
+later before the full load replaces it, and text outside ASCII or with a named
+`locale`.
+
+**What stays.** The eight `it.fails` locale pins in `tests/order-by-nulls.test.ts`
+stay. They now document this limit and will fail the build, as they should, if
+the server ever matches the client. The README tells readers to set
+`stringSort: "lexical"` on a limited query over a text column.
+
+**Revisit if** the supported floor moves to 0.9 or later (then no supported
+version shows a wrong final window and only the cost remains), or if upstream
+starts sending a bounded request for a locale order (then nothing corrects the
+first window and we would need a fix).
