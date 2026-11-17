@@ -48,11 +48,13 @@ const { Miniflare } = createRequire(require.resolve("wrangler/package.json"))("m
 const workersTypes = installedVersion("@cloudflare/workers-types")
 
 /** Known diagnostics in @tanstack/db's OWN declarations: its local-storage
- *  types assume DOM, absent from a Worker program. Shown, not failed on. Any
- *  other diagnostic fails — upstream's included: the root typecheck skips lib
- *  checks, so this is the only place an upstream declaration break shows. */
+ *  types, and from 0.13 its IndexedDB types, assume DOM, absent from a Worker
+ *  program. Shown, not failed on. Any other diagnostic fails — upstream's
+ *  included: the root typecheck skips lib checks, so this is the only place an
+ *  upstream declaration break shows. */
 const KNOWN_UPSTREAM = [
   /^node_modules\/@tanstack\/db\/dist\/esm\/local-storage\.d\.ts\(\d+,\d+\): error TS(2304|2552): Cannot find name '(Storage|StorageEvent)'/,
+  /^node_modules\/@tanstack\/db\/dist\/esm\/indexed-db(-wrapper)?\.d\.ts\(\d+,\d+\): error TS(2304|2552): Cannot find name 'IDB\w+'/,
 ]
 
 const work = mkdtempSync(join(tmpdir(), "tddc-pack-smoke-"))
