@@ -10,6 +10,12 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ### Changed
 
+- **The examples run on `@tanstack/db` and `@tanstack/react-db` 1.0.0-rc.1.5.**
+  The ssr example also moves `@tanstack/react-router-with-db` to
+  `^1.0.0-rc.1`, because 0.1.0 cannot be installed beside the release
+  candidate. No example source changed. On 1.0, if the first WebSocket dial of
+  chat or multi-do fails, the page must be reloaded. On 0.9 it recovered by
+  itself (ADR-0024 amendment, ADR-0028 D2).
 - **BREAKING (raw clients only):** the server rejects an insert or update
   whose `cols` carry the primary key with a value different from the op
   `key`, answering with a `VALIDATION` rejection before `authorize` runs.
