@@ -8,6 +8,55 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ## [Unreleased]
 
+### Changed
+
+- **The `@tanstack/db` peer range is `>=0.8.6 || >=1.0.0-rc.1`.** npm can
+  now install this package beside the 1.0 release candidates, which is what
+  `@tanstack/db@latest` and `@tanstack/react-db@latest` resolve to. Before,
+  the install failed with `ERESOLVE`, because in semver a plain `>=0.8.6`
+  matches no prerelease. The floor is unchanged (ADR-0028).
+
+### Fixed
+
+- **On `@tanstack/db` 1.0, a failed first connect fails `preload()` with its
+  cause again.** 1.0 renamed the sync control `markError` to `fail`, and the
+  adapter called only the old name, so the collection stayed `loading`
+  forever. On 1.0 a failed collection recovers through `collection.reload()`.
+  Before 1.0 an eager collection still recovers by itself once the transport
+  reconnects (ADR-0028).
+- **On `@tanstack/db` 1.0, `reload()` of an on-demand collection no longer
+  keeps rows the server deleted.** A reload keeps the rows of the previous
+  sync run, and nothing in the new run held them, so a row deleted while the
+  socket was down stayed for good. The new run now starts with a truncate and
+  reloads every live subset (ADR-0028).
+- **A hydrated eager collection no longer ends up in `error` when its first
+  dial fails.** It is ready at once with the hydrated rows, and the transport
+  retries. The adapter reported the failed dial as a failed load, and nothing
+  cleared that again, although the rows converged. The adapter now reports a
+  failure only before a collection is first ready (ADR-0028).
+- **Restarting an eager collection while a snapshot is arriving can no longer
+  lose rows.** The collection reused one subscription id, so the rest of the
+  old snapshot could be taken for the new one, and after a drop the rows
+  already consumed were never sent again. Each sync run now subscribes under
+  a fresh id (ADR-0028).
+- **Correction to the 0.7.0 notes.** "A retried `preload()` recovers" a
+  collection whose first connect failed is true for eager collections only,
+  and only before 1.0. An on-demand collection that was not hydrated has no
+  subscription yet, so the transport does not retry. Recover it with
+  `cleanup()` then `preload()`, or with `reload()` on 1.0.
+
+### Internal
+
+- The `locked` CI leg and the root devDependency move to `@tanstack/db`
+  1.0.0-rc.1.5, so PR CI runs the suite on 0.8.6 and on the release candidate
+  (ADR-0028). Tests await a write through `tests/settled.ts`, which works on
+  both.
+- The weekly upstream job runs its tests, build and pack smoke test even when
+  an earlier step fails. One failing step used to hide the others.
+- The pack smoke test allowlists the DOM-only IndexedDB types in
+  `@tanstack/db`'s own declarations (0.13 and newer), as it does for its
+  local-storage types.
+
 ## [0.7.0] — 2026-09-25
 
 ### Added

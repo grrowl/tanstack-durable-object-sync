@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest"
 import { doCollectionOptions } from "../src/client/do-collection.ts"
 import { WebSocketTransport, type WebSocketLike } from "../src/client/transport.ts"
 import type { TestApi } from "./test-worker.ts"
+import { settled } from "./settled.ts"
 
 // WHY: the entire reactive layer (filtering, joins, incremental view
 // maintenance) is the client's job — the DO only stores + emits, never runs
@@ -43,20 +44,24 @@ describe("client live query / IVM over a DO-backed collection (M8)", () => {
     const kept = createLiveQueryCollection((q) => q.from({ m: messages }).where(({ m }) => eq(m.body, "keep")))
     await kept.preload()
 
-    await messages.insert({ id: "a", body: "keep" }).isPersisted.promise
-    await messages.insert({ id: "b", body: "drop" }).isPersisted.promise
+    await settled(messages.insert({ id: "a", body: "keep" }))
+    await settled(messages.insert({ id: "b", body: "drop" }))
 
     await waitFor(() => kept.get("a") !== undefined)
     expect(kept.get("a")).toMatchObject({ id: "a", body: "keep" })
     expect(kept.get("b")).toBeUndefined() // filtered out client-side
 
     // Incremental update: edit 'b' into the view, 'a' out of it.
-    await messages.update("b", (d) => {
-      d.body = "keep"
-    }).isPersisted.promise
-    await messages.update("a", (d) => {
-      d.body = "drop"
-    }).isPersisted.promise
+    await settled(
+      messages.update("b", (d) => {
+        d.body = "keep"
+      }),
+    )
+    await settled(
+      messages.update("a", (d) => {
+        d.body = "drop"
+      }),
+    )
 
     await waitFor(() => kept.get("b") !== undefined && kept.get("a") === undefined)
     expect(kept.get("b")).toMatchObject({ id: "b", body: "keep" })

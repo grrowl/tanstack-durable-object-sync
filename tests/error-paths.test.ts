@@ -6,6 +6,7 @@ import { WebSocketTransport, type WebSocketLike } from "../src/client/transport.
 import { createFrameCodec } from "../src/wire/frame-codec.ts"
 import type { ClientFrame, ServerFrame } from "../src/wire/frames.ts"
 import type { TestApi } from "./test-worker.ts"
+import { settled } from "./settled.ts"
 
 // WHY: these tests pin three load-bearing invariants in the server's error paths:
 //   1. Atomicity — a failed mutation leaves no partial state; nothing is applied
@@ -244,7 +245,7 @@ describe("no mutation handler, at client altitude", () => {
     await coll.preload()
 
     // Seed via the existing insert mutation (allowed).
-    await coll.insert({ id: "r1", body: "orig" }).isPersisted.promise
+    await settled(coll.insert({ id: "r1", body: "orig" }))
     expect(coll.get("r1")).toMatchObject({ body: "orig" })
 
     // update has NO handler on `transformed`.
@@ -256,7 +257,7 @@ describe("no mutation handler, at client altitude", () => {
 
     let err: unknown
     try {
-      await tx.isPersisted.promise
+      await settled(tx)
     } catch (e) {
       err = e
     }

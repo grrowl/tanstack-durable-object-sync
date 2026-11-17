@@ -1,12 +1,15 @@
 import { createCollection } from "@tanstack/db"
 import { describe, expect, it } from "vitest"
+import { settled } from "./settled.ts"
 
-// PROBE (ADR-0002 C2): when a confirmed write lands in NO loaded window, no
-// delta arrives, yet the completed *direct* optimistic upsert is retained until
-// a later sync commit. Does an empty begin()/commit() run TanStack's clear path
-// (state.ts:1167-1188) and drop the unconfirmed row? If yes, the adapter issues
-// a post-mutation empty commit to retire no-window-match phantoms; if no, it
-// must emit a targeted synced delete instead.
+// PROBE (ADR-0002 C2, ADR-0028): a confirmed write that lands in NO loaded
+// window gets no delta. Through @tanstack/db 0.11 its completed *direct*
+// optimistic upsert is then retained until a later sync commit, so the adapter
+// issues a post-mutation empty begin()/commit() to run the clear path. From
+// 0.12 (TanStack/db#2030) the row is dropped when the mutation function
+// settles, and that empty commit has nothing left to do. The adapter issues it
+// on every version; this pins the one outcome it needs from all of them:
+// nothing is left once it has run.
 
 interface Row {
   id: string
@@ -14,7 +17,7 @@ interface Row {
 }
 
 describe("@tanstack/db: empty sync commit clears a confirmed no-match direct insert", () => {
-  it("an empty begin/commit retires a completed direct optimistic upsert", async () => {
+  it("nothing is left of a confirmed no-match direct insert after an empty begin/commit", async () => {
     type Controls = {
       begin: () => void
       write: (m: { type: string; value?: unknown; key?: string }) => void
@@ -37,13 +40,12 @@ describe("@tanstack/db: empty sync commit clears a confirmed no-match direct ins
       onInsert: async () => {},
     } as never)
 
-    const tx = c.insert({ id: "x", body: "1" }) as unknown as { isPersisted: { promise: Promise<unknown> } }
-    await tx.isPersisted.promise
+    const tx = c.insert({ id: "x", body: "1" })
+    expect(c.get("x")).toMatchObject({ id: "x", body: "1" }) // the optimistic row
+    await settled(tx)
+    // No sync confirmed it. Here 0.11 and older still show the row; 0.12+ do not.
 
-    // Retained as a completed direct optimistic upsert (no sync confirmed it).
-    expect(c.get("x")).toMatchObject({ id: "x", body: "1" })
-
-    // The decisive step: an empty sync commit.
+    // The decisive step for the older versions: an empty sync commit.
     controls!.begin()
     controls!.commit()
     await Promise.resolve()
