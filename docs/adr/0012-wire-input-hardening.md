@@ -268,12 +268,13 @@ hold as a number, so it is correctly found to be past the end.
 
 ### Decision 2: a `since` past the current position gets `reset` and a snapshot
 
-A well formed `since` above the current position cannot be a position this
-object gave out. It happens when the object's storage was recreated and its
-positions started again, while a client kept its cursor, or its SSR meta, from
-before. Such a `since` used to be answered `uptodate`, so the client kept the
-old object's rows for ever. It now falls through to `reset` and a snapshot,
-exactly as a `since` below the log's floor already did. This is a change of
+The position the server compares `since` with is the head of its change log,
+`MAX(seq)`. A well formed `since` above the head of a log that is not empty
+happens when the object's storage was recreated and its positions started
+again, while a client kept its cursor, or its SSR meta, from before. (A log
+that is empty, after pruning, already sent every `since` to a snapshot.) Such a
+`since` used to be answered `uptodate`, so the client kept the old object's
+rows for ever. It now gets `reset` and a snapshot. This is a change of
 behaviour on its own, separate from decision 1, and each kind of subscription in
 `src/client/do-collection.ts` already handles that `reset`:
 
@@ -296,6 +297,23 @@ through the real client, with rows rendered from one object and hydrated
 against another whose log is shorter. The watch's path is the one a reconnect
 below the floor already takes, and is read from the code.
 
+**The limit: the `reset` does not repair the client's cursor.** It gives a
+recreated object's client the right rows on that connection, and that is all.
+Below the floor, the snapshot's position is above the client's cursor, so the
+cursor ends up right. Above the head it does not: the transport's cursor only
+grows, a `reset` does not touch it, and it stays above the head. So each later
+reconnect sends the same `since` and gets `reset` and a full snapshot again,
+until the object's position passes the cursor. If it passes the cursor while
+the client is away, the reconnect gets a catch-up from the cursor, and the rows
+written between the old head and the cursor never arrive. The case is closed
+only while the object's position stays below the client's cursor. This is the
+known limitation "No incarnation epoch" of
+[ADR-0011](./0011-ssr-dehydrate-hydrate.md), seen from the other side. Repairing it means
+moving the single cursor backwards, which belongs with the cursor rules of
+ADR-0002 and ADR-0026 and not in a frame guard, so this change does not do it.
+`tests/cursor-known-limitations.test.ts` pins it as L3, an `it.fails` for the
+change that closes it to turn around.
+
 ### Decision 3: the client sends `since` only in the plain form
 
 A cursor in SSR meta is checked by `parseSyncMeta`, which accepted any string
@@ -307,13 +325,22 @@ answers, after `markReady`, so it would silently stop receiving updates.
 `parseSyncMeta` now returns the plain form (`String(BigInt(cursor))`), and
 refuses a cursor above the largest the server accepts (`MAX_CURSOR`, 19 nines,
 in `src/client/transport.ts`) as it refuses a negative or unparseable one: the
-hydrate call throws, and sync start takes the safe route of a snapshot that
-reconciles the rows. `seedCursor` refuses a cursor above that bound too. Everything else the
-client sends as `since` is `appliedCursor`, which is `String` of a bigint taken
-from the server's own positions.
+hydrate call throws, and sync start takes the safe route: an eager collection
+subscribes with no `since` and reconciles its rows against the snapshot, and an
+on-demand collection truncates and reloads its queries. `seedCursor` refuses a
+cursor above that bound too. Everything else the library sends as `since` is
+`appliedCursor`, which is `String` of a bigint taken from the server's own
+positions. `Transport.subscribe`, which is exported, refuses a `since` that is
+not in the plain form at the call, with a message that names the form, so an
+app that calls it directly with `"05"` fails at once instead of waiting for
+ever (`POSITION`, shared from `src/wire/frames.ts` by the server and the
+client).
 
 **Breaking for raw clients only.** A raw client that sends any other spelling of
-a number (`"01"`, `"1.0"`, `"1e3"`, a space) now gets no reply for that `sub`.
+a number (`"01"`, `"1.0"`, `"1e3"`, a space) now gets no reply for that `sub`. A
+client of 0.7.1 or earlier sends such a `since` only from SSR meta that was
+changed on the way, and that collection then stops receiving updates; the
+server itself always writes the plain form.
 
 Pinned by `tests/since-shape.test.ts`, `tests/ssr-cursor-form.test.ts`, and the
 sync meta tests in `tests/ssr-adapter.test.ts` and `tests/ssr-cursor.test.ts`.
@@ -323,8 +350,10 @@ sync meta tests in `tests/ssr-adapter.test.ts` and `tests/ssr-cursor.test.ts`.
 The only bound on an id a client chooses was the frame size. A `sub` id is
 echoed in every frame for its sub (each `snap`, delta, `snap-end`, catch-up
 `uptodate` and `reset`) and stored in `_sync_subs`, so a 600 000 character sub
-id made every delta for it at least that long. Each such frame also logged an
-oversize warning, so the client chose how many log lines the server wrote. A
+id made every delta for it at least that long. Each outbound frame over
+1 048 576 bytes logs a warning, and a long sub id brought every frame of its sub
+closer to that size, so with a large row the client chose how many such lines
+the server wrote. A
 `txId` is stored in `_sync_seen_tx` for `dedupRetentionMs`. A `fetchId` is
 echoed once. A collection or command name that is not registered is refused,
 but a `mut` or `call` refusal quoted it in its message, which is stored with the
@@ -349,8 +378,12 @@ limit of its own. So `compileSchema` now refuses a table name (in
 names the limit. Those are the only places a name enters the registry:
 `registerSync` compiles the schema with `compileSchema`, and mutations are keyed
 by their table name. With that bound, the longest id the library builds is
-128 + 9 + 21 = 158 bytes, under 256. Only an app supplied transaction id can
-reach the limit, and decision 2 makes that fail at once.
+128 + 9 + 21 = 158 bytes, under 256. The library's client can still reach the
+limit in three ways, each of them an input the app chose: a transaction id the
+app supplies with `createTransaction({ id })`, a collection's `table` option
+that is not a key of the server's schema and is long enough to make its ids
+over 256 bytes, and direct calls to the exported transport's `subscribe`,
+`fetch` and `sendMut` with long ids. Decision 2 makes each of them fail at once.
 
 Both are fixed numbers, not options beside D2: they describe the protocol's
 shape, not how a deployment is tuned, and a client must be able to rely on them.
@@ -372,14 +405,14 @@ as it handles any other refusal of that frame:
 - **`fetch`, id over the limit:** an empty `page` with `seq: "0"`, as for an
   unknown collection, before anything is read.
 - **`mut` or `call`, `txId` over the limit:** `rejected` with code
-  `LIMIT_EXCEEDED` and the message `txId is over 256 bytes`. It is refused
-  before the dedup lookup and is **not** recorded. ADR-0025 runs every per
-  transaction rejection after the dedup lookup, so that a resent `txId` keeps its
-  stored outcome. A `txId` over the limit can have no stored outcome, because
-  none is ever recorded under one, so there is nothing for the lookup to find.
-  The one exception is a receipt recorded under such an id before this change,
-  within one `dedupRetentionMs` of deploying it: a resend of that `txId` is now
-  refused instead of replayed.
+  `LIMIT_EXCEEDED` and the message `txId is over 256 bytes`. ADR-0025 runs
+  every check that can answer a `txId` with `rejected` after the dedup lookup,
+  so that a resent `txId` keeps its stored outcome, and this check keeps that
+  rule: it runs in `#oncePerTx`, after the lookup and after any attempt still in
+  flight, and before the `txId` is reserved as in flight. It is **not**
+  recorded and leaves no in-flight entry. No receipt is recorded under such an
+  id from now on, but one recorded before this change still replays. The cost is
+  one primary key lookup with a key no longer than the frame.
 - **`unsub`, id over the limit:** ignored. No sub can hold the id.
 - **A name over the limit:** a `mut` gets `rejected` with `LIMIT_EXCEEDED` and
   `collection name is over 128 bytes`, and a `call` gets `command name is over
@@ -391,7 +424,8 @@ as it handles any other refusal of that frame:
   already is, with nothing stored.
 
 A frame over more than one limit gets one answer: the id is checked first, then
-the name, then everything else.
+the name, then everything else. For a `mut` or `call`, a stored receipt for its
+`txId` comes before all three.
 
 The reply echoes the id once. That costs about what the client spent to send
 it, and the problem was the echo in every delta, the storage and the log lines,
