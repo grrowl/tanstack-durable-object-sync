@@ -238,3 +238,53 @@ mount for orders 0.9 cannot express as a cursor.
   fail loud.
 - SQL `ORDER BY` ignores `nulls` and locale collation, so a bounded snapshot
   can choose a different top-k than the client's comparator.
+
+## Amendment — 2026-09-29: fetch flush barrier
+
+The fetch/coalescer follow-up above is resolved: `#handleFetch` now flushes the
+requesting socket's buffered deltas before reading its page, as the subscription
+snapshot path already does. A covered load therefore cannot settle with an old
+held row while its newer delta remains buffered. The page remains an atomic
+read and does not advance the client cursor; the preceding delta boundary
+commits the update first. `tests/fetch-flush-barrier.test.ts` pins both the
+wire order and the held row's value at load settlement through the real DO,
+transport, and on-demand collection.
+
+## Amendment — 2026-09-29: bounded snapshot NULL placement
+
+The `nulls` half of the ORDER BY follow-up is fixed: each SQLite sort term
+explicitly uses the requested `NULLS FIRST` or `NULLS LAST`, and `NULLS FIRST`
+when the clause names none. `@tanstack/db` 0.8.6 and 0.9.2 both default to
+`nulls: "first"` in either direction, while SQLite's default puts NULLs last
+in a `DESC` sort, so a descending window used to drop its NULL rows.
+`tests/order-by-nulls.test.ts` compares the real DO's bounded snapshot with
+TanStack's own answer. The locale-collation half remains open (pinned as
+`it.fails`), as does top-k selection among NULL ties crossing the limit, which
+SQLite does not break by row key as TanStack does.
+
+Cursor pages are client-built `where` expressions, so this fix does not touch
+them. 0.8.6's `buildCursor` ignores `nulls` (plain `gt`/`lt`, `eq` for ties).
+0.9.2 builds no cursor at a NULL boundary: a page request becomes a prefix load
+(`orderBy` + `limit`, no cursor), and a boundary-tie request loads the full
+subset. At a non-NULL boundary with `nulls: "last"`, its `whereFrom` is
+`gt(v)` (`lt(v)` descending) `OR isNull OR isUndefined`, and `isNull` is
+outside the predicate floor (ADR-0013): the fetch is refused as an empty page
+and the window stops growing. Pinned as `it.fails`.
+
+## Amendment — 2026-09-29: row-key tie-break and the nulls-last cursor
+
+Two of the open items above are closed.
+
+- **Ties.** Every bounded read ends its `ORDER BY` with the collection's pk,
+  ascending whatever the direction. `@tanstack/db` breaks value ties by row key
+  ascending (`createKeyedComparator` → `compareKeys` in db-ivm; identical in
+  0.8.6's db-ivm 0.1.19 and 0.9.2's 0.1.22), comparing strings with `<`. The
+  term is `COLLATE BINARY` explicitly, since a pk may declare another collation
+  (NOCASE would order `a` before `B`). BINARY matches JS code-unit order except
+  for astral versus U+E000–U+FFFF characters (JS compares UTF-16 code units,
+  SQLite UTF-8 bytes): a known residual divergence. The snapshot, RPC snapshot, and fetch paths all build their
+  SQL in `compileSubsetQuery`, so one change covers them.
+  `tests/order-by-ties.test.ts` drives the sub and fetch paths.
+- **Nulls-last cursor.** `isNull` and `isUndefined` joined the predicate floor
+  (ADR-0013 amendment, same date), so 0.9.2's `gt(v) OR isNull OR isUndefined`
+  cursor compiles and the window grows.

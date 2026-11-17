@@ -182,7 +182,7 @@ describe("a fetch page from an abandoned socket", () => {
       () => "resolved",
       (e: Error) => `rejected: ${e.message}`,
     )
-    await sleep(30) // the page is held on the old socket
+    await waitFor(() => gate.queue.length >= 1) // the page is held on the old socket
     t.seedCursor("1") // regress: forced reconnect onto a fresh socket
     const held = gate.queue.splice(0)
     gate.hold = false

@@ -92,3 +92,29 @@ operator that lands in one floor and not the other.
   floor-operator agreement; `tests/subscriptions.test.ts` pins the JS-floor guard at
   the unit level; `tests/sql-compiler.test.ts` pins `ne` rejection and `not(eq)`
   lowering.
+
+## Amendment 2026-09-29: `isNull` and `isUndefined` join the floor (bugbash F4-cursor)
+
+On @tanstack/db 0.9, an indexed window ordered `nulls: "last"` scrolls with a
+cursor whose `whereFrom` is `gt(v) OR isNull(col) OR isUndefined(col)` (`lt` for
+descending). Both null checks were off-floor, so the cursor fetch was refused as
+an empty page and the window never grew.
+
+D2's rule still holds: each addition is a verified-agreeing operator. Checked
+against `evaluators.ts` in both 0.8.6 and 0.9.2 (identical):
+
+- `isNull(x)` is `x === null`. SQL: `"col" IS NULL`. The delta and catch-up paths
+  evaluate rows hydrated from SQLite, where a NULL column is always `null`
+  (whether the write omitted it or sent `null`), so the two agree.
+- `isUndefined(x)` is `x === undefined`. A stored column is never undefined (SQLite
+  has no such value; hydration yields `null`), so it is false for every stored row.
+  SQL: the constant `0`, like the empty `in`. The operand is still validated as a
+  plain column reference. Residual: `=== undefined` is TRUE for a property the row
+  lacks, i.e. a column the table does not have; there SQL says false. Unknown
+  columns are out of contract (the schema is author-owned and shared with the
+  client, and SQLite reads an unresolvable quoted name as a string literal, so
+  no operator fails loud on one).
+
+The floor is now `{ eq, gt, gte, lt, lte, like, in, isNull, isUndefined, and, or,
+not }`. `tests/predicate-parity.test.ts` pins both operators, and the composed
+cursor shape, across the snapshot and delta paths, per D2.

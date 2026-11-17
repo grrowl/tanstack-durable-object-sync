@@ -102,3 +102,10 @@ a maintainer design decision.
 - **Test coverage**: `tests/wire-hardening.test.ts` (5 tests) pins all four
   invariants; `tests/error-paths.test.ts` was updated to assert the new generic
   error text for execute failures.
+
+## Amendment — 2026-09-29: D3 command authorization
+
+[ADR-0014 D2](./0014-object-sync-schema.md) revises D3 above: command
+`authorize` errors now surface to clients like mutation `authorize` errors;
+only command `execute` errors are sanitized as `EXECUTE_FAILED`. The shared
+sanitized catch described in D3 is historical, not the current contract.

@@ -15,7 +15,6 @@
 // non-trivial host reach `this.ctx.storage.sql` directly (ADR-0015).
 
 import { DurableObject } from "cloudflare:workers"
-import type { SqlStorage } from "@cloudflare/workers-types"
 import { Syncable } from "./mixin.ts"
 import type { CompiledSync, SyncSchema } from "./registry.ts"
 

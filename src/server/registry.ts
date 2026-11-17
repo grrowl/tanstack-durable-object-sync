@@ -20,7 +20,6 @@
 // commands keyed by name) — see `compileSchema`. The wire/dispatch semantics are
 // unchanged; this file only changes how the author DECLARES them.
 
-import type { SqlStorage } from "@cloudflare/workers-types"
 import type { MutOp, RowOp } from "../wire/frames.ts"
 import { SYNC_PREFIX } from "./changes.ts"
 import type { StandardSchemaV1 } from "./standard-schema.ts"

@@ -227,3 +227,11 @@ tddc design gap; a PR against Actors is possible in principle but out of scope.
   and ADR-0019's `tests/hibernation.test.ts` now exercises the restore under
   real `evictDurableObject` cycles — which promptly exposed that the restore
   was incomplete (sockets survived, subscriptions didn't). See ADR-0019.]*
+
+## Amendment — 2026-09-29: subclass tick initialization
+
+The coalescer reads `tickMs` when arming an on-demand flush, not while the mixin
+constructor runs: subclass field initializers have not run during `super()`.
+This preserves the protected-field tuning contract and creates no idle timer.
+`tests/tick-override.test.ts` pins the real DO path; the slow-tick cursor-barrier
+and replay tests now run with their intended 30-second coalescer window.

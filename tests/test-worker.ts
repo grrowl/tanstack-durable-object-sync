@@ -228,11 +228,13 @@ export class UnregisteredDO extends SyncDurableObject<unknown, Claims> {}
 
 /** Same collections as SyncTestDO, but with a tiny compaction threshold so the
  *  opportunistic `maybeCompact` housekeeping (compaction + retention prune +
- *  dedup sweep) fires after a few writes instead of 200 — lets tests exercise
- *  the real drain → maybeCompact → waitUntil path. Keeps the default 2-day
- *  `changelogRetentionMs` so the retention wiring is tested as shipped. */
+ *  orphan-sub sweep) fires after a few writes instead of 200 — lets tests
+ *  exercise the real drain → maybeCompact → waitUntil path. Keeps the default
+ *  2-day `changelogRetentionMs` so the retention wiring is tested as shipped.
+ *  A 1 s `dedupRetentionMs` lets the dedup sweep gate reopen within a test. */
 export class MaintTestDO extends SyncTestDO {
   protected override readonly compactionEvery = 3
+  protected override readonly dedupRetentionMs = 1000
 }
 
 /** Same collections as SyncTestDO with an effectively-infinite coalescer tick:

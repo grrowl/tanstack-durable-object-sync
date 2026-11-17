@@ -23,7 +23,9 @@ export const chatSchema = sync.schema({
           },
           execute: ({ op, sql }) => {
             const m: Message = op.cols
-            sql.exec("INSERT INTO messages VALUES (?, ?, ?, ?)", m.id, m.author, m.content, m.created_at)
+            type TypedSql<Sql> = 0 extends (1 & Sql) ? never : Sql
+            const typedSql: TypedSql<typeof sql> = sql
+            typedSql.exec("INSERT INTO messages VALUES (?, ?, ?, ?)", m.id, m.author, m.content, m.created_at)
           },
         },
         delete: { execute: ({ op, sql }) => void sql.exec("DELETE FROM messages WHERE id = ?", op.key) },

@@ -145,3 +145,25 @@ Before this change the same never-settling handler already hung its own
 frame and kept the DO active.
 
 Tests: `tests/inflight-txid.test.ts` (with `GatedTestDO` in the test worker).
+
+## Amendment — 2026-09-29: supplied row primary key must agree with op key
+
+For a `mut` insert or update, when `cols` owns the collection's `pk` field,
+reject the entire batch with `VALIDATION` if its value differs from `op.key`.
+This includes `""`, `null`, and non-string values. Run the gate after the
+dedup lookup, before any `authorize` or `execute`, and record the rejection
+as a receipt. Do not overwrite `cols[pk]`: ADR-0014's validation is a gate,
+not a parser, and rewriting the value would hide a mismatch from the author
+while breaking ADR-0001 D9's optimistic-id == confirmed-id contract. An
+update that supplies a different pk could likewise move a row under a
+different identity in a handler that writes the patch, so it is rejected too.
+
+An insert whose `cols` omits the pk is not rejected by this gate: no value
+exists to compare. ADR-0014 describes a full row for insert, but its schema
+validation is opt-in and the author controls `execute`; a handler may use
+`op.key` to populate the SQL pk. Requiring `cols[pk]` would change that
+contract. The author still owns row completeness and the actual SQL write;
+this gate only prevents an explicitly conflicting identity. Delete has no
+`cols` and remains covered by the existing non-empty op-key check.
+
+Tests: `tests/mutation-pk-consistency.test.ts`.

@@ -6,7 +6,6 @@
 // current client can still retry an old txId, so this table is swept on its
 // own time-based horizon (M7), not tied to the compaction floor.
 
-import type { SqlStorage } from "@cloudflare/workers-types"
 import { decode as decodeValue, encode as encodeValue } from "../wire/codec.ts"
 
 export interface SeenTx {
@@ -69,7 +68,12 @@ export function decodeResult(stored: string | null): unknown {
  * Drop dedup entries older than `olderThanMs`. Retention is INDEPENDENT of the
  * changelog (ADR-0002 C5): sized to the maximum client retry/outbox window, not
  * the compaction floor — a fully-current client can still retry an old txId.
+ *
+ * `ts` is stamped in whole seconds (`unixepoch()*1000`), truncated, so it can
+ * trail the true write time by up to 999 ms. The extra 1000 ms in the cutoff
+ * keeps `olderThanMs` a true lower bound (a receipt is never swept before it
+ * has aged that long); the cost is retention of up to 1 s longer.
  */
 export function sweepDedup(sql: SqlStorage, olderThanMs: number, nowMs: number): void {
-  sql.exec("DELETE FROM _sync_seen_tx WHERE ts < ?", nowMs - olderThanMs)
+  sql.exec("DELETE FROM _sync_seen_tx WHERE ts < ?", nowMs - olderThanMs - 1000)
 }
