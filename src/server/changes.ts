@@ -140,14 +140,17 @@ export function ensureTriggers(
  * which breaks optimistic id parity), and any table that lacks a usable internal
  * `rowid` — a `WITHOUT ROWID` table (which has none) or one with a declared
  * `rowid` column (which shadows it) — because the cold-snapshot/fetch reader
- * orders by `rowid` when the client sends no orderBy (ADR-0015). Introspects the
- * real table, so it works however the author created it. `pragma_table_info` is
- * the table-valued form, so the table name binds as a parameter.
+ * orders by `rowid` when the client sends no orderBy (ADR-0015) — and a column
+ * named `__proto__`, which no row object can carry (ADR-0007 amendment
+ * 2026-11-17). Introspects the real table, so it works however the author created
+ * it. `pragma_table_xinfo` is the table-valued form, so the table name binds as a
+ * parameter; unlike `pragma_table_info` it lists generated columns, which
+ * `SELECT *` returns and which can shadow `rowid` too.
  */
 export function assertSyncCompatible(sql: SqlStorage, tbl: string, pk: string): void {
   const cols = Array.from(
     sql.exec<{ name: string; type: string; is_pk: number }>(
-      "SELECT name, type, pk AS is_pk FROM pragma_table_info(?)",
+      "SELECT name, type, pk AS is_pk FROM pragma_table_xinfo(?)",
       tbl,
     ),
   )
@@ -173,10 +176,10 @@ export function assertSyncCompatible(sql: SqlStorage, tbl: string, pk: string): 
   // can defeat that, both rejected here at registerSync rather than left to
   // surface at read time:
   //
-  //   1. A declared column named `rowid` SHADOWS the internal rowid, so
-  //      `ORDER BY rowid` would silently sort by that arbitrary user column
-  //      (and lose determinism on null/duplicate values). Check the introspected
-  //      columns directly.
+  //   1. A declared column named `rowid`, generated or not, SHADOWS the internal
+  //      rowid, so `ORDER BY rowid` would silently sort by that arbitrary user
+  //      column (and lose determinism on null/duplicate values). Check the
+  //      introspected columns directly.
   if (cols.some((c) => c.name.toLowerCase() === "rowid")) {
     throw new Error(
       `collection '${tbl}': a column named 'rowid' shadows SQLite's internal rowid, which the ` +
@@ -197,6 +200,18 @@ export function assertSyncCompatible(sql: SqlStorage, tbl: string, pk: string): 
       `collection '${tbl}': table is WITHOUT ROWID — sync requires a rowid table so snapshot/fetch ` +
         `reads have a deterministic default order (ORDER BY rowid, ADR-0015). Recreate '${tbl}' ` +
         `without the WITHOUT ROWID clause.`,
+    )
+  }
+  // A row of `SELECT *` is a plain object with each column set on it, so a
+  // column named `__proto__` sets the row's prototype (to null for a NULL)
+  // instead of becoming a key. No snapshot or delta can carry it, and the
+  // evaluator would read the prototype where SQL reads the column. Names are
+  // exact: `__PROTO__` is an ordinary key, and `constructor` and the like are
+  // set as own keys.
+  if (cols.some((c) => c.name === "__proto__")) {
+    throw new Error(
+      `collection '${tbl}': a column named '__proto__' cannot be carried on a row object, so no ` +
+        `snapshot or delta would hold it. Rename that column.`,
     )
   }
 }

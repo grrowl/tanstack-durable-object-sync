@@ -382,8 +382,8 @@ export function compileSubsetQuery(
     // across inserts regardless of intervening deletes. Every synced table
     // exposes a real internal rowid: `assertSyncCompatible` (changes.ts) forbids
     // an `INTEGER PRIMARY KEY` pk (which aliases it), a `WITHOUT ROWID` table
-    // (which has none), and a declared `rowid` column (which shadows it), so this
-    // reference always resolves to insertion order.
+    // (which has none), and a column named `rowid`, generated or not (which
+    // shadows it), so this reference always resolves to insertion order.
     sql += ` ORDER BY rowid`
   }
 

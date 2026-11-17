@@ -100,4 +100,52 @@ describe("assertSyncCompatible (ADR-0007, D9) — real-table introspection", () 
       expect(() => assertSyncCompatible(sql, "t", "id")).toThrow(/shadows/)
     })
   })
+
+  // ADR-0007 amendment 2026-11-17. A generated column is not in `pragma_table_info`,
+  // and `SELECT rowid` resolves to it, so neither the column check nor the probe
+  // saw it, and the default `ORDER BY rowid` sorted by the generated value.
+  for (const [kind, ddl] of [
+    ["virtual", "rowid TEXT GENERATED ALWAYS AS (upper(body)) VIRTUAL"],
+    ["stored", "ROWID TEXT GENERATED ALWAYS AS (upper(body)) STORED"],
+  ] as const) {
+    it(`rejects a ${kind} generated column named rowid`, async () => {
+      await withSql((sql) => {
+        sql.exec(`CREATE TABLE t (id TEXT PRIMARY KEY, body TEXT, ${ddl})`)
+        sql.exec("INSERT INTO t (id, body) VALUES ('a', 'z'), ('b', 'a')")
+        // Why the probe alone cannot see it: `rowid` reads the generated value.
+        expect(Array.from(sql.exec("SELECT rowid AS r FROM t ORDER BY rowid"), (x) => x.r)).toEqual(["A", "Z"])
+        expect(() => assertSyncCompatible(sql, "t", "id")).toThrow(/shadows/)
+      })
+    })
+  }
+
+  // ADR-0007 amendment 2026-11-17. workerd builds a row of `SELECT *` by setting
+  // each column on a plain object, so a column named `__proto__` is never an own
+  // key of the row, and a NULL in it sets the row's prototype to null. Neither
+  // the snapshot nor a delta can carry that column, and SQL can match on it where
+  // the evaluator reads the row's prototype.
+  it("rejects a column named __proto__, plain or generated", async () => {
+    await withSql((sql) => {
+      sql.exec("CREATE TABLE t (id TEXT PRIMARY KEY, __proto__ TEXT)")
+      sql.exec("INSERT INTO t (id, __proto__) VALUES ('a', 'x'), ('b', NULL)")
+      const [a, b] = Array.from(sql.exec("SELECT * FROM t ORDER BY id"))
+      expect(Object.keys(a!)).toEqual(["id"])
+      expect(Object.getPrototypeOf(b!)).toBe(null)
+      expect(() => assertSyncCompatible(sql, "t", "id")).toThrow(/__proto__/)
+
+      sql.exec("CREATE TABLE g (id TEXT PRIMARY KEY, body TEXT, __proto__ TEXT GENERATED ALWAYS AS (body) VIRTUAL)")
+      expect(() => assertSyncCompatible(sql, "g", "id")).toThrow(/__proto__/)
+    })
+  })
+
+  it("accepts columns named after other Object.prototype members", async () => {
+    // Only `__proto__` is an accessor on a plain object; these are set as own keys.
+    await withSql((sql) => {
+      sql.exec("CREATE TABLE t (id TEXT PRIMARY KEY, constructor TEXT, toString TEXT, hasOwnProperty TEXT)")
+      sql.exec("INSERT INTO t VALUES ('a', NULL, 'x', 'y')")
+      const [a] = Array.from(sql.exec("SELECT * FROM t"))
+      expect(Object.keys(a!)).toEqual(["id", "constructor", "toString", "hasOwnProperty"])
+      expect(() => assertSyncCompatible(sql, "t", "id")).not.toThrow()
+    })
+  })
 })
