@@ -1,4 +1,5 @@
-import { and, createLiveQueryCollection, DbClient, collectionOptions, eq } from "@tanstack/db"
+import * as tanstackDb from "@tanstack/db"
+import { and, BTreeIndex, createLiveQueryCollection, DbClient, collectionOptions, eq } from "@tanstack/db"
 import { env, runInDurableObject, SELF } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
 import { doCollectionOptions } from "../src/client/do-collection.ts"
@@ -395,4 +396,64 @@ describe("SSR round trip: dehydrate on the worker, hydrate + converge in the bro
     writer.close()
     ws.close()
   })
+
+  // 0.8.x sends no cursor request inside a first load (0.9.0 removed the
+  // subset-algebra helpers, so their presence marks 0.8.x).
+  it.runIf(!("isWhereSubset" in tanstackDb))(
+    "on-demand with a cursor request read at two positions: what changed between them converges on hydration",
+    async () => {
+      // A render answers a cursor request with two reads, the boundary ties and
+      // then the page, at two positions (ADR-0011 amendment 2026-11-17). Between
+      // them, `a` changes and `x` joins AT the boundary value, so neither read
+      // returns `x`: the render misses it. Both reads join the MIN cursor, so
+      // the hydration catch-up replays both changes.
+      const room = `rt-od-two-${crypto.randomUUID()}`
+      await sql(room, "INSERT INTO messages(id,body) VALUES('a','b1'),('b','b2'),('c','b3')")
+      const isPage = (where: unknown) => /"name":"(gt|lt)"/.test(JSON.stringify(where ?? null))
+      const read = makeRead(room)
+      let firstCursor: string | null = null
+      const ssr = new SsrSnapshotTransport<Api>({
+        read: async (req) => {
+          if (isPage(req.where) && firstCursor === null) {
+            firstCursor = ssr.appliedCursor
+            await sql(room, "UPDATE messages SET body='b0' WHERE id='a'", "INSERT INTO messages(id,body) VALUES('x','b3')")
+          }
+          return read(req)
+        },
+      })
+      const lexical = { stringSort: "lexical" } as const
+      const indexed = (t: SsrSnapshotTransport<Api> | WebSocketTransport<Api>) =>
+        collectionOptions({
+          ...(doCollectionOptions({ transport: t, table: "messages", getKey: (r) => r.id, syncMode: "on-demand" }) as object),
+          autoIndex: "eager",
+          defaultIndexType: BTreeIndex,
+        } as never) as never
+      const top = (col: unknown) =>
+        createLiveQueryCollection((q) =>
+          q
+            .from({ m: col as never })
+            .orderBy(({ m }: { m: Msg }) => m.body, lexical)
+            .limit(10),
+        )
+
+      const server = new DbClient()
+      const serverTop = top(server.collection(indexed(ssr)))
+      await serverTop.preload()
+      expect(firstCursor).not.toBeNull() // the cursor request was read
+      const rendered = (serverTop.toArray as Array<Msg>).map((r) => `${r.id}=${r.body}`)
+      expect(rendered).toEqual(["a=b1", "b=b2", "c=b3"]) // `a` from before, no `x`
+      const state = server.dehydrate()
+      expect((state.collections[0]!.syncMeta as { cursor: string }).cursor).toBe(firstCursor)
+
+      const ws = makeWsTransport(room)
+      const db = new DbClient()
+      db.hydrate(state as never)
+      const live = top(db.collection(indexed(ws)))
+      await live.preload()
+      const rows = () => (live.toArray as Array<Msg>).map((r) => `${r.id}=${r.body}`).join(" ")
+      await waitFor(() => rows() === "a=b0 b=b2 c=b3 x=b3")
+      expect(live.status).toBe("ready")
+      ws.close()
+    },
+  )
 })
