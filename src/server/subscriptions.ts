@@ -165,7 +165,10 @@ export function sweepOrphanSubs(sql: SqlStorage, liveSocketIds: ReadonlySet<stri
     sql.exec("DELETE FROM _sync_subs")
     return
   }
-  const ids = Array.from(liveSocketIds)
-  const placeholders = ids.map(() => "?").join(",")
-  sql.exec(`DELETE FROM _sync_subs WHERE socket_id NOT IN (${placeholders})`, ...ids)
+  // One JSON parameter, not one per socket: Durable Object SQLite binds at most
+  // 100 per statement, and a DO can hold more live sockets than that.
+  sql.exec(
+    "DELETE FROM _sync_subs WHERE socket_id NOT IN (SELECT value FROM json_each(?))",
+    JSON.stringify(Array.from(liveSocketIds)),
+  )
 }

@@ -110,46 +110,50 @@ a maintainer design decision.
 only command `execute` errors are sanitized as `EXECUTE_FAILED`. The shared
 sanitized catch described in D3 is historical, not the current contract.
 
-## Amendment — 2026-11-17: the server always answers a well-formed `sub` or `fetch`
+## Amendment — 2026-11-17: a refusal is always answered, and long lists no longer throw
 
-A `sub` whose snapshot query threw in SQLite (an `in` list over the bind limit,
-[ADR-0013 amendment of the same date](./0013-predicate-floor-one-evaluator.md))
-got no reply, and the sub stayed registered in memory and in `_sync_subs`. Only
-`UnsupportedPredicateError` was caught; anything else escaped.
+A `sub` with an `in` list over 100 values threw from SQLite with no reply, and the
+sub stayed registered in memory and in `_sync_subs` ([ADR-0013 amendment of the
+same date](./0013-predicate-floor-one-evaluator.md)). This change guarantees two
+things.
 
-- **`sub`.** After the unknown-collection and cap checks, any throw is logged and
-  answered with `reset`. The sub is removed from memory and from `_sync_subs`. A
-  re-sub that fails drops the subId it replaced, since the client has just been
-  told that subId is reset.
-- **No `snap` precedes the refusal.** The snapshot rows are read before the first
-  frame is sent, and the below-floor fallback reads them before it sends its own
-  `reset`. A failure therefore never follows a `snap`, which matters because the
-  client takes a `reset` before `snap-end` as a refusal that holds no rows
-  ([ADR-0023](./0023-on-demand-watches-acquisitions-holds.md) D5). A windowed
-  catch-up still sends its `d` frames as it builds them. It only runs for a sub
-  that resumed with `since`, which the client sends only after the sub
-  bootstrapped (ADR-0023 D7), and there a `reset` truncates. Nothing in it is
-  expected to throw.
-- **`fetch`.** Any throw is logged and answered with an empty `page`.
-- **When the refusal itself fails.** If the cleanup or the reply throws, the
-  server logs it and closes the socket with **1011**. The client's reconnect
-  policy retries every close outside 4000-4999
-  ([ADR-0016](./0016-reconnect-policy.md)), so the client reconnects and
-  resubscribes. This is the same move as a restored sub that no longer compiles
-  ([ADR-0019](./0019-subscription-persistence-across-hibernation.md) D3). The
-  socket's subscriptions leave memory first; if its durable rows cannot be
-  deleted then, the compaction sweep removes a closed socket's rows (ADR-0019 D4).
-- **`readSyncSnapshot`** is unchanged: it has no socket, and a throw rejects the
-  RPC (fail loud, ADR-0011 D1).
+- **Long lists no longer throw**, and every SQLite limit a compiled query can
+  reach is refused when the query is compiled (ADR-0013 amendment). So a
+  predicate over a limit is a deliberate refusal, never a throw from SQLite.
+  The same bug sat in the orphan-sub sweep (ADR-0019 D4), which bound one
+  parameter per live socket and threw in the background with 101 sockets; it
+  now passes them as one JSON parameter.
+- **A request the server refuses on purpose always gets its refusal reply, and
+  nothing of a refused sub stays registered.** The deliberate refusals of a `sub`
+  are: an unknown collection, the per-socket cap (D2), a predicate outside either
+  floor, and a query over one of SQLite's limits. Each answers with `reset` and
+  removes the subId in memory and in `_sync_subs`. A refused re-sub therefore also
+  drops the entry it would have replaced, since the client now holds that subId
+  as reset. A refused `fetch` answers with an empty `page`, as before.
+
+The snapshot rows are read before the sub's first frame, and the below-floor
+fallback reads them before it sends its `reset`. So a read that throws has sent
+the client nothing for that sub: no `snap`, which the client would keep (a
+`reset` before `snap-end` is taken as holding no rows, ADR-0023 D5).
+
+**Unexpected failures are unchanged here.** A throw that is not a deliberate
+refusal (SQLite failing on a write-through, a storage limit, a bug) still escapes
+the handler with no reply, and a sub registered before it stays registered, as
+before this change. Two replies were considered and rejected for now: a bare
+`reset` loses rows for a resumed eager sub (it truncates, nothing re-snapshots,
+and the transport keeps resuming from its cursor), and closing the socket loops
+when the cause persists, because the client resets its backoff on every
+successful open. Unexpected failures are decided separately, together with a
+client backoff fix.
 
 **No new inbound cap.** A list's length no longer reaches SQLite as parameters,
-and `maxFrameBytes` (D2) already bounds the size of any one predicate. The
-evaluator's cost per row is a `Set` lookup on 1.0 and a scan of the list on
-0.8.6 and 0.9.2, bounded by the same frame cap. Observed and left open: the
-predicates a socket keeps, in memory and in `_sync_subs`, are bounded only by
-`maxSubsPerSocket × maxFrameBytes` (256 MiB), which is above a Worker isolate's
-128 MB. That was already true for any large literal and does not depend on list
-length.
+`maxFrameBytes` (D2) already bounds the size of any one predicate on the socket,
+and every SQLite limit is now refused at compile time. The evaluator's cost per
+row is a `Set` lookup on 1.0 and a scan of the list on 0.8.6 and 0.9.2, bounded
+by the same frame cap. Observed and left open: the predicates a socket keeps, in
+memory and in `_sync_subs`, are bounded only by `maxSubsPerSocket × maxFrameBytes`
+(256 MiB), which is above a Worker isolate's 128 MB. That was already true for any
+large literal and does not depend on list length.
 
-Pinned by `tests/long-in-lists.test.ts` ("the server always answers a
-well-formed sub or fetch").
+Pinned by `tests/long-in-lists.test.ts` ("a predicate over SQLite's limits is
+refused on purpose") and `tests/sqlite-limits.test.ts`.

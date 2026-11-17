@@ -119,7 +119,7 @@ The floor is now `{ eq, gt, gte, lt, lte, like, in, isNull, isUndefined, and, or
 not }`. `tests/predicate-parity.test.ts` pins both operators, and the composed
 cursor shape, across the snapshot and delta paths, per D2.
 
-## Amendment 2026-11-17: long `in` lists, and `in` compares by kind (bug bash)
+## Amendment 2026-11-17: long `in` lists, `in` compares by kind, and SQLite's limits are refused at compile time (bug bash)
 
 **Context.** The compiler bound one SQL parameter per `in` value. SQLite in a
 Durable Object accepts at most 100 bound parameters per statement, so an `in`
@@ -132,14 +132,25 @@ affected: the snapshot, both halves of a cursor fetch, the reset-and-resnapshot
 below the retention floor, and `readSyncSnapshot`. The windowed catch-up and the
 wake restore use the JS evaluator only, so they were not.
 
-**Where 100 comes from.** workerd's `SqliteDatabase::setupSecurity`
-(`src/workerd/util/sqlite.c++`) calls
-`sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, 100)`, and Cloudflare's Durable
-Objects limits page lists "Maximum bound parameters per query: 100". In workerd,
-100 parameters run and 101 fail with `too many SQL variables`
-(`tests/long-in-lists.test.ts`, "the platform limit"). The same function sets
-`SQLITE_LIMIT_SQL_LENGTH` to 100 000 bytes, and the expression tree depth is
-capped at 100 (`Expression tree is too large (maximum depth 100)`, observed).
+**SQLite's limits in a Durable Object.** workerd's `SqliteDatabase::setupSecurity`
+(`src/workerd/util/sqlite.c++`) sets them; Cloudflare's Durable Objects limits page
+lists the same numbers. The ones a compiled query can reach:
+
+| Limit | Value | How it fails |
+| --- | --- | --- |
+| `SQLITE_LIMIT_VARIABLE_NUMBER` | 100 bound parameters | `too many SQL variables` |
+| `SQLITE_LIMIT_EXPR_DEPTH` | an expression tree 100 deep | `Expression tree is too large` |
+| `SQLITE_LIMIT_SQL_LENGTH` | 100 000 bytes of SQL | `statement too long` |
+| `SQLITE_LIMIT_LENGTH` | one string value | `string or blob too big` |
+| `SQLITE_LIMIT_LIKE_PATTERN_LENGTH` | 50 bytes | `LIKE or GLOB pattern too complex`, only when the LIKE is evaluated on a row |
+
+For `SQLITE_LIMIT_LENGTH`, workerd's main branch sets 8 MiB + 34 (`MAX_ROW_LENGTH`
+in `sqlite.h`), but the workerd this package is tested on (1.20260721.1) rejects a
+plain string over 2 200 000 bytes and a `json_each` list of exactly 2 200 000
+bytes. The other limits in that function cannot be reached by a compiled query: it
+uses no compound select, no function with more than one argument, and no more
+than 100 columns. A query is at most 100 000 bytes of SQL, so its program stays far
+below `SQLITE_LIMIT_VDBE_OP` (250 000 instructions).
 
 **What was measured in workerd** (vitest-pool-workers 0.18.7):
 
@@ -148,12 +159,11 @@ capped at 100 (`Expression tree is too large (maximum depth 100)`, observed).
 - Running the list in chunks across statements breaks `ORDER BY`/`LIMIT`/
   `OFFSET` and any composition (`or`, `not`, two lists). Rejected.
 - `x IN (SELECT value FROM json_each(?))` takes one parameter per list and the
-  plan still searches the pk index (`SEARCH … USING INDEX sqlite_autoindex_…
-  (id=?)`). `json_each` is on workerd's SQL function allowlist. Strings come back
-  exact, including NUL, astral characters and JSON-looking text. Safe integers
-  come back exact. Doubles do not always: 3 196 of 25 008 random bit patterns
-  parsed to a neighbouring double, all of them at extreme magnitudes (none
-  between 1e-20 and 1e20).
+  plan still searches the pk index. `json_each` is on workerd's SQL function
+  allowlist. Strings come back exact, including NUL, astral characters and
+  JSON-looking text. Safe integers come back exact. Doubles do not always: 3 196
+  of 25 008 random bit patterns parsed to a neighbouring double, all of them at
+  extreme magnitudes (none between 1e-20 and 1e20).
 - The bound form already disagreed with the evaluator. workerd binds every JS
   number as REAL and booleans and Dates as text, and SQLite converts by column
   affinity, while @tanstack/db's `in` compares by kind. So `in(text_col, [1])`
@@ -167,42 +177,61 @@ capped at 100 (`Expression tree is too large (maximum depth 100)`, observed).
    Strings go in one JSON array read with `json_each`, guarded by
    `typeof(col) IN ('text', 'null')`. Safe integers go in one JSON array, and
    other numbers bind one each (JSON text cannot carry every double exactly);
-   both are guarded by `typeof(col) IN ('integer', 'real', 'null')`. The guard
-   makes a value match only stored values of its own kind, as the evaluator
-   does, and allowing `'null'` keeps a NULL column unknown, so `not` leaves it
-   out as the evaluator does. `null`, `undefined` and `NaN` never match in the
-   evaluator (0.8.6 to 1.0.0-rc.1.5) and are dropped. When nothing is left, the
-   result is `CASE WHEN col IS NULL THEN NULL ELSE 0 END`: false, or unknown for
-   a NULL column.
-2. **Other kinds in an `in` list are refused** (`UnsupportedPredicateError`, so
-   `reset` or an empty page): boolean, bigint, Date, bytes, objects and arrays.
-   SQLite has no boolean, bigint or date, and a server row never holds a
-   `Uint8Array` (BLOBs hydrate as `ArrayBuffer`), so no SQL form agrees with the
-   evaluator on them. Before, they bound as text (`'true'`, a Date's
-   `toString()`) or a blob and disagreed, or threw (bigint) and hung. This is D3's
-   rule for `like` patterns applied to `in`. A Date could later be admitted by
-   sending its `getTime()`, which is what the evaluator compares; that is a
-   separate decision.
-3. **The parameter rule covers the whole statement.** `compileSubsetQuery`
-   refuses a statement that would bind more than 100 values in total, counting
-   every list, comparison literal, `limit` and `offset`. What is still refused:
-   an `or` of more than about 98 comparisons, or more than about 98 distinct
-   non-integer numbers across lists. The other SQLite caps (expression depth
-   100, statement length 100 KB) are not checked at compile time; a statement
-   over them throws from SQLite and gets the refusal reply (ADR-0012 amendment
-   of the same date).
+   both are guarded by `typeof(col) IN ('integer', 'real', 'null')`. Each kind is
+   its own `OR` term, which keeps the pk index for every mix of kinds (SQLite's
+   `MULTI-INDEX OR`; one term mixing kinds made it scan). The guard makes a value
+   match only stored values of its own kind, as the evaluator does, and allowing
+   `'null'` keeps a NULL column unknown, so `not` leaves it out as the evaluator
+   does. When no value is left, the result is
+   `CASE WHEN col IS NULL THEN NULL ELSE 0 END`: false, or unknown for a NULL
+   column.
+2. **A value that can equal nothing a stored row holds is dropped; a Date matches
+   by its time value.** The evaluator compares a Date by `getTime()`
+   (`normalizeValue`, the same in 0.8.6, 0.9.2 and 1.0.0-rc.1.5), so a Date
+   travels as that integer and matches a numeric row with that value. Dropped:
+   `null` and `undefined` (never members); `NaN` and an invalid Date (the
+   evaluator does match `NaN` to `NaN`, but SQLite stores `NaN` as NULL, so no row
+   holds it); booleans, bigints, objects and arrays (a row from SQLite holds none
+   of them); and `Uint8Array` (BLOBs hydrate as `ArrayBuffer`, which the
+   evaluator never equates with a `Uint8Array`). Dropping agrees with the
+   evaluator and refuses nothing, which matters while a refusal still reads as an
+   empty result on the client. Before this change these values bound as text
+   (`'true'`, a Date's `toString()`) or a blob and disagreed, or threw (bigint).
+3. **Every limit in the table is refused when the query is compiled.**
+   `compileSubsetQuery` refuses (`UnsupportedPredicateError`, so `reset`, an
+   empty page, or a rejected `readSyncSnapshot`) a statement that binds more than
+   100 values in total (every list, comparison literal, `limit` and `offset`
+   counts), whose `where` is more than 100 levels deep, whose SQL is over 100 000
+   bytes, or that binds a string of 2 200 000 bytes or more; and a `like` pattern
+   over 50 bytes. The depth is computed with SQLite's own rule (a leaf is 1, any
+   other node 1 + its tallest child, `a OR b OR c` parsed left-deep), except for
+   the `in` terms, whose heights were measured: a `json_each` term is 5, one level
+   more than the rule gives, and a bound-list term is 4. The value edge is one
+   byte early for a plain string, because a `json_each` list of exactly
+   2 200 000 bytes already fails. A LIKE pattern over 50 bytes is refused even
+   where SQLite would never evaluate it.
+
+   What this refuses that ran before: an `or` of 100 or more comparisons (depth,
+   or the parameter count past 100), and an `or` of 97 to 99 one-value `in` terms
+   (each guarded `in` term is two levels deeper than the old `col IN (?)`; 96 still
+   runs). Everything else it refuses used to throw from SQLite.
 
 **Not changed, recorded here.** The comparators (`eq`, `gt`, …) still bind one
-value with SQLite's affinity conversion, so `eq(text_col, 1)` still matches
-"1.0". Other divergences that apply to both SQL forms and to `eq` alike: a column
-declared `COLLATE NOCASE` compares case-insensitively; a lone surrogate is
-stored as U+FFFD, which the evaluator does not equate with the surrogate; an
-integer beyond 2^53 hydrates rounded. On the delta path, a BLOB never matches
-bytes, because the server hydrates it as `ArrayBuffer`.
+value with SQLite's affinity conversion, so `eq(text_col, 1)` still matches "1.0",
+and `in` and `eq` now disagree on mixed kinds. Other divergences that apply to
+`in` and `eq` alike: a column declared `COLLATE NOCASE` compares
+case-insensitively; a lone surrogate is stored as U+FFFD, which the evaluator does
+not equate with the surrogate; an integer beyond 2^53 hydrates rounded (and a
+bound string such as `"9007199254740993"` stores that exact integer in an INTEGER
+column). On the delta path, a BLOB never matches bytes. On 0.8.6 only, the
+evaluator turns a `Uint8Array` into the string `__u8__1,2,…`, which would equal a
+text row holding exactly that string; dropping the bytes misses that row.
 
 **Evidence.** `tests/in-list-parity.test.ts` pins SQL and evaluator agreement for
-every admitted kind against columns of each affinity, with and without `not`,
-at 99, 100, 101 and 3 000 values, inside larger predicates, and through the DO's
-snapshot and delta paths. It also pins the refusals. It passes on @tanstack/db
-0.8.6, 0.9.2 and 1.0.0-rc.1.5. `tests/long-in-lists.test.ts` drives every path
-that runs the compiled SQL.
+every kind of list value against columns of each affinity, with and without
+`not`, at 99, 100, 101 and 3 000 values, inside larger predicates, and through the
+DO's snapshot and delta paths, and that every mix of kinds keeps the pk index. It
+passes on @tanstack/db 0.8.6 and 1.0.0-rc.1.5. `tests/sqlite-limits.test.ts`
+compiles queries on both sides of each limit, across shapes, and requires the
+compiler to accept a query exactly when SQLite runs it.
+`tests/long-in-lists.test.ts` drives every path that runs the compiled SQL.

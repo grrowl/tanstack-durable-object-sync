@@ -23,11 +23,25 @@ export class UnsupportedPredicateError extends Error {
 }
 
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/
-/** Bound parameters SQLite in a Durable Object accepts per statement: workerd's
- *  `SqliteDatabase::setupSecurity` sets SQLITE_LIMIT_VARIABLE_NUMBER to 100, and
- *  Cloudflare's Durable Objects limits page lists "Maximum bound parameters per
- *  query: 100". Pinned in workerd by tests/long-in-lists.test.ts. */
+// SQLite limits in a Durable Object, set by workerd's `SqliteDatabase::setupSecurity`
+// (Cloudflare's Durable Objects limits page lists the same). A query over one is
+// refused when it is compiled, so none of them throws from SQLite (ADR-0013
+// amendment 2026-11-17). Each edge is pinned in workerd by tests/sqlite-limits.test.ts.
+/** SQLITE_LIMIT_VARIABLE_NUMBER: bound parameters per statement. */
 const MAX_BOUND_PARAMS = 100
+/** SQLITE_LIMIT_EXPR_DEPTH: height of an expression tree. */
+const MAX_EXPR_HEIGHT = 100
+/** SQLITE_LIMIT_SQL_LENGTH: bytes in one statement. */
+const MAX_SQL_BYTES = 100_000
+/** SQLITE_LIMIT_LENGTH: a bound string must be shorter than this many bytes.
+ *  workerd's main branch sets 8 MiB + 34; the workerd this package is tested on
+ *  rejects a plain string over 2 200 000 bytes and a `json_each` list of exactly
+ *  2 200 000. The smaller holds on both. */
+const MAX_VALUE_BYTES = 2_200_000
+/** SQLITE_LIMIT_LIKE_PATTERN_LENGTH: bytes in a LIKE pattern. SQLite only
+ *  throws when the LIKE is evaluated on a row, so this is refused up front. */
+const MAX_LIKE_PATTERN_BYTES = 50
+const utf8Bytes = (s: string): number => new TextEncoder().encode(s).length
 const COMPARATORS: Record<string, string> = {
   eq: "=",
   gt: ">",
@@ -64,55 +78,73 @@ function literal(node: unknown, params: Array<unknown>): string {
   return "?"
 }
 
+/** Compiled SQL for one expression, with its height in SQLite's expression tree
+ *  (SQLite's `exprSetHeight`: a leaf is 1, any other node 1 + its tallest child;
+ *  `a OR b OR c` is parsed left-deep, so each further operand adds one). The
+ *  heights of the `in` terms are measured, not derived: a `json_each` term
+ *  counts one more than this rule gives. tests/sqlite-limits.test.ts holds the
+ *  model to SQLite's verdict across shapes. */
+interface Compiled {
+  sql: string
+  height: number
+}
+
 /** `col IN list` without one bound parameter per value: Durable Object SQLite
  *  allows 100 per statement, and @tanstack/db's join loader sends one `in` over
  *  every join key (ADR-0013 amendment 2026-11-17). Strings and safe integers
- *  travel as one JSON array each, read with `json_each` (exact for both, and
- *  the pk index is still used); other numbers bind one each, because JSON text
- *  does not carry every double exactly.
+ *  travel as one JSON array each, read with `json_each` (exact for both); other
+ *  numbers bind one each, because JSON text does not carry every double exactly.
+ *  One OR term per kind keeps the pk index (SQLite's MULTI-INDEX OR).
  *
  *  @tanstack/db's `in` compares by kind (a string never equals a number) where
  *  SQLite converts by column affinity (`1` would match the text "1.0" in a TEXT
  *  column, "5" the integer 5 in an INTEGER one), so each kind matches only
  *  stored values of that kind. Allowing `typeof … 'null'` keeps a NULL column
- *  NULL (unknown), as the evaluator does, so `not` leaves it out too. null,
- *  undefined and NaN never match in the evaluator and are dropped; other kinds
- *  (boolean, bigint, Date, bytes, objects) have no agreeing SQL form. */
-function compileIn(col: string, list: Array<unknown>, params: Array<unknown>): string {
+ *  NULL (unknown), as the evaluator does, so `not` leaves it out too.
+ *
+ *  The evaluator compares a Date by its time value (`normalizeValue`, 0.8.6 to
+ *  1.0), so a Date travels as that number. A value that can equal nothing a
+ *  stored row holds is dropped: null and undefined never match, SQLite stores
+ *  NaN (and so an invalid Date) as NULL, a row holds no boolean, bigint, object
+ *  or array, and its BLOBs hydrate as ArrayBuffer, which the evaluator never
+ *  equates with a Uint8Array. */
+function compileIn(col: string, list: Array<unknown>, params: Array<unknown>): Compiled {
   const texts: Array<string> = []
   const ints: Array<number> = []
   const others: Array<number> = []
-  for (const v of list) {
-    if (v === null || v === undefined || Number.isNaN(v)) continue
+  for (const item of list) {
+    const v = item instanceof Date ? item.getTime() : item
     if (typeof v === "string") texts.push(v)
     else if (Number.isSafeInteger(v)) ints.push(v as number)
-    else if (typeof v === "number") others.push(v)
-    else {
-      const kind = typeof v === "object" ? Object.prototype.toString.call(v).slice(8, -1) : typeof v
-      throw new UnsupportedPredicateError(`'in' list values must be strings or numbers, got ${kind}`)
-    }
+    else if (typeof v === "number" && !Number.isNaN(v)) others.push(v)
   }
-  const terms: Array<string> = []
+  const textGuard = `typeof(${col}) IN ('text', 'null')`
+  const numberGuard = `typeof(${col}) IN ('integer', 'real', 'null')`
+  // Heights measured in workerd: a `json_each` term is 5, a bound-list term 4.
+  const terms: Array<Compiled> = []
   if (texts.length > 0) {
     params.push(JSON.stringify(texts))
-    terms.push(`(${col} IN (SELECT value FROM json_each(?)) AND typeof(${col}) IN ('text', 'null'))`)
+    terms.push({ sql: `(${col} IN (SELECT value FROM json_each(?)) AND ${textGuard})`, height: 5 })
   }
-  const numeric: Array<string> = []
   if (ints.length > 0) {
     params.push(JSON.stringify(ints))
-    numeric.push(`${col} IN (SELECT value FROM json_each(?))`)
+    terms.push({ sql: `(${col} IN (SELECT value FROM json_each(?)) AND ${numberGuard})`, height: 5 })
   }
   if (others.length > 0) {
     params.push(...others)
-    numeric.push(`${col} IN (${others.map(() => "?").join(", ")})`)
+    terms.push({ sql: `(${col} IN (${others.map(() => "?").join(", ")}) AND ${numberGuard})`, height: 4 })
   }
-  if (numeric.length > 0) terms.push(`((${numeric.join(" OR ")}) AND typeof(${col}) IN ('integer', 'real', 'null'))`)
   // Nothing can match: false, or NULL for a NULL column (as above).
-  if (terms.length === 0) return `CASE WHEN ${col} IS NULL THEN NULL ELSE 0 END`
-  return terms.length === 1 ? terms[0]! : `(${terms.join(" OR ")})`
+  if (terms.length === 0) return { sql: `CASE WHEN ${col} IS NULL THEN NULL ELSE 0 END`, height: 3 }
+  return terms.length === 1 ? terms[0]! : { sql: `(${terms.map((t) => t.sql).join(" OR ")})`, height: orHeight(terms) }
 }
 
-function compileExpr(node: unknown, params: Array<unknown>): string {
+/** Height of `a OR b OR c` (or AND): left-deep, so each further operand adds one. */
+function orHeight(parts: Array<Compiled>): number {
+  return parts.reduce((h, p, i) => (i === 0 ? p.height : 1 + Math.max(h, p.height)), 0)
+}
+
+function compileExpr(node: unknown, params: Array<unknown>): Compiled {
   if (!isNode(node) || node.type !== "func") {
     throw new UnsupportedPredicateError(
       `expected a boolean function expression${isNode(node) ? `, got '${node.type}'` : ""}`,
@@ -132,16 +164,21 @@ function compileExpr(node: unknown, params: Array<unknown>): string {
       if (!isNode(lit) || lit.type !== "val" || typeof lit.value !== "string") {
         throw new UnsupportedPredicateError("'like' pattern must be a string literal")
       }
+      if (utf8Bytes(lit.value) > MAX_LIKE_PATTERN_BYTES) {
+        throw new UnsupportedPredicateError(`'like' pattern is over ${MAX_LIKE_PATTERN_BYTES} bytes`)
+      }
     }
-    return `${column(args[0])} ${COMPARATORS[name]} ${literal(args[1], params)}`
+    return { sql: `${column(args[0])} ${COMPARATORS[name]} ${literal(args[1], params)}`, height: 2 }
   }
   if (name === "and" || name === "or") {
     if (args.length === 0) throw new UnsupportedPredicateError(`'${name}' expects at least one argument`)
-    return `(${args.map((a) => compileExpr(a, params)).join(` ${name.toUpperCase()} `)})`
+    const parts = args.map((a) => compileExpr(a, params))
+    return { sql: `(${parts.map((p) => p.sql).join(` ${name.toUpperCase()} `)})`, height: orHeight(parts) }
   }
   if (name === "not") {
     if (args.length !== 1) throw new UnsupportedPredicateError("'not' expects 1 argument")
-    return `(NOT ${compileExpr(args[0], params)})`
+    const inner = compileExpr(args[0], params)
+    return { sql: `(NOT ${inner.sql})`, height: 1 + inner.height }
   }
   if (name === "isNull" || name === "isUndefined") {
     if (args.length !== 1) throw new UnsupportedPredicateError(`'${name}' expects 1 argument`)
@@ -152,7 +189,7 @@ function compileExpr(node: unknown, params: Array<unknown>): string {
     // (`gt OR isNull OR isUndefined`). ADR-0013 amendment 2026-09-29.
     // Only a column the table lacks is undefined in JS (true there, false here); the
     // schema is author-owned and shared with the client, so that is out of contract.
-    return name === "isNull" ? `${col} IS NULL` : "0"
+    return name === "isNull" ? { sql: `${col} IS NULL`, height: 2 } : { sql: "0", height: 1 }
   }
   if (name === "in") {
     const arr = isNode(args[1]) && args[1].type === "val" ? (args[1] as { value: unknown }).value : undefined
@@ -181,7 +218,7 @@ export function andPredicates(a: unknown, b: unknown): unknown {
 /** Compile a `where` IR to a SQL boolean expression + bound params. */
 export function compileWhere(where: unknown): { sql: string; params: Array<unknown> } {
   const params: Array<unknown> = []
-  return { sql: compileExpr(where, params), params }
+  return { sql: compileExpr(where, params).sql, params }
 }
 
 /** Extract (column, descending, nulls last) from an orderBy clause. Accepts @tanstack/db's
@@ -244,9 +281,13 @@ export function compileSubsetQuery(tbl: string, opts: SubsetQuery): { sql: strin
   const params: Array<unknown> = []
 
   if (opts.where != null) {
-    const w = compileWhere(opts.where)
+    const w = compileExpr(opts.where, params)
+    if (w.height > MAX_EXPR_HEIGHT) {
+      throw new UnsupportedPredicateError(
+        `predicate is ${w.height} levels deep; Durable Object SQLite allows ${MAX_EXPR_HEIGHT}`,
+      )
+    }
     sql += ` WHERE ${w.sql}`
-    params.push(...w.params)
   }
 
   const orderBy = compileOrderBy(opts.orderBy, opts.pk)
@@ -278,11 +319,20 @@ export function compileSubsetQuery(tbl: string, opts: SubsetQuery): { sql: strin
     params.push(nonNegInt(opts.offset, "offset"))
   }
 
-  // Over the limit, SQLite would throw at run time; refuse it here instead.
+  // Over a limit SQLite would throw at run time; refuse here instead. The SQL is
+  // ASCII (identifiers are validated, values are bound), so length is bytes.
   if (params.length > MAX_BOUND_PARAMS) {
     throw new UnsupportedPredicateError(
       `query binds ${params.length} values; Durable Object SQLite allows ${MAX_BOUND_PARAMS} per statement`,
     )
+  }
+  if (sql.length > MAX_SQL_BYTES) {
+    throw new UnsupportedPredicateError(`query is ${sql.length} bytes; Durable Object SQLite allows ${MAX_SQL_BYTES}`)
+  }
+  for (const p of params) {
+    if (typeof p === "string" && p.length >= MAX_VALUE_BYTES / 3 && utf8Bytes(p) >= MAX_VALUE_BYTES) {
+      throw new UnsupportedPredicateError(`a bound value is ${MAX_VALUE_BYTES} bytes or more`)
+    }
   }
   return { sql, params }
 }
