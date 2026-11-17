@@ -196,7 +196,11 @@ export class SessionDO extends SyncDurableObject<Env, Claims> {
 > `CREATE TABLE`, Drizzle, a versioned migrator), then call `registerSync` to
 > wire CDC. The pk must have **TEXT affinity** (`TEXT`, `VARCHAR`, `CHAR`, …) so
 > it stores the client-supplied id verbatim; an `INTEGER` key is rejected — it
-> aliases rowid (server-assigned) and breaks optimistic id parity. Evolve
+> aliases rowid (server-assigned) and breaks optimistic id parity. `registerSync`
+> also rejects a `WITHOUT ROWID` table, a column named `rowid` (generated or
+> not), and a column named `__proto__`. It throws, and the whole object fails on
+> every wake, so rename such a column in a migration that runs before
+> `registerSync` (ADR-0007). Evolve
 > freely: the CDC triggers capture only the row key, so `ALTER TABLE ADD COLUMN`
 > flows to clients with no re-wiring, and re-running `registerSync` on the next
 > deploy is idempotent (ADR-0007). A table or command name over 128 bytes fails
@@ -434,6 +438,20 @@ browser-verified.
 > One rare difference remains, for characters outside the Basic Multilingual
 > Plane. See ADR-0023.
 
+> [!NOTE]
+> The server can only sort by, and filter on, a column of the table. When an
+> on-demand query orders by or filters on something else, the client asks for
+> **every row the rest of its `where` matches** and filters, sorts and cuts them
+> itself. The query is right, on the socket and in a server render, but its
+> `limit` saves nothing, and a `where` with nothing else in it loads the whole
+> collection. This happens for a nested field such as `m.title.length`, in an
+> `orderBy` or a `where`, on every `@tanstack/db` version, and on 0.8.x for an
+> `orderBy` on a subquery's field, or one with clauses on two collections of a
+> join. Two costs follow. A server render ships every one of those rows in the
+> page. And when the whole collection was loaded this way, it stays loaded and
+> live for as long as any other query on that collection is mounted, because
+> that one subscription now covers them all. See ADR-0023.
+
 ---
 
 ## Common patterns and recipes
@@ -532,6 +550,19 @@ show. The conventions, what's verified and how, and the full
   refusals fail loud, the query reads as no results. Two names that used to
   return rows are refused too: a name in another letter case than the declared
   one (`BODY` for `body`), and `rowid`.
+- **A nested field in a query** (`eq(m.title.length, 3)`, or an `orderBy` on one)
+  loads every row the rest of the `where` matches, and the whole collection when
+  nothing else is left (see the note on ordering above). This is for on-demand
+  queries. An eager collection's own `where` on a nested field is still refused
+  and the collection stays empty. A frame built by hand that sends one to the
+  server is refused.
+- **One 0.8.x subquery orders by the wrong column.** On `@tanstack/db` 0.8.x, a
+  limited query over a subquery whose alias equals the inner alias, ordered by a
+  field the inner `select` renamed to the name of another column
+  (`select(({ f }) => ({ id: f.id, name: f.id }))`, then `orderBy(f.name)`), is
+  sent ordered by the table's own `name` column. The first window can be wrong,
+  with no error. Use another alias for the outer query. 0.9 and later are not
+  affected.
 
 ---
 

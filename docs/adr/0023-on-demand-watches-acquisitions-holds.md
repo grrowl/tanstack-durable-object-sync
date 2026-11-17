@@ -355,3 +355,115 @@ the server ever matches the client. The README tells readers to set
 version shows a wrong final window and only the cost remains), or if upstream
 starts sending a bounded request for a locale order (then nothing corrects the
 first window and we would need a fix).
+
+## Amendment 2026-11-17: the adapter sends a request the server can read
+
+**Context.** The server now reads a column ref only in the one shape
+`{ type: "ref", path: [name] }` and refuses any other (ADR-0013 amendment
+2026-11-17, column references). The library's client sends other shapes:
+
+- every version sends a nested field as a longer path (`orderBy(m.meta.x)` sends
+  `["meta", "x"]`), in an `orderBy`, a cursor, and a `where`;
+- on 0.9 and later a limited query ordered by a nested field also asks, on its
+  first load and again when its window grows, for the rows that tie with the
+  boundary, as `and(where, eq(order expression, v))`: a `where` that holds the
+  longer path;
+- 0.8.6 pushes an `orderBy` and its `limit` through a subquery or a join with the
+  outer alias kept (`["sub", "body"]`, `["sub", "title"]`, and `["f", "name"]`
+  for a join ordered by clauses on two of its collections).
+
+The server refuses all of them. On the socket a refusal reads as no rows and logs
+an error line; in a server render a refused read throws, so `preload()` rejects
+and the query ends in `error`. On 0.8.6 a query ordered by `sub.body` with a limit
+worked on main and showed nothing after the server change. The server cannot
+read these refs correctly in general, so it must keep refusing them.
+
+**Decision.** The adapter sends a request the server can read that contains the
+one core asked for. The client filters, sorts and cuts the rows it holds, so a
+request that returns more rows gives the same query. The rule below drops whole
+top-level conjuncts. It does not look for the tightest such request: for
+`or(and(a, x), and(a, y))` with `x` and `y` unreadable it sends no `where`,
+though `a` is implied by both branches.
+
+- **`where`.** `readableWhere` drops each top-level conjunct (flattened through
+  nested `and`s) that holds a ref the server cannot read, and sends the rest. Any
+  other node that holds one (an `or`, a `not`, a comparison that is the whole
+  `where`) is dropped whole, as the conjunct it is part of; when it is the root,
+  the request has no `where`. Nothing is widened inside an `or` or a `not`: a
+  `not` over a wider predicate would be narrower. When nothing is dropped the
+  `where` is core's own object. A rebuilt `and` keeps the original node's keys
+  in order, so its request key equals core's for the same conjuncts.
+- **`orderBy`.** When any term is not a column ref the server reads, the order is
+  dropped.
+- **Both together.** When either is rewritten, the request is for the whole
+  readable `where` subset: no `orderBy`, `limit` or `offset`. A limit is never
+  kept over a wider `where`, because the top rows of the wider set can miss rows
+  of the narrower one.
+- **"Cannot read"** is `columnRefProblem` in `src/wire/column-ref.ts` and nothing
+  else, the same function the compiler refuses with. An operator off the floor
+  (ADR-0013 D2) is not touched: the server still refuses it, and it still reads
+  as no rows.
+
+1. **Where it is decided.** Once, at the top of `loadSubset`, by `sendable`. The
+   request key (D1), the cover check and the watch it may open (D2), the covered
+   fetch, and the resubscribe after a reconnect all use the sent request. The
+   SSR transport serves the same `subscribe` and `fetch` calls, so a server
+   render reads the same request. The bookkeeping that core releases by
+   (`outstanding`, `acquisitionOf`, D8) stays keyed by the object core passed.
+2. **The watch.** A rewritten request that no watch covers opens a watch on the
+   sent `where`, with no `orderBy` or `limit`. Its snapshot is the whole readable
+   subset, and its deltas cover that superset, so a row that enters or leaves
+   the narrower `where` arrives on it; the client's own filter decides. Such a
+   watch covers every later request whose conjuncts include its own (D2),
+   bounded or not.
+3. **Key and cover.** The rewritten request's key is that of the sent request,
+   so it shares an acquisition with any request that is sent the same: a 0.9
+   full-source load on the same `where`, a second query ordered differently by a
+   nested field, and the tie request, which widens to the base `where`. On the
+   first load of a nested-field query that shares the acquisition already held
+   and sends no frame. A rewritten request that a watch already covers is a
+   covered fetch of the whole readable subset and pins that watch.
+4. **A cursor request** (load more) is decided in `loadMore` by the same rules.
+   Its cursor is built from the same order, so when the request is rewritten the
+   fetch is for the readable `where` alone, with no cursor, order or limit,
+   written insert-if-absent (ADR-0003) and held by the covering watch. When the
+   covering watch was opened with no limit and has its snapshot, it already
+   holds every row of its `where`, and so every row the cursor asks for: nothing
+   is fetched. This applies to any cursor request under such a watch, rewritten
+   or not.
+5. **Cost.** A rewritten query loads every row its readable `where` matches, and
+   its watch keeps all of them live, however small its `limit`. A `where` on a
+   nested field alone loads the whole collection. This is the only way such a
+   query can be answered correctly, but it is not visible in the query; the
+   README says it next to the other ordering notes and in the limits.
+
+**What the rule cannot see.** On 0.8.6, a subquery whose alias equals the inner
+alias and whose `select` renames a field (`q.from({ f: q.from({ f: files })
+.select(({ f }) => ({ id: f.id, name: f.id })) }).orderBy(({ f }) => f.name)
+.limit(2)`) has its alias stripped and sends `orderBy ["name"]` with the limit.
+The path is one element and names a real column, so it is sent, and the server
+sorts by the table's `name` while the query orders by the selected `name`. The
+first window can then be wrong, with no refusal and no log line. It is the same
+on main. 0.9 and later load the whole source for it. Measured by the review on
+0.8.6.
+
+**Evidence.** `tests/client-ref-shapes.test.ts` runs a fixed list of live
+queries through the real adapter and Durable Object: the three 0.8.6 `orderBy`
+shapes, a nested-field order with and without an index, a nested-field `where`
+alone and inside an `and`, an `or` and a `not` (with and without an order), and
+ordinary queries. Each must end `ready` with the rows and order @tanstack/db
+gives over the same data, before and after its window grows, and no ref the
+server refuses may reach the wire. Each is also rendered through
+`SsrSnapshotTransport` reading `readSyncSnapshot`, and must end `ready` with the
+same rows. The refs core asks for are written down per version line, so a later
+@tanstack/db that sends another shape fails there first. Further tests pin that
+a rewritten request is released by core's object (the collection empties and the
+server holds no sub) and shared when it is sent the same (one `sub`, no
+`fetch`), and that a cursor request under a whole-subset watch sends nothing; each
+was checked by breaking the code it pins. CI runs the locked version and the
+floor; 0.9.2 was run by hand. Before this change, on 0.8.6 the three 0.8.6
+shapes and the nested-field order ended `ready` with no rows, on 0.9.2 and
+1.0.0-rc.1.5 the nested-field order did, and on 1.0.0-rc.1.5 the nested-field
+`where` shapes did (the run before this change was made on that version only;
+the server refuses such a `where` on every version). On 0.9.2 and 1.0.0-rc.1.5
+a server render of a nested-field order ended in `error`.
