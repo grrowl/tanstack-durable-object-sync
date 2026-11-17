@@ -137,21 +137,33 @@ cannot be synced correctly. Both were measured in workerd 1.20260721.1.
   letter case, now sees a generated one, virtual or stored.
 - It refuses a column named exactly `__proto__`, plain or generated, with a
   message that names the column. The rule is "a name a row object cannot carry".
-  `__proto__` is the only accessor that `Object.prototype` defines, so it is the
-  only such name: setting `constructor`, `toString` or `hasOwnProperty` makes an
-  own key, and the test pins that. The name is compared exactly, as row keys are,
-  so `__PROTO__` is an ordinary column.
+  In an unmodified realm `__proto__` is the only accessor that `Object.prototype`
+  defines, so it is the only such name. The review checked in workerd that a row
+  of `SELECT *` carries columns named `constructor`, `toString`,
+  `hasOwnProperty`, `__defineGetter__`, `valueOf`, `length`, `then`, `0`, the
+  empty string and `a b` as own keys; the test pins the first three. The name is
+  compared exactly, as row keys are, so `__PROTO__` is an ordinary column, and a
+  test pins that too.
 
 Both are refused at registration and not per query, because the fault is in the
-table: no query on it can be answered correctly (the default order) or no row
-of it can be carried (the `__proto__` column). That is the kind of fault the
-other `assertSyncCompatible` checks refuse.
+table. With a generated `rowid`, every read with no `orderBy` (an eager
+collection's snapshot, and any on-demand request without one) is sorted by the
+generated value instead of by insertion order; a read with an `orderBy` is not
+affected. With a `__proto__` column, no row of the table can be carried whole.
+That is the kind of fault the other `assertSyncCompatible` checks refuse.
 
 **Consequences.**
 
 - **Breaking.** `registerSync` now throws for a table with a generated column
-  named `rowid` or a column named `__proto__`, where it used to succeed. An app
-  with such a table must rename the column before it upgrades.
+  named `rowid` or a column named `__proto__`, where it used to succeed.
+  `registerSync` runs in the constructor, inside `blockConcurrencyWhile`, on
+  every wake, and it stores the registry only after every collection passes
+  (`#registerSync` in `mixin.ts`). So the throw fails the whole object, not only
+  that collection: every sync frame, mutation and `readSyncSnapshot` on it fails,
+  on every wake. An app with such a table must rename the column in a migration
+  that runs before `registerSync` in the constructor (`ALTER TABLE … RENAME
+  COLUMN` for a plain column; a generated column is dropped and added again
+  under another name), and deploy that migration with the upgrade.
 - Like every check in `assertSyncCompatible`, these run in `registerSync`. A
   migration that adds such a column while the object is alive, with no
   `registerSync` after it, is caught only at the next `registerSync`, at the latest

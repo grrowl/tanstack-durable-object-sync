@@ -196,7 +196,11 @@ export class SessionDO extends SyncDurableObject<Env, Claims> {
 > `CREATE TABLE`, Drizzle, a versioned migrator), then call `registerSync` to
 > wire CDC. The pk must have **TEXT affinity** (`TEXT`, `VARCHAR`, `CHAR`, …) so
 > it stores the client-supplied id verbatim; an `INTEGER` key is rejected — it
-> aliases rowid (server-assigned) and breaks optimistic id parity. Evolve
+> aliases rowid (server-assigned) and breaks optimistic id parity. `registerSync`
+> also rejects a `WITHOUT ROWID` table, a column named `rowid` (generated or
+> not), and a column named `__proto__`. It throws, and the whole object fails on
+> every wake, so rename such a column in a migration that runs before
+> `registerSync` (ADR-0007). Evolve
 > freely: the CDC triggers capture only the row key, so `ALTER TABLE ADD COLUMN`
 > flows to clients with no re-wiring, and re-running `registerSync` on the next
 > deploy is idempotent (ADR-0007).
@@ -433,6 +437,15 @@ browser-verified.
 > One rare difference remains, for characters outside the Basic Multilingual
 > Plane. See ADR-0023.
 
+> [!NOTE]
+> The server can only sort by a column of the table. When a limited on-demand
+> query orders by something else, the client loads **every row its `where`
+> matches** and sorts and cuts them itself, so the query is right but its
+> `limit` saves nothing. This happens for a nested field such as
+> `orderBy(({ m }) => m.title.length)` on every `@tanstack/db` version, and on
+> 0.8.x for an `orderBy` on a subquery's field or on a joined collection's
+> field. See ADR-0023.
+
 ---
 
 ## Common patterns and recipes
@@ -529,6 +542,10 @@ show. The conventions, what's verified and how, and the full
   refusals fail loud, the query reads as no results. Two names that used to
   return rows are refused too: a name in another letter case than the declared
   one (`BODY` for `body`), and `rowid`.
+- **A `where` on a nested field** (`eq(m.title.length, 3)`) is refused and reads
+  as no results: SQLite has no nested value to compare. An `orderBy` on one is not
+  refused, but it loads the whole `where` subset (see the note on ordering
+  above).
 
 ---
 

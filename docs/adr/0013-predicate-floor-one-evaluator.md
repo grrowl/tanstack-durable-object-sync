@@ -410,7 +410,7 @@ refused sub is registered or persisted, that the log line names the column and
 is clipped, that the pk and a column added after the first query (plain or
 generated) are accepted, and the restore after a column is dropped.
 
-## Amendment 2026-11-17: a column reference must have the one shape the client sends
+## Amendment 2026-11-17: a column reference must have the one shape the server reads
 
 **Context.** The rule behind the previous amendment is that the SQL that builds
 a snapshot and the evaluator that decides the deltas must read the same column.
@@ -432,37 +432,55 @@ built frames.
    orders by key. The last element rule came in with commit b7f4e2b, which gives
    no reason for it.
 
-**What the client sends.** Measured on 0.8.6, 0.9.2 and 1.0.0-rc.1.5 by
-recording every frame a real `WebSocketTransport` sent, through
-`doCollectionOptions` in on-demand mode, for these live queries: an `orderBy`
-with a limit, with and without a `where` and with and without a `BTreeIndex`,
-then a window grown with `setWindow` over seeded rows (on 0.8.6 this sends cursor
-fetches); an `orderBy` on either side of a join; a subquery in `from`; a `select`
-before an `orderBy`; `inArray`; `findOne`; an `orderBy` on `upper(...)`; and a
-`where` and an `orderBy` on a nested field. After the frame codec, every ref in
-`where`, `orderBy` and `cursor` had exactly the own keys `type` and `path`, and
-every path had one element, except for the nested field, which sent
-`["meta", "x"]` in both `where` and `orderBy`. No version sent `sourceAlias`, and
-no path started with the query's alias.
+**What the client sends.** Measured on 0.8.6, 0.9.2 and 1.0.0-rc.1.5 through the
+real adapter (`tests/client-ref-shapes.test.ts` keeps the list and what each
+version sends). After the frame codec no version sent `sourceAlias` or any field
+on a ref other than `type` and `path`. Most paths have one element. These do not:
+
+- every version sends a nested field as a longer path (`orderBy(m.meta.x)` sends
+  `["meta", "x"]`), in `orderBy`, in a cursor, and in the `where` of a tie
+  request;
+- 0.8.6 pushes an `orderBy` and its `limit` through a subquery or a join to the
+  source collection, keeping the outer alias: a subquery `sub` with
+  `select({ body: m.body })` ordered by `sub.body` sends `["sub", "body"]`; with
+  `select({ title: m.body })` it sends `["sub", "title"]`; a join ordered by
+  `m.body` then `f.name` sends `["body"]` and `["f", "name"]` to `messages`
+  (0.8.6 `normalizeExpressionPaths` strips only the subscriber's own alias, and
+  `processOrderBy` pushes the order to the source). 0.9.2 and 1.0.0-rc.1.5 load
+  the whole source with no `orderBy` for these three.
+
+For `["sub", "body"]` sorting by the last element is right, and on main that
+query worked. For `["sub", "title"]`, `["f", "name"]` and `["meta", "x"]` it is
+wrong. The server cannot tell them apart.
 
 **Decision.** A ref is read only when it is exactly `{ type: "ref", path: [name] }`:
 no field other than `type` and `path`, a `path` that is an array of one element,
-and that element a string that passes the identifier check. `column()` in
-`sql-compiler.ts` checks this, and the expression of an `orderBy` term now goes
+and that element a string that passes the identifier check. The rule is
+`columnRefProblem` in `src/wire/column-ref.ts`. `column()` in `sql-compiler.ts`
+refuses what it rejects, and the expression of an `orderBy` term now goes
 through `column()` too, so `where`, `orderBy` and both halves of a cursor follow
 one rule. Anything else is an `UnsupportedPredicateError`, so a `sub` gets
 `reset`, a `fetch` gets the empty page, and `readSyncSnapshot` throws. The message
 and the log line name the cause, for example
 `a column reference carries only 'type' and 'path'; got 'sourceAlias'`.
 
+The on-demand adapter uses the same function: it does not send an `orderBy` the
+server would refuse, and loads the request's whole `where` subset instead
+(ADR-0023 amendment 2026-11-17). So the client queries above, which the server
+refuses, work on every version, at the cost of loading every row the `where`
+matches. A `where` on a nested field is still refused and still reads as no
+rows.
+
 The shape is strict, not only "no `sourceAlias`", because a field the compiler
 does not read is a field the evaluator may read, in this release of
 @tanstack/db or a later one, and the server cannot tell which. A path that is not
 an array shows the same thing: the compiler read `path.length` and `path[0]`,
 while the evaluator iterates `path`, which throws for a plain object on 0.8.6
-and 0.9.2. A `val` node and a `func` node are not made strict: the evaluator
-reads only `value`, and `name` and `args`, on all three versions, as the compiler
-does.
+and 0.9.2. A `val` node and a `func` node are not made strict about extra
+fields: the evaluator reads only `value`, and `name` and `args`, on all three
+versions. But a `func` must now have a string `name` and an array `args` (the
+evaluator calls `args.map`, so a map with `length` compiled here and threw
+there), and its name is looked up in the operator table by own key only.
 
 **What the rule refuses beyond the two examples.**
 
@@ -471,28 +489,35 @@ does.
 - A path that is not an array, or whose one element is not a string. Before, an
   element such as `["body"]` passed the identifier check by string conversion and
   was refused only by the column check, with a misleading message.
-- An `orderBy` on a path of more than one element, including the nested field the
-  client does send (`orderBy(({ m }) => m.meta.x)`). A `where` on a nested field
-  was already refused. An `orderBy` on one was refused since the previous
-  amendment, unless the table had a column named like the last element of the
-  path, in which case it sorted by that column. The evaluator reads
-  `row.meta.x`, which SQL cannot sort by, so that order was never correct.
+- An `orderBy` on a path of more than one element: the nested field and the
+  0.8.6 paths above, when a frame carries them. The adapter no longer sends
+  them.
 - An `orderBy` expression that is not a ref (a function) is still refused, now
   with `expected a column reference` instead of `unsupported orderBy clause`.
 
-Nothing else the client sends on 0.8.6, 0.9.2 or 1.0.0-rc.1.5 is refused: the
-whole suite passes on each. The simple `{ col, dir }` orderBy shape is unchanged;
-the client never sends it, and tests use it.
+The simple `{ col, dir }` orderBy shape is unchanged; the client never sends it,
+and tests use it.
+
+**Frames that threw.** Four frames threw from the compiler instead of being
+refused, so a `sub` or a `fetch` got no reply and stayed loading: an `orderBy`
+term of `null`, a `func` with no `args`, a `func` named after an
+`Object.prototype` member (`name in` the operator table followed the prototype
+chain and wrote broken SQL), and a `func` whose `args` is not an array. Each is
+now an `UnsupportedPredicateError`. The library's client sends none of them.
 
 **Restore (ADR-0019).** A persisted `where` holding a ref of another shape now
 fails to compile on restore, so its socket closes with 1011, as for any refusal
 of a row written by an older build. An older build could only have persisted
 such a `where` from a hand built frame.
 
-**Evidence.** `tests/column-refs.test.ts` drives each shape above through a
-`sub` (checking that nothing is persisted), a `fetch` and `readSyncSnapshot` on a
-real Durable Object, checks that a cursor whose `whereCurrent` alone carries an
-aliased ref is refused, and checks that the client's shape still works in a
-`where`, an `orderBy` and a cursor. The tables that cannot be synced correctly,
+**Evidence.** `tests/column-refs.test.ts` drives each shape above, and the four
+frames that threw, through a `sub` (checking that nothing is persisted), a
+`fetch` and `readSyncSnapshot` on a real Durable Object, checks that a cursor
+whose `whereCurrent` alone carries an aliased ref is refused, and checks that
+the client's shape still works in a `where`, an `orderBy` and a cursor.
+`tests/client-ref-shapes.test.ts` runs a fixed list of query shapes through the
+real adapter on each version, records the refs core asks for, checks that no
+refused ref reaches the wire, and pins that `columnRefProblem` is what the
+compiler refuses in an `orderBy`. The tables that cannot be synced correctly,
 which the same review found, are refused at registration (ADR-0007 amendment
 2026-11-17).
