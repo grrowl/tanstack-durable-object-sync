@@ -12,8 +12,8 @@ import type { ClientFrame, ServerFrame } from "../src/wire/frames.ts"
 
 const codec = createFrameCodec()
 const CAP = 2000 // far above a clipped line, far below an unclipped one
-async function openWs(room: string): Promise<WebSocket> {
-  const res = await SELF.fetch(`https://example.com/sync/${room}`, { headers: { Upgrade: "websocket" } })
+async function openWs(room: string, route = "sync"): Promise<WebSocket> {
+  const res = await SELF.fetch(`https://example.com/${route}/${room}`, { headers: { Upgrade: "websocket" } })
   const ws = res.webSocket
   if (!ws) throw new Error("no webSocket")
   ws.accept()
@@ -75,5 +75,53 @@ describe("log lines clip the strings a client chose", () => {
     ws.close()
     expect(lines.length).toBeGreaterThanOrEqual(2)
     expect(lines.filter((l) => l.length > CAP).map((l) => l.length)).toEqual([])
+  })
+
+  /** The one line logged for `marker`: short, and noting what was clipped. */
+  const expectClipped = (marker: string): void => {
+    const hits = lines.filter((l) => l.includes(marker))
+    expect(hits, `a line containing "${marker}"`).toHaveLength(1)
+    expect(hits[0]!.length).toBeLessThanOrEqual(CAP)
+    expect(hits[0]).toMatch(/clipped, \d+ chars/)
+  }
+  const dates = (n: number): Array<Date> => Array.from({ length: n }, (_, i) => new Date(1_700_000_000_000 + i))
+
+  // The line that stalled CI: the backstop's refusal, reached with a sub id so
+  // long that the `_sync_subs` row is over SQLite's value cap.
+  it("a sub refused by the SQLite-limit backstop", async () => {
+    const ws = await openWs(`clip-backstop-${crypto.randomUUID()}`)
+    send(ws, { t: "sub", subId: long, collection: "messages", where: fn("in", ref("id"), val(dates(40_000))) })
+    await next(ws, (f) => f.t === "reset")
+    ws.close()
+    expectClipped("refused at a SQLite limit")
+  })
+
+  it("a fetch refused for its predicate", async () => {
+    const ws = await openWs(`clip-fetch-refused-${crypto.randomUUID()}`)
+    send(ws, { t: "fetch", fetchId: long, collection: "messages", where: fn("ne", ref("body"), val("x")) })
+    await next(ws, (f) => f.t === "page")
+    ws.close()
+    expectClipped("operator 'ne' is not supported")
+  })
+
+  it("a sub whose predicate is too large to store", async () => {
+    const ws = await openWs(`clip-store-${crypto.randomUUID()}`)
+    send(ws, { t: "sub", subId: "s".repeat(1000), collection: "messages", where: fn("in", ref("id"), val(dates(60_000))) })
+    await next(ws, (f) => f.t === "reset")
+    ws.close()
+    expectClipped("predicate too large to store")
+  })
+
+  it("a sub refused at the per-socket cap", async () => {
+    // LimitsTestDO allows 2 subs per socket.
+    const ws = await openWs(`clip-cap-${crypto.randomUUID()}`, "limits")
+    for (const subId of ["a", "b"]) {
+      send(ws, { t: "sub", subId, collection: "messages" })
+      await next(ws, (f) => f.t === "snap-end")
+    }
+    send(ws, { t: "sub", subId: long, collection: "messages" })
+    await next(ws, (f) => f.t === "reset")
+    ws.close()
+    expectClipped("maxSubsPerSocket")
   })
 })
