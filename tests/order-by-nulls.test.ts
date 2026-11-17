@@ -95,6 +95,7 @@ describe(`F4 bounded snapshot vs TanStack comparator (@tanstack/db ${version})`,
   for (const indexed of [false, true]) {
     for (const c of cases) {
       // bugbash F4-locale: SQLite BINARY cannot reproduce JS localeCompare.
+      // Accepted limitation, not a fix to come (ADR-0023 amendment 2026-11-17).
       // 0.9.x masks the bad bounded SQL result by subsequently fetching the full subset.
       const locale = c.rows === caseRows && c.opts.stringSort !== "lexical"
       let bounded: Array<string | null> | undefined
@@ -135,6 +136,7 @@ describe(`F4 bounded snapshot vs TanStack comparator (@tanstack/db ${version})`,
       })
       if (locale) {
         // bugbash F4-locale: the SQL snapshot alone is wrong, even when 0.9.x later recovers.
+        // Pinned on purpose: this fails the day the server matches the client's locale order.
         it.fails(`${c.name} index=${indexed} bounded locale parity`, () => {
           expect(bounded).toEqual(expected)
         })

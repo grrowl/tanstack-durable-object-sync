@@ -109,3 +109,64 @@ a maintainer design decision.
 `authorize` errors now surface to clients like mutation `authorize` errors;
 only command `execute` errors are sanitized as `EXECUTE_FAILED`. The shared
 sanitized catch described in D3 is historical, not the current contract.
+
+## Amendment 2026-11-17: D4 is an accepted limitation, and it has two effects
+
+D4 names one effect. There are two, and we accept both for now.
+
+1. **Read.** A socket that presents another client's `txId` receives that
+   client's stored receipt, including a command's result. `#oncePerTx` finds the
+   row with `lookupTx` and `#replayReceipt` sends it (`src/server/mixin.ts`,
+   lines 876 to 879 and 912 to 925; `src/server/dedup.ts`, lines 24 to 34).
+2. **Pre-claim.** A socket that uses a `txId` first makes the owner's later write
+   with the same `txId` answer `committed` without running, and the owner's rows
+   are never written. The same lookup answers the owner with the first socket's
+   receipt. If the first attempt is still running, the owner waits on the
+   in-flight map and then gets that receipt (`mixin.ts`, lines 881 to 884). A
+   rejected attempt is recorded too (`#rejectTx`, lines 907 to 909), so the owner
+   can be answered with another socket's rejection. That last case was read from
+   the code and not run.
+
+`tests/dedup-identity-scope.test.ts` reproduces both as `it.fails`, next to a
+control that shows a reconnect of the same identity must still get its replay.
+
+**Why we accept it.** Each point below is checked in the code on this branch.
+
+- The built-in `txId`s are random. A command's `txId` is
+  `crypto.randomUUID()` (`src/client/transport.ts`, line 719). A mutation's
+  `txId` is the TanStack transaction id (`src/client/do-collection.ts`, line
+  940), which is `config.id ?? safeRandomUUID()` (`transactions.js` in 0.8.6,
+  0.9.2 and 1.0.0-rc.1.5). `safeRandomUUID` (`utils/uuid.js`) uses
+  `crypto.randomUUID` or `crypto.getRandomValues` and throws if neither exists.
+- The table is per Durable Object. `#sql` is `this.ctx.storage.sql`
+  (`mixin.ts`, lines 270 to 272), `_sync_seen_tx` is created there
+  (`src/server/changes.ts`, line 40), and the in-flight map is an instance field
+  (`mixin.ts`, line 200). An attacker must be authenticated on the same object.
+- No server frame carries a `txId` to another socket. Only `committed` and
+  `rejected` carry one (`src/wire/frames.ts`, lines 79 and 80), and every send of
+  them passes the socket that sent the frame (`mixin.ts`, lines 799, 866, 909,
+  919 and 925). Broadcasts are only `d` and `uptodate`.
+
+So an attacker needs a `txId` that the built-in clients never expose, plus a
+connection to the same Durable Object. A default that scopes dedup to the socket
+would also break the replay after a reconnect that ADR-0021 relies on, so the fix
+would be an option most apps never set, a new key on a table that already exists
+in deployed objects, and a migration.
+
+**What an app must not do.**
+
+- Supply a predictable or reused id, whether as `createTransaction({ id })` or as
+  the `txId` of a `transport.sendMut` frame. Treat a `txId` like a password for
+  the dedup window.
+- Show a `txId` to other users. Some client error messages contain it
+  (`transport.ts`, lines 612, 623 and 795), so do not forward them, or telemetry
+  that includes them, to other users.
+- Put users who do not trust each other in one Durable Object when commands
+  return secrets.
+
+**Revisit if** any feature sends a `txId` to another socket (for example a delta
+that names the transaction that caused it), or an app needs untrusted peers in
+one Durable Object. A documented pattern that asks apps to supply stable
+transaction ids, such as an offline outbox, would also raise the risk. The shape
+is still the `dedupScope(user)` hook from D4, with today's behavior as the
+default.
