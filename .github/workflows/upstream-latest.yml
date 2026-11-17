@@ -34,14 +34,20 @@ jobs:
           npm install --no-save --no-audit --no-fund "@tanstack/db@latest"
           echo "@tanstack/db $(node -p 'require("./node_modules/@tanstack/db/package.json").version')" >> "$GITHUB_STEP_SUMMARY"
 
+      # Every check runs even when an earlier one fails. One red step used to
+      # skip the rest, so a removed type hid a runtime break and an install
+      # conflict for weeks (ADR-0028).
       - name: Typecheck
         run: npm run typecheck
 
       - name: Test
+        if: ${{ !cancelled() }}
         run: npm test
 
       - name: Build
+        if: ${{ !cancelled() }}
         run: npm run build
 
       - name: Pack smoke
+        if: ${{ !cancelled() }}
         run: node scripts/pack-smoke.mjs --db latest

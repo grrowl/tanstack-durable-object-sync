@@ -139,6 +139,52 @@ describe("SSR round trip: dehydrate on the worker, hydrate + converge in the bro
     ws.close()
   })
 
+  it("eager: a first dial that fails leaves the hydrated rows usable, and no error is left once it converges", async () => {
+    // A hydrated collection is ready at once (stale-while-revalidate), so a
+    // dial that fails is not a failed load: the transport retries, and the
+    // catch-up converges the rows. Reporting it as one left the collection in
+    // error for good. The catch-up brings no snapshot to clear it before
+    // @tanstack/db 1.0, and from 1.0 `fail` ends the sync run (ADR-0028).
+    const room = `rt-offline-${crypto.randomUUID()}`
+    await sql(room, "INSERT INTO messages(id,body) VALUES('a','v1'),('b','doomed')")
+    const state = await serverRender(room)
+    await sql(room, "UPDATE messages SET body='v2' WHERE id='a'", "DELETE FROM messages WHERE id='b'")
+
+    let down = true
+    let dials = 0
+    const ws = new WebSocketTransport<Api>({
+      url: `https://example.com/sync/${room}`,
+      reconnectDelay: 5,
+      open: async () => {
+        dials++
+        if (down) throw new Error("dial failed: server unreachable")
+        const res = await SELF.fetch(`https://example.com/sync/${room}`, { headers: { Upgrade: "websocket" } })
+        const sock = res.webSocket
+        if (!sock) throw new Error("no webSocket")
+        sock.accept()
+        return sock as unknown as WebSocketLike
+      },
+    })
+    const db = new DbClient()
+    db.hydrate(state as never)
+    const col = db.collection(makeOptions(ws)) as unknown as {
+      preload: () => Promise<void>
+      get: (k: string) => Msg | undefined
+      status: string
+      health?: { hasErrors: boolean }
+    }
+    await col.preload()
+    expect(col.get("a")).toMatchObject({ body: "v1" })
+    await waitFor(() => dials > 1) // the first dial failed and the transport is retrying
+    expect(col.status).toBe("ready")
+
+    down = false
+    await waitFor(() => col.get("a")?.body === "v2" && col.get("b") === undefined)
+    expect(col.status).toBe("ready")
+    expect(col.health?.hasErrors ?? false).toBe(false) // `health` exists from 1.0
+    ws.close()
+  })
+
   it("eager with NO resume point (pruned log → cursor 0): snapshot reconcile removes the dead row", async () => {
     const room = `rt-zero-${crypto.randomUUID()}`
     await sql(room, "INSERT INTO messages(id,body) VALUES('a','hi'),('b','doomed')")

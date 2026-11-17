@@ -1,6 +1,6 @@
 {
   "name": "tanstack-durable-object-sync",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Sync a TanStack DB collection to a Cloudflare Durable Object over WebSockets — optimistic mutations, live queries, and single-ordered-stream write confirmation.",
   "type": "module",
   "license": "MIT",
@@ -58,12 +58,12 @@
     "@msgpack/msgpack": "^3.0.0"
   },
   "peerDependencies": {
-    "@tanstack/db": ">=0.8.6"
+    "@tanstack/db": ">=0.8.6 || >=1.0.0-rc.1"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.18.7",
     "@cloudflare/workers-types": "^4.20260518.1",
-    "@tanstack/db": "^0.9.2",
+    "@tanstack/db": "^1.0.0-rc.1.5",
     "typescript": "^5.7",
     "vitest": "4.1.10",
     "wrangler": "^4"

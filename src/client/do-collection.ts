@@ -68,9 +68,11 @@ interface SyncParams {
   write: (message: { type: RowOp; value?: unknown; key?: string }) => void
   commit: (signal?: AbortSignal) => CommitReceipt
   markReady: () => void
-  /** Fails the collection's readiness promises with the cause (@tanstack/db
-   *  0.8.2); recovery is a retried preload() once sync later succeeds.
-   *  Optional only for bare test harnesses — real @tanstack/db provides it. */
+  /** Fails the collection's first load with the cause, so `preload()` rejects
+   *  instead of waiting forever: `fail` from @tanstack/db 1.0, `markError`
+   *  (0.8.2) before it (ADR-0028). Both optional only for bare test harnesses —
+   *  real @tanstack/db provides exactly one. */
+  fail?: (error: unknown) => void
   markError?: (error?: unknown) => void
   truncate: () => void
 }
@@ -163,7 +165,6 @@ export function doCollectionOptions(opts: {
 }): CollectionConfig<any, string> {
   const { transport, table, getKey, where } = opts
   const syncMode = opts.syncMode ?? "eager"
-  const eagerSubId = `${table}#${++subSeq}`
   const matches = compilePredicate(where)
 
   // Set by sync(); used by mutationFn to retire no-subset-match optimistic rows.
@@ -188,8 +189,30 @@ export function doCollectionOptions(opts: {
   let pendingReceipts = 0
   let settledCursor = "0"
 
+  // Set by the first sync run: a later run replaces one. @tanstack/db 1.0's
+  // `reload()` starts such a run and keeps the rows of the run it replaces
+  // (ADR-0028). Before 1.0 a restart goes through cleanup, which drops them.
+  let hasRun = false
+
   const sync = (params: SyncParams): SyncConfigResult => {
-    const { collection, begin, write, commit, markReady, markError, truncate } = params
+    const { collection, begin, write, commit, truncate } = params
+    const restarted = hasRun
+    hasRun = true
+    // The first load fails loud: `preload()` rejects with the cause instead of
+    // waiting forever (`fail` from @tanstack/db 1.0, `markError` before it,
+    // ADR-0028). Once this run has been ready there is no load left to fail:
+    // the collection is usable and the transport retries by itself. Reporting
+    // a failure then would only strand it. From 1.0 `fail` ends the sync run,
+    // and before 1.0 `markError` waits for a snapshot that a catch-up never
+    // brings.
+    let ready = false
+    const markReady = (): void => {
+      ready = true
+      params.markReady()
+    }
+    const failLoad = (e: unknown): void => {
+      if (!ready) (params.fail ?? params.markError)?.(e)
+    }
     const consumeHydratedCursor = (): string | null => {
       const hc = hydratedCursor
       hydratedCursor = null
@@ -273,9 +296,9 @@ export function doCollectionOptions(opts: {
       opts?: { reconcileSnapshots?: boolean; onFail?: (e: unknown) => void },
     ): SubHandler => {
       // Where a rejected receipt lands: a subset load rejects ITS promise; the
-      // collection-level default fails readiness loud (a later markReady —
-      // any successful snapshot — recovers, error → ready).
-      const onFail = opts?.onFail ?? ((e: unknown): void => markError?.(e))
+      // collection-level default fails readiness loud (before @tanstack/db 1.0
+      // a later markReady — any successful snapshot — recovers, error → ready).
+      const onFail = opts?.onFail ?? failLoad
       // `reconcileSnapshots` (armed for every EAGER sub, never for on-demand
       // subset subs — a subset snapshot must not delete other subsets' rows):
       // a snapshot is authoritative SET semantics over the synced rows —
@@ -540,6 +563,7 @@ export function doCollectionOptions(opts: {
       const hc = consumeHydratedCursor()
       let catchupId: string | null = null
       let readyGate: Promise<void>
+      let dropRows = false
       if (hc !== null && hc !== "0") {
         const id = `${table}#hydrate#${++subSeq}`
         catchupId = id
@@ -584,18 +608,32 @@ export function doCollectionOptions(opts: {
           undefined,
           hc,
         )
-      } else if (hc === "0") {
-        // No resume point: drop the hydrated rows at sync start, honestly.
-        readyGate = transport.connect().then(() => {
-          truncateAll()
-        })
       } else {
+        // No resume point: once connected, drop the rows, honestly. They were
+        // hydrated with no cursor, or this run replaces another whose rows
+        // core kept (a 1.0 `reload()`, ADR-0028). No watch of this run holds
+        // them, so nothing would remove one the server has since deleted.
+        // The truncate does not look for rows first: a commit of the replaced
+        // run can still be queued behind a persisting write, and lands later.
+        // Core's truncate replay reloads every live demand with fresh subs.
+        dropRows = hc === "0" || restarted
         readyGate = transport.connect()
       }
-      // A failed gate fails readiness loud (markError; preload() rejects with
-      // the cause) instead of hanging — a later retried preload() recovers
-      // once the transport's policy-driven reconnect succeeds (0.8.2).
-      void readyGate.then(markReady, (e) => markError?.(e))
+      // A failed gate fails the first load loud (preload() rejects with the
+      // cause) instead of hanging. Without a hydration catch-up nothing
+      // retries it: the transport reconnects only for live subscriptions, and
+      // this run has none yet. The app starts a new run: `reload()` on
+      // @tanstack/db 1.0, `cleanup()` then `preload()` before it (ADR-0028).
+      //
+      // Only the gate itself can fail the load. What runs once it is open is
+      // not under failLoad: applying the truncate makes the collection ready
+      // in core, which runs the app's ready callbacks, and one that throws
+      // surfaces from this commit. It is the app's error. It goes uncaught, as
+      // a throw from markReady() does, and the collection stays ready.
+      void readyGate.then(() => {
+        if (dropRows) truncateAll()
+        markReady()
+      }, failLoad)
 
       const openWatch = (o: LoadSubsetOptions, onReady: () => void, onFail: (e: unknown) => void, onRefused: () => void): Watch => {
         let accept!: (ok: boolean) => void
@@ -841,6 +879,11 @@ export function doCollectionOptions(opts: {
     // veto), futures we haven't imagined — it is what prevents a
     // server-deleted held row from being stale forever. C1′ makes it sound
     // mid-session too: a held synced key absent from a snapshot is deleted.
+    //
+    // The sub id is fresh per sync run, like an on-demand watch's (ADR-0023
+    // D8). A restart must not hand the replaced run's late frames to the new
+    // handler: a leftover snap-end would pass for a whole snapshot (ADR-0028).
+    const eagerSubId = `${table}#${++subSeq}`
     {
       const hc = consumeHydratedCursor()
       const handler = makeHandler(markReady, { reconcileSnapshots: true })
@@ -851,15 +894,19 @@ export function doCollectionOptions(opts: {
         // no resume point ("0"), take a fresh snapshot and reconcile it.
         // Ready NOW: stale-while-revalidate is the explicit SSR contract —
         // first paint renders the hydrated rows, the boundary converges them.
+        // So a dial that fails here is not a failed load (see failLoad): the
+        // transport retries it.
         void transport
           .subscribe(eagerSubId, table, handler, where, undefined, undefined, hc === "0" ? undefined : hc)
-          .catch((e) => markError?.(e))
+          .catch(failLoad)
         markReady()
       } else {
-        // A first-connect failure fails readiness loud (preload() rejects);
-        // the policy-driven reconnect keeps retrying and the eventual
-        // snapshot's markReady recovers the collection (error → ready, 0.8.2).
-        void transport.subscribe(eagerSubId, table, handler, where).catch((e) => markError?.(e))
+        // A first-connect failure fails the first load loud (preload()
+        // rejects). The policy-driven reconnect keeps retrying. Before
+        // @tanstack/db 1.0 the eventual snapshot's markReady recovers the
+        // collection (error → ready, 0.8.2); from 1.0 a failed run stays
+        // failed and the app calls `reload()` (ADR-0028).
+        void transport.subscribe(eagerSubId, table, handler, where).catch(failLoad)
       }
     }
     return () => {

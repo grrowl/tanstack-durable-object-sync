@@ -4,7 +4,10 @@
 D5's peer-range statement: the floor moves from 0.8.5 to **0.8.6**, and the
 rationale for the range now lives here. The rest of D5 (the
 `withCollectionConfigFactory` marker, no `Symbol.for` self-branding, released
-packages only) stands.
+packages only) stands. **Amended by** [ADR-0028](./0028-db-1-0-release-candidates.md):
+the range gains a clause that admits the 1.0 release candidates, the contract
+table gains the 0.12 and 1.0 rows, and the `locked` leg moves to the release
+candidate.
 
 ## Context
 

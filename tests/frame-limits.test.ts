@@ -22,6 +22,7 @@ import {
 } from "../src/client/transport.ts";
 import { createFrameCodec } from "../src/wire/frame-codec.ts";
 import type { TestApi } from "./test-worker.ts";
+import { settled } from "./settled.ts";
 
 function makeTransport(
   room: string,
@@ -262,7 +263,7 @@ describe("oversize client mutation frames (ADR-0018)", () => {
 
     let err: unknown;
     try {
-      await tx.isPersisted.promise;
+      await settled(tx);
     } catch (e) {
       err = e;
     }
