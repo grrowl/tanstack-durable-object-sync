@@ -278,3 +278,103 @@ The library's client is unaffected; the whole suite passes on the locked
 `@tanstack/db` and on the floor.
 
 Pinned by `tests/since-shape.test.ts`.
+
+## Amendment 2026-11-17: ids and names have a length limit
+
+The only bound on an id a client chooses was the frame size. A `sub` id is
+echoed in every frame for its sub (each `snap`, delta, `snap-end`, catch-up
+`uptodate` and `reset`) and stored in `_sync_subs`, so a 600 000 character sub
+id made every delta for it at least that long. Each such frame also logged an
+oversize warning, so the client chose how many log lines the server wrote. A
+`txId` is stored in `_sync_seen_tx` for `dedupRetentionMs`. A `fetchId` is
+echoed once. A collection or command name that is not registered is refused,
+but a `mut` or `call` refusal quoted it in its message, which is stored with the
+receipt.
+
+### Decision 1: the limits, and where they come from
+
+- **An id** (`subId`, `fetchId`, `txId`) may be at most **256 bytes**
+  (`MAX_ID_BYTES` in `src/server/mixin.ts`).
+- **A collection or command name** may be at most **128 bytes**
+  (`MAX_NAME_BYTES` in `src/server/registry.ts`).
+
+The library's client builds its ids from a table name: a sub id is
+`<table>#<n>`, a fetch id `<table>#fetch#<n>`, and the hydration catch-up's sub
+id `<table>#hydrate#<n>` (`src/client/do-collection.ts`). `n` is a counter that
+prints as at most 21 digits. A call's `txId` is `crypto.randomUUID()`, 36
+characters, and a mutation's is TanStack's transaction id, which is a UUID unless
+the app supplies one with `createTransaction({ id })`. Nothing bounded a table
+name before: `IDENT` checks its characters only, and SQLite has no identifier
+limit of its own. So `compileSchema` now refuses a table name (in
+`assertValidCollection`) or a command name over 128 bytes, with a message that
+names the limit. Those are the only places a name enters the registry:
+`registerSync` compiles the schema with `compileSchema`, and mutations are keyed
+by their table name. With that bound, the longest id the library builds is
+128 + 9 + 21 = 158 bytes, under 256. Only an app supplied transaction id can
+reach the limit, and decision 2 makes that fail at once.
+
+Both are fixed numbers, not options beside D2: they describe the protocol's
+shape, not how a deployment is tuned, and a client must be able to rely on them.
+
+**The unit is the UTF-8 byte.** SQLite stores TEXT as UTF-8 and MessagePack sends
+a string as UTF-8, so bytes bound what is stored and sent. A limit in characters
+would let a client send four times as many bytes in four byte characters. A
+UTF-16 unit is at least one UTF-8 byte, so a string longer than the limit in
+`length` is over it without being encoded (`exceedsBytes`).
+
+### Decision 2: a frame over a limit gets its own refusal, echoing the id once
+
+Each refusal is the reply that frame type already has, so a client handles it
+as it handles any other refusal of that frame:
+
+- **`sub`, id over the limit:** `reset` for that sub id. It is refused before
+  anything else is checked or read. No sub can hold such an id, so nothing is
+  removed or stored.
+- **`fetch`, id over the limit:** an empty `page` with `seq: "0"`, as for an
+  unknown collection, before anything is read.
+- **`mut` or `call`, `txId` over the limit:** `rejected` with code
+  `LIMIT_EXCEEDED` and the message `txId is over 256 bytes`. It is refused
+  before the dedup lookup and is **not** recorded. ADR-0025 runs every per
+  transaction rejection after the dedup lookup, so that a resent `txId` keeps its
+  stored outcome. A `txId` over the limit can have no stored outcome, because
+  none is ever recorded under one, so there is nothing for the lookup to find.
+  The one exception is a receipt recorded under such an id before this change,
+  within one `dedupRetentionMs` of deploying it: a resend of that `txId` is now
+  refused instead of replayed.
+- **`unsub`, id over the limit:** ignored. No sub can hold the id.
+- **A name over the limit:** a `mut` gets `rejected` with `LIMIT_EXCEEDED` and
+  `collection name is over 128 bytes`, and a `call` gets `command name is over
+  128 bytes`. Neither message quotes the name. The `txId` is within its limit
+  here, so this is an ordinary per transaction rejection: it runs after the
+  dedup lookup and first in `#applyMut` and `#applyCall`, and is recorded as
+  every rejection is. A `sub` or `fetch` needs no check of its own: no
+  collection can have such a name, so it is refused as an unknown collection
+  already is, with nothing stored.
+
+A frame over more than one limit gets one answer: the id is checked first, then
+the name, then everything else.
+
+The reply echoes the id once. That costs about what the client spent to send
+it, and the problem was the echo in every delta, the storage and the log lines,
+none of which remain. Log lines clip the id as before. Two other answers were
+considered:
+
+- **Drop the frame as D1 does, with no reply.** A raw client would wait for ever
+  for a `sub`, and until its timeout for anything else. A library app with an
+  app supplied transaction id over the limit would wait `timeoutMs` and then see
+  a vague `confirmation timeout`. ADR-0025 chose a reply over a drop for the empty
+  op key for the same reason, and the amendment above says a deliberate refusal
+  always gets its reply.
+- **A reply with a clipped id.** The client matches a reply to its request by
+  the id, so a clipped id matches nothing, and the client waits as it would for
+  a drop.
+
+**Breaking.** A raw client whose ids are over 256 bytes, or whose collection or
+command names are over 128, is now refused. An app that supplies a transaction
+id over 256 bytes now has the transaction rejected with `LIMIT_EXCEEDED`. A
+schema with a table or command name over 128 bytes now fails to register.
+
+Pinned by `tests/id-limits.test.ts` (raw frames at and one byte over each limit,
+in one, two and four byte characters), `tests/id-limits-client.test.ts` (the real
+client with a table and a command name at 128 bytes, and a watch refused for its
+id), and `tests/registry.test.ts`.

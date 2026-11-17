@@ -2,6 +2,7 @@ import { SELF } from "cloudflare:test"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { createFrameCodec } from "../src/wire/frame-codec.ts"
 import type { ClientFrame, ServerFrame } from "../src/wire/frames.ts"
+import { whereJustUnderStoredCap } from "./row-over-cap.ts"
 
 // WHY: the server's log lines quote strings a client chose (sub ids, fetch ids,
 // collection names, whole malformed frames). Unclipped, any client can make the
@@ -48,6 +49,10 @@ describe("log lines clip the strings a client chose", () => {
 
   const long = "s".repeat(600_000)
   const normal = "messages#3"
+  // The longest id the server accepts (ADR-0012 amendment 2026-11-17), still
+  // longer than a log line keeps. The refusals below come after the id check,
+  // so only an id within the limit reaches them.
+  const longest = "s".repeat(256)
 
   it("a refused sub with a long id or a long column name", async () => {
     const ws = await openWs(`clip-sub-${crypto.randomUUID()}`)
@@ -86,11 +91,12 @@ describe("log lines clip the strings a client chose", () => {
   }
   const dates = (n: number): Array<Date> => Array.from({ length: n }, (_, i) => new Date(1_700_000_000_000 + i))
 
-  // The line that stalled CI: the backstop's refusal, reached with a sub id so
-  // long that the `_sync_subs` row is over SQLite's value cap.
+  // The line that stalled CI: the backstop's refusal, reached when the
+  // `_sync_subs` row is over SQLite's value cap. A 600 000 character sub id did
+  // that then; now the id is limited, so the predicate sits just under the cap.
   it("a sub refused by the SQLite-limit backstop", async () => {
     const ws = await openWs(`clip-backstop-${crypto.randomUUID()}`)
-    send(ws, { t: "sub", subId: long, collection: "messages", where: fn("in", ref("id"), val(dates(40_000))) })
+    send(ws, { t: "sub", subId: longest, collection: "messages", where: whereJustUnderStoredCap() })
     await next(ws, (f) => f.t === "reset")
     ws.close()
     expectClipped("refused at a SQLite limit")
@@ -98,7 +104,7 @@ describe("log lines clip the strings a client chose", () => {
 
   it("a fetch refused for its predicate", async () => {
     const ws = await openWs(`clip-fetch-refused-${crypto.randomUUID()}`)
-    send(ws, { t: "fetch", fetchId: long, collection: "messages", where: fn("ne", ref("body"), val("x")) })
+    send(ws, { t: "fetch", fetchId: longest, collection: "messages", where: fn("ne", ref("body"), val("x")) })
     await next(ws, (f) => f.t === "page")
     ws.close()
     expectClipped("operator 'ne' is not supported")
@@ -106,7 +112,7 @@ describe("log lines clip the strings a client chose", () => {
 
   it("a sub whose predicate is too large to store", async () => {
     const ws = await openWs(`clip-store-${crypto.randomUUID()}`)
-    send(ws, { t: "sub", subId: "s".repeat(1000), collection: "messages", where: fn("in", ref("id"), val(dates(60_000))) })
+    send(ws, { t: "sub", subId: longest, collection: "messages", where: fn("in", ref("id"), val(dates(60_000))) })
     await next(ws, (f) => f.t === "reset")
     ws.close()
     expectClipped("predicate too large to store")
@@ -119,7 +125,7 @@ describe("log lines clip the strings a client chose", () => {
       send(ws, { t: "sub", subId, collection: "messages" })
       await next(ws, (f) => f.t === "snap-end")
     }
-    send(ws, { t: "sub", subId: long, collection: "messages" })
+    send(ws, { t: "sub", subId: longest, collection: "messages" })
     await next(ws, (f) => f.t === "reset")
     ws.close()
     expectClipped("maxSubsPerSocket")

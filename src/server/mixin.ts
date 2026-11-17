@@ -38,7 +38,14 @@ import {
 } from "./changes.ts"
 import { Broadcaster } from "./broadcast.ts"
 import { decodeResult, encodeResult, lookupTx, recordTx, type SeenTx, sweepDedup } from "./dedup.ts"
-import { compileSchema, type CompiledSync, type SyncSchema, ValidationError } from "./registry.ts"
+import {
+  compileSchema,
+  type CompiledSync,
+  exceedsBytes,
+  MAX_NAME_BYTES,
+  type SyncSchema,
+  ValidationError,
+} from "./registry.ts"
 import {
   andPredicates,
   compileSubsetQuery,
@@ -652,6 +659,8 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           case "sub":
             return this.#handleSub(ws, frame)
           case "unsub": {
+            // No sub can hold an id over the limit, so there is nothing to drop.
+            if (exceedsBytes(frame.subId, MAX_ID_BYTES)) return
             this.#subs.remove(ws, frame.subId)
             if (this.#compiled) {
               const sid = this.#socketIdFor(ws)
@@ -681,6 +690,14 @@ export function Syncable<Env = unknown, TUser = unknown>() {
        *  — a concurrent mutation is either reflected in it or arrives as a delta
        *  AFTER it, never split across the two reads (ADR-0003). */
       #handleFetch(ws: WebSocket, frame: Extract<ClientFrame, { t: "fetch" }>): void {
+        // An id over the limit is refused first, with nothing read: an empty page
+        // echoes it once (ADR-0012 amendment 2026-11-17). A name over
+        // MAX_NAME_BYTES needs no check of its own: no collection can have it.
+        if (exceedsBytes(frame.fetchId, MAX_ID_BYTES)) {
+          console.error(`fetch '${clip(frame.fetchId)}' refused: id over ${MAX_ID_BYTES} bytes`)
+          this.#send(ws, { t: "page", fetchId: frame.fetchId, rows: [], seq: "0" })
+          return
+        }
         this.#broadcaster.flushOne(ws)
         const coll = this.#registry.collections.get(frame.collection)
         if (!coll) {
@@ -745,12 +762,19 @@ export function Syncable<Env = unknown, TUser = unknown>() {
        * optimistic overlay is never dropped before the authoritative row lands.
        */
       async #handleMut(ws: WebSocket, f: Extract<ClientFrame, { t: "mut" }>): Promise<void> {
+        if (exceedsBytes(f.txId, MAX_ID_BYTES)) return this.#refuseTxId(ws, f.txId)
         // Dedup first: a resent txId gets its stored outcome, never a fresh
         // rejection from a check in #applyMut (ADR-0025).
         return this.#oncePerTx(ws, f.txId, () => this.#applyMut(ws, f))
       }
 
       async #applyMut(ws: WebSocket, f: Extract<ClientFrame, { t: "mut" }>): Promise<void> {
+        // A name over the limit names no collection. Refused before the other
+        // checks, and without quoting it, so the stored receipt stays short.
+        if (exceedsBytes(f.collection, MAX_NAME_BYTES)) {
+          return this.#rejectTx(ws, f.txId, `collection name is over ${MAX_NAME_BYTES} bytes`, "LIMIT_EXCEEDED")
+        }
+
         // Inbound limit: reject over-length batches without applying anything
         // (ADR-0012). Reject-don't-truncate: a partial apply silently drops writes.
         if (f.ops.length > this.maxOpsPerMutation) {
@@ -850,10 +874,14 @@ export function Syncable<Env = unknown, TUser = unknown>() {
 
       /** Run a named command (outside any transaction) and confirm with its result. */
       async #handleCall(ws: WebSocket, f: Extract<ClientFrame, { t: "call" }>): Promise<void> {
+        if (exceedsBytes(f.txId, MAX_ID_BYTES)) return this.#refuseTxId(ws, f.txId)
         return this.#oncePerTx(ws, f.txId, () => this.#applyCall(ws, f))
       }
 
       async #applyCall(ws: WebSocket, f: Extract<ClientFrame, { t: "call" }>): Promise<void> {
+        if (exceedsBytes(f.name, MAX_NAME_BYTES)) {
+          return this.#rejectTx(ws, f.txId, `command name is over ${MAX_NAME_BYTES} bytes`, "LIMIT_EXCEEDED")
+        }
 
         const def = this.#registry.commands.get(f.name)
         if (!def) return this.#rejectTx(ws, f.txId, `unknown command '${f.name}'`, "UNKNOWN_COMMAND")
@@ -932,6 +960,16 @@ export function Syncable<Env = unknown, TUser = unknown>() {
         if (now - this.#lastDedupSweepAt < this.dedupRetentionMs) return
         this.#lastDedupSweepAt = now
         sweepDedup(this.#sql, this.dedupRetentionMs, now)
+      }
+
+      /** A txId over the limit is refused before the dedup lookup and is not
+       *  recorded: no receipt is ever stored under such an id, so there is none
+       *  to replay (ADR-0012 amendment 2026-11-17). The reply echoes it once, so
+       *  the client's pending write fails at once. */
+      #refuseTxId(ws: WebSocket, txId: string): void {
+        console.error(`txId '${clip(txId)}' refused: over ${MAX_ID_BYTES} bytes`)
+        const message = `txId is over ${MAX_ID_BYTES} bytes`
+        this.#send(ws, { t: "rejected", txId, error: { code: "LIMIT_EXCEEDED", message } })
       }
 
       #rejectTx(ws: WebSocket, txId: string, message: string, code?: string): void {
@@ -1063,6 +1101,15 @@ export function Syncable<Env = unknown, TUser = unknown>() {
       /** Full-collection subscribe: emit every current row as a snapshot, then a
        *  boundary. */
       #handleSub(ws: WebSocket, frame: Extract<ClientFrame, { t: "sub" }>): void {
+        // An id over the limit is refused first, with a `reset` that echoes it
+        // once. No sub can hold such an id, so there is nothing to drop
+        // (ADR-0012 amendment 2026-11-17). A name over MAX_NAME_BYTES needs no
+        // check of its own: no collection can have it, so it is refused below.
+        if (exceedsBytes(frame.subId, MAX_ID_BYTES)) {
+          console.error(`sub '${clip(frame.subId)}' refused: id over ${MAX_ID_BYTES} bytes`)
+          this.#send(ws, { t: "reset", sub: frame.subId })
+          return
+        }
         const coll = this.#registry.collections.get(frame.collection)
         if (!coll) {
           // Unknown collection: drop the subscriber's view. Richer sub-error
@@ -1320,6 +1367,14 @@ const LOG_CLIP_CHARS = 128
 function clip(s: string): string {
   return s.length <= LOG_CLIP_CHARS ? s : `${s.slice(0, LOG_CLIP_CHARS)}… [clipped, ${s.length} chars]`
 }
+
+/** The longest `subId`, `fetchId` or `txId` a client may send, in UTF-8 bytes,
+ *  the form in which an id is stored and sent. The library's own ids are ASCII
+ *  and at most 158 bytes: a table name of at most MAX_NAME_BYTES, `#fetch#` or
+ *  `#hydrate#`, and a counter of at most 21 digits, or a UUID (36). A frame
+ *  over it is refused with its own reply, and nothing is stored (ADR-0012
+ *  amendment 2026-11-17). */
+const MAX_ID_BYTES = 256
 
 /** A `since` is a position in its plain decimal form, as the client sends it:
  *  no sign, no leading zero, at most 19 digits, the length of SQLite's largest

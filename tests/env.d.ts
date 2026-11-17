@@ -11,5 +11,6 @@ declare namespace Cloudflare {
     GATED_DO: DurableObjectNamespace
     HOST_DO: DurableObjectNamespace
     HOST_OPTIN_DO: DurableObjectNamespace
+    LONG_DO: DurableObjectNamespace
   }
 }

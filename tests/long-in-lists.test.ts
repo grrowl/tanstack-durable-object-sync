@@ -5,6 +5,7 @@ import { doCollectionOptions } from "../src/client/do-collection.ts"
 import { WebSocketTransport, type WebSocketLike } from "../src/client/transport.ts"
 import { createFrameCodec } from "../src/wire/frame-codec.ts"
 import type { ClientFrame, ServerFrame } from "../src/wire/frames.ts"
+import { whereJustUnderStoredCap } from "./row-over-cap.ts"
 import type { TestApi } from "./test-worker.ts"
 
 // WHY: Durable Object SQLite allows at most 100 bound parameters in one
@@ -265,14 +266,14 @@ describe("a predicate over SQLite's limits is refused on purpose", () => {
 
   // The backstop: an error SQLite gives for one of its limits, where the
   // compiler's checks passed, is a refusal too. Here the predicate's stored
-  // form fits, but the `_sync_subs` row (a 600 KB subId beside it) does not.
+  // form fits, but the `_sync_subs` row (the sub id and socket id beside it)
+  // does not.
   it("sub: a statement SQLite still rejects for a limit → reset, and nothing stays registered", async () => {
     const r = room("backstop")
     await seed(r, SEEDED)
     const ws = await openWs(r)
-    const subId = "s".repeat(600_000)
-    const where = fn("in", ref("id"), val(Array.from({ length: 40_000 }, (_, i) => new Date(1_700_000_000_000 + i))))
-    send(ws, { t: "sub", subId, collection: "messages", where })
+    const subId = "s1"
+    send(ws, { t: "sub", subId, collection: "messages", where: whereJustUnderStoredCap() })
     const frames = await collectUntil(ws, (f) => f.t === "reset" || f.t === "snap-end")
     expect(frames.map((f) => f.t)).toEqual(["reset"])
     expect(await persistedSubs(r)).toEqual([])
