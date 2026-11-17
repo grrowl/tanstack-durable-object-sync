@@ -78,8 +78,8 @@ async function fetchPage(ws: WebSocket, body: Sent): Promise<Array<string>> {
 
 type SnapshotReq = { collection: string; where?: unknown; orderBy?: unknown; limit?: number }
 type Snapshot = { rows: Array<{ id: string }> }
-/** `readSyncSnapshot` on the instance, settled inside it: an error thrown across
- *  the RPC boundary is also reported as an unhandled rejection by the test pool. */
+/** `readSyncSnapshot` on the instance, settled inside it, so a test can check the
+ *  error's class (it does not survive the RPC; one case below goes through the stub). */
 function readSyncSnapshot(room: string, req: SnapshotReq): Promise<Snapshot | { error: unknown }> {
   return runInDurableObject(stubFor(room), (inst) =>
     (inst as unknown as { readSyncSnapshot: (r: SnapshotReq, request: Request) => Promise<Snapshot> })
@@ -168,14 +168,35 @@ describe("a query naming a column the table does not have is refused", () => {
     ws.close()
   })
 
-  it("a fetch whose cursor names an unknown column is refused", async () => {
-    const room = `unk-cursor-${crypto.randomUUID()}`
+  // A cursor fetch runs two statements: the ties (base AND whereCurrent, no
+  // limit) and the page (base AND whereFrom). Each half is pinned alone, so a
+  // check of only one statement's columns fails here. Unchecked, the ties
+  // statement below returns every row.
+  for (const [half, cursor] of [
+    ["whereCurrent", { whereCurrent: fn("eq", ref("nope"), val("nope")), whereFrom: fn("gt", ref("body"), val("b1")) }],
+    ["whereFrom", { whereCurrent: fn("eq", ref("body"), val("b1")), whereFrom: fn("gt", ref("nope"), val("b1")) }],
+  ] as const) {
+    it(`a cursor fetch whose ${half} alone names an unknown column is refused`, async () => {
+      const room = `unk-cursor-${crypto.randomUUID()}`
+      await seeded(room)
+      const ws = await openWs(room)
+      expect(await fetchPage(ws, { orderBy: by("body"), limit: 2, cursor })).toEqual([])
+      expect(lines.some((l) => l.includes("'nope'"))).toBe(true)
+      ws.close()
+    })
+  }
+
+  it("readSyncSnapshot over the RPC stub: the caller gets a plain Error, its message naming the class", async () => {
+    const room = `unk-rpc-${crypto.randomUUID()}`
     await seeded(room)
-    const ws = await openWs(room)
-    const cursor = { whereCurrent: fn("eq", ref("nope"), val("b1")), whereFrom: fn("gt", ref("nope"), val("b1")) }
-    expect(await fetchPage(ws, { orderBy: by("body"), limit: 2, cursor })).toEqual([])
-    expect(lines.some((l) => l.includes("'nope'"))).toBe(true)
-    ws.close()
+    const stub = stubFor(room) as unknown as {
+      readSyncSnapshot: (r: SnapshotReq, request: Request) => Promise<Snapshot>
+    }
+    const req = { collection: "messages", where: fn("eq", ref("nope"), val("nope")) }
+    const error = await stub.readSyncSnapshot(req, new Request("https://example.com/ssr")).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(Error)
+    expect(error).not.toBeInstanceOf(UnsupportedPredicateError) // the class does not survive the RPC
+    expect((error as Error).message).toMatch(/^UnsupportedPredicateError: column 'nope' is not in table 'messages'/)
   })
 
   it("the log line clips a long column name", async () => {
