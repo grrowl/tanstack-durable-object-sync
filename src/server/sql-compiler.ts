@@ -15,6 +15,8 @@
 // sets `PRAGMA case_sensitive_like = ON` (SyncDurableObject constructor), which
 // makes SQLite LIKE case-sensitive to match @tanstack/db's case-sensitive `like`.
 
+import { columnRefProblem, IDENT } from "../wire/column-ref.ts"
+
 export class UnsupportedPredicateError extends Error {
   constructor(message: string) {
     super(message)
@@ -22,7 +24,6 @@ export class UnsupportedPredicateError extends Error {
   }
 }
 
-const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/
 // SQLite limits in a Durable Object, set by workerd's `SqliteDatabase::setupSecurity`
 // (Cloudflare's Durable Objects limits page lists the same). A query over one is
 // refused when it is compiled (ADR-0013 amendment 2026-11-17). The checks are
@@ -99,27 +100,14 @@ function isNode(x: unknown): x is Node {
  *  name that matches no column as a string. The caller checks `names` against
  *  the table (ADR-0013 amendment 2026-11-17).
  *
- *  A ref must be exactly `{ type: "ref", path: [name] }`, the shape the library's
- *  client sends (0.8.6 to 1.0), so the evaluator reads `row[name]` as SQL does.
- *  It reads any other shape differently: on 1.0 it drops `path[0]` when it equals
- *  `sourceAlias`, and it walks a longer path into the value (ADR-0013 amendment
- *  2026-11-17, column references). `where` and `orderBy` both come here. */
+ *  The ref must have the one shape `columnRefProblem` accepts (ADR-0013
+ *  amendment 2026-11-17, column references). `where` and `orderBy` both come
+ *  here, and the on-demand adapter uses the same rule to decide which `orderBy`
+ *  it can send. */
 function column(node: unknown, names: Set<string>): string {
-  if (!isNode(node) || node.type !== "ref") throw new UnsupportedPredicateError("expected a column reference")
-  const extra = Object.keys(node).find((k) => k !== "type" && k !== "path")
-  if (extra !== undefined) {
-    throw new UnsupportedPredicateError(`a column reference carries only 'type' and 'path'; got '${extra}'`)
-  }
-  const path: unknown = node.path
-  if (!Array.isArray(path)) throw new UnsupportedPredicateError("a column reference's path must be an array")
-  if (path.length !== 1) {
-    const shown = path.map((p) => (typeof p === "string" ? p : typeof p)).join(", ")
-    throw new UnsupportedPredicateError(`nested/aliased column paths are not supported: [${shown}]`)
-  }
-  const name: unknown = path[0]
-  if (typeof name !== "string" || !IDENT.test(name)) {
-    throw new UnsupportedPredicateError(`invalid column name: ${typeof name === "string" ? name : typeof name}`)
-  }
+  const problem = columnRefProblem(node)
+  if (problem !== null) throw new UnsupportedPredicateError(problem)
+  const name = (node as { path: [string] }).path[0]
   names.add(name)
   return `"${name}"`
 }

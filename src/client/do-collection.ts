@@ -25,6 +25,7 @@ import {
   type CollectionConfig,
 } from "@tanstack/db"
 import { encode as codecEncode } from "../wire/codec.ts"
+import { columnRefProblem } from "../wire/column-ref.ts"
 import type { MutOp, RowOp } from "../wire/frames.ts"
 import type { SubHandler, Transport } from "./transport.ts"
 
@@ -109,6 +110,18 @@ interface LoadSubsetOptions {
   offset?: number
   cursor?: { whereFrom: unknown; whereCurrent: unknown; lastKey?: unknown }
   signal?: AbortSignal
+}
+
+/** True when the server can sort by every term of `orderBy`: each term orders by
+ *  a column ref in the one shape the server reads (`columnRefProblem`, ADR-0013
+ *  amendment 2026-11-17). @tanstack/db 0.8 pushes an `orderBy` through a subquery
+ *  or a join to the source with refs such as `["sub", "body"]`, and every version
+ *  sends a nested field as a longer path. The server refuses those. */
+function serverCanSort(orderBy: unknown): boolean {
+  return (
+    Array.isArray(orderBy) &&
+    orderBy.every((t) => typeof t === "object" && t !== null && columnRefProblem((t as { expression?: unknown }).expression) === null)
+  )
 }
 
 function compilePredicate(where: unknown): (row: Record<string, unknown>) => boolean {
@@ -736,6 +749,10 @@ export function doCollectionOptions(opts: {
       // DuplicateKeySyncError and abort the transaction), and a key the live sub
       // already holds keeps its fresher value. The live `where` sub stays the
       // source of truth for anything currently in the collection.
+      //
+      // An `orderBy` the server cannot sort by (see `sendable`) gives a cursor it
+      // cannot read either: the page is then the whole `where` subset, with no
+      // cursor, order or limit. Rows already held are kept (insert-if-absent).
       const loadMore = async (o: LoadSubsetOptions): Promise<void> => {
         const { whereFrom, whereCurrent } = o.cursor!
         const g = gen
@@ -745,9 +762,7 @@ export function doCollectionOptions(opts: {
           fetchId: `${table}#fetch#${++subSeq}`,
           collection: table,
           where: o.where,
-          cursor: { whereFrom, whereCurrent },
-          orderBy: o.orderBy,
-          limit: o.limit,
+          ...(serverCanSort(o.orderBy) ? { cursor: { whereFrom, whereCurrent }, orderBy: o.orderBy, limit: o.limit } : {}),
         })
         // A request cancelled, a truncate (new generation), or a session cleaned
         // up meanwhile: install nothing (0.9 cooperative cancellation; a page
@@ -786,20 +801,32 @@ export function doCollectionOptions(opts: {
         await installPage(page, w)
       }
 
-      const loadSubset = (o: LoadSubsetOptions): true | Promise<void> => {
-        if (o.cursor) return loadMore(o)
+      /** The request as it is sent (ADR-0023 amendment 2026-11-17). An `orderBy`
+       *  and a `limit` only let the server send fewer rows: the client sorts and
+       *  cuts the rows it holds. So when the server cannot sort by the `orderBy`
+       *  (it would refuse the request, which reads as no rows), the request is for
+       *  the whole `where` subset instead. Decided here, once, so the request key,
+       *  the watch, the covered fetch and the SSR read all see the same request. */
+      const sendable = (o: LoadSubsetOptions): LoadSubsetOptions =>
+        o.orderBy == null || serverCanSort(o.orderBy) ? o : { where: o.where, signal: o.signal }
+
+      const loadSubset = (core: LoadSubsetOptions): true | Promise<void> => {
+        if (core.cursor) return loadMore(core)
+        // Bookkeeping (`outstanding`, `acquisitionOf`) is by the object core
+        // passed, which it releases with; everything else uses the sent request.
+        const o = sendable(core)
         // Neither a watch's snapshot nor a fetch can skip rows without a cursor:
         // fail loud rather than answer with the wrong page. (Upstream pairs a
         // non-zero offset with a cursor.)
         if (o.offset) {
           return Promise.reject(new Error(`on-demand '${table}': a subset request with offset ${o.offset} and no cursor is unsupported`))
         }
-        outstanding.set(o, (outstanding.get(o) ?? 0) + 1)
+        outstanding.set(core, (outstanding.get(core) ?? 0) + 1)
         const key = requestKey(o)
         const existing = acquisitions.get(key)
         if (existing) {
           existing.refs++
-          acquisitionOf.set(o, existing)
+          acquisitionOf.set(core, existing)
           return existing.ready
         }
         let resolve!: () => void
@@ -810,7 +837,7 @@ export function doCollectionOptions(opts: {
         })
         const acq: Acquisition = { key, refs: 1, ready, watch: null, released: false, gen, settle: () => resolve(), fail: reject }
         acquisitions.set(key, acq)
-        acquisitionOf.set(o, acq)
+        acquisitionOf.set(core, acq)
         // A completed load also (re)marks ready — the recovery path out of a
         // failed ready-gate's error state (idempotent otherwise). A send failure
         // or rejected receipt rejects THIS load (0.8.4 surfaces it
