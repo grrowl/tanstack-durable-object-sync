@@ -266,3 +266,107 @@ by SQLite, that every family crosses its own edge, and that early refusal stays
 within a stated slack; it also runs a deterministic fuzz of 89 376 predicates
 (about 13 seconds). `tests/long-in-lists.test.ts` drives every path that runs the
 compiled SQL.
+
+## Amendment 2026-11-17: a query that names a column the table does not have is refused
+
+**Context.** The compiler writes a column as a double quoted name. When the table
+has no such column, SQLite does not fail: it reads the name as a string literal
+and runs the statement. The evaluator, which decides the deltas, reads the
+missing column as undefined. Measured on the test table `messages (id, body)`
+with raw `sub` and `fetch` frames: `eq`, `gt`, `in`, `like` and `not(isNull)` on
+`nope` snapshot every row; `eq(nope, "other")` and `isNull(nope)` snapshot none;
+`orderBy nope limit 2` returns two rows in no meaningful order; later inserts
+send synthetic deletes; and `fetch` returns the same wrong rows. There was no
+refusal and no log line, so a typo in a column name gave an app a wrong list
+that looked right. The 2026-09-29 amendment called unknown columns out of
+contract. That is replaced here: they are refused.
+
+**What SQLite does.** Measured in workerd 1.20260721.1:
+
+- A double quoted name that matches no column is a string literal in `WHERE`
+  and in `ORDER BY` alike, so `"nope" = 'nope'` is true on every row,
+  `"nope" IS NULL` is false, and `ORDER BY "nope"` sorts by a constant. The same
+  holds on a rowid table, a `WITHOUT ROWID` table and a view.
+- A name in backticks, or one qualified with the table (`"messages"."nope"`), is
+  never read as a string. Both clauses fail with `no such column`.
+- SQLite matches a name in any case (`"BODY"` finds `body`) and resolves
+  `rowid` and `_rowid_` on a rowid table. A row from `SELECT *` has
+  neither key: its keys are the declared names, and the rowid is not one of
+  them. So the evaluator reads `row.BODY` and `row.rowid` as undefined while the
+  SQL reads a real value.
+- A generated column, virtual or stored, is in `SELECT *` and in
+  `pragma_table_xinfo` (with `hidden` 2 or 3), but not in `pragma_table_info`.
+- A view and a `WITHOUT ROWID` table cannot be registered (`assertSyncCompatible`
+  finds no primary key on a view and no rowid on the other), and a virtual table
+  cannot carry the capture triggers. So none of them is a synced table, and none
+  changes the answer below.
+
+**Options.**
+
+1. Read the table's columns when a query is compiled, and refuse a name that is
+   not one of them.
+2. Quote names so SQLite never reads them as strings (backticks, or the table
+   name in front), and treat `no such column` as a refusal.
+3. Both.
+
+Option 2 is not correct on its own. It still accepts `BODY` and `rowid`, which
+SQLite resolves and the evaluator does not see. It only fails when the
+statement is prepared, but the catch-up path of a reconnecting `sub` never runs
+the compiled SQL, and a sub restored on wake (ADR-0019) has no SQL at all, so
+both would still accept the query. It would also have to pick `no such column`
+out of other errors by the message text. Option 3 refuses nothing that option 1
+does not already refuse. Option 1 is the simplest one that is correct.
+
+**Decision.**
+
+- `compileSubsetQuery` returns, beside the SQL, the names its `where` and
+  `orderBy` refer to (`columns`). It stays free of SQLite.
+- The mixin refuses a query that names a column not in
+  `SELECT name FROM pragma_table_xinfo(?) WHERE hidden != 1`, which is the list
+  of names `SELECT *` returns. The names are compared exactly, as a row's keys
+  are. The refusal is an `UnsupportedPredicateError`, so it takes the same path
+  as an operator off the floor: a `sub` gets `reset` and nothing of it stays
+  registered, a `fetch` gets the empty page, and `readSyncSnapshot` throws. The
+  log line is the existing one, for example
+  `sub 's1' on 'messages' rejected: column 'nope' is not in table 'messages'`,
+  clipped like every client string.
+- The pk is a column of the table, so it passes. The library adds no column to
+  a synced table: its triggers write to `_sync_changes`, and its own tables are
+  all `_sync_*`. The `ORDER BY rowid` default and the pk tie break are written by
+  the compiler and are not checked. A `rowid` named by the client is refused.
+- With the unknown column refused, the residual in the 2026-09-29 amendment
+  (`isUndefined` is true in the evaluator for a column the table lacks) can no
+  longer be reached.
+
+**Cost.** One read of the pragma for each `sub`, `fetch` and `readSyncSnapshot`
+whose query names a column, and none for one that names no column (an eager
+collection's `sub`). A cursor `fetch` compiles two statements and reads the list
+once for both. The read is a synchronous call into SQLite's in memory schema; it
+was not timed, because workerd does not advance its clock inside a request.
+Nothing is kept between queries, so a column added while the object is alive
+(by `ALTER TABLE` in a migration, with or without a later `registerSync`) is
+accepted by the next query. There is no timer and nothing runs while the object
+is idle.
+
+**Restore (ADR-0019).** A persisted sub carries only its `where` (its `orderBy`
+shaped a snapshot that was already sent). On restore, that `where` is now
+compiled and its columns checked, reading each table's columns once per
+restore. If a migration dropped a column it names, the sub is handled as one
+whose predicate no longer compiles: the socket closes with 1011 and its
+persisted subs are deleted. The client reconnects and sends its subs again; the
+one naming the dropped column is refused with `reset`, and the others are served
+as usual. Restore runs inside every `registerSync`, so a column dropped while the
+object is awake is caught the same way when `registerSync` runs after it. One
+dropped with no `registerSync` after it is not caught: until the next wake or
+reconnect, live subs on it read the column as undefined.
+
+**Not changed.** A refused query still reads as no results on the client, as
+every refusal does today. The kinds of values a column is compared with are not
+checked.
+
+**Evidence.** `tests/unknown-columns.test.ts` drives every shape above through a
+`sub` (including the catch-up path), a `fetch` (including a cursor) and
+`readSyncSnapshot` on a real Durable Object, and checks that nothing of a
+refused sub is registered or persisted, that the log line names the column and
+is clipped, that the pk and a column added after the first query (plain or
+generated) are accepted, and the restore after a column is dropped.
