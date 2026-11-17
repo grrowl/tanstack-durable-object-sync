@@ -10,6 +10,13 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ### Changed
 
+- **SSR reads what the browser reads.** On `@tanstack/db` 0.9 and later,
+  core asks for every matching row in two cases: a limited query ordered by
+  text with the default sort, and a first page that ends on a NULL in the
+  order column. A render now reads and dehydrates those rows. Top 10 of
+  100 000 rows under the default text sort dehydrates 100 000. With
+  `stringSort: "lexical"` it dehydrates 10. A NULL boundary is not helped by
+  `lexical`. See the SSR section of the README.
 - **Predicates within a few levels of SQLite's expression depth limit of 100
   are now refused.** The server checks depth on a safe bound before it runs a
   query, so it can refuse a little early. Examples are an `or` of 98 or 99
@@ -32,6 +39,19 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ### Fixed
 
+- **SSR: a render answers every read an on-demand collection makes.** A
+  render failed when a query was answered by a fetch: a request that an
+  earlier query covers (for example a list and a detail row of one table), on
+  `@tanstack/db` 0.9 and later the extra requests core sends for a single
+  query with `orderBy` and `limit`, and a window that grows during the
+  render. `SsrSnapshotTransport` now answers a fetch without a cursor with
+  one snapshot read, and a fetch with a cursor with the two reads the server
+  makes (the rows tied at the boundary, then the next page). All of them join
+  the resume cursor of the render. A cursor that lacks either half is
+  refused, as the server refuses it. Mutations during SSR still throw
+  `SsrReadOnlyError` (ADR-0011 amendment 2026-11-17).
+- **A fetched page writes each key once.** A row that both reads of a render
+  return no longer fails the load (ADR-0003 note 2026-11-17).
 - **A `sub` or `fetch` whose `where` has an `in` list of more than 100
   values now works.** Before, the subscription got no reply and its live query
   stayed loading forever, and a fetch timed out. Durable Object SQLite allows

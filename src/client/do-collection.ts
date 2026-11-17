@@ -524,12 +524,19 @@ export function doCollectionOptions(opts: {
       }
       /** Write a fetched page insert-if-absent (ADR-0003: a key already synced
        *  keeps its value; the watch streams its changes) and attribute every row
-       *  to the watch that keeps it live. Settles once the rows are visible. */
+       *  to the watch that keeps it live. Settles once the rows are visible.
+       *  Insert-if-absent holds inside the page too: a render reads a cursor
+       *  page's ties and next rows at two positions, so a row that moved past
+       *  the boundary between them is in both. The first copy (the earlier
+       *  read) wins; the hydration catch-up from the MIN cursor brings the
+       *  newer value (ADR-0011 amendment 2026-11-17). */
       const installPage = async (rows: Array<unknown>, w: Watch | null): Promise<void> => {
         ensureBegin()
+        const written = new Set<string>()
         for (const r of rows) {
           const key = getKey(r as Record<string, unknown>)
-          if (!syncedHas(key)) write({ type: "insert", value: r })
+          if (!syncedHas(key) && !written.has(key)) write({ type: "insert", value: r })
+          written.add(key)
           if (w && w.gen === gen && watches.has(w)) hold(key, w)
         }
         const receipt = flush()

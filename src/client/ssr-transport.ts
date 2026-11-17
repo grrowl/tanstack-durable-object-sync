@@ -83,12 +83,18 @@ export class SsrSnapshotTransport<Api = unknown> implements Transport<Api> {
     limit?: number,
     _since?: string,
   ): Promise<void> {
-    const { rows, cursor } = await this.opts.read({ collection, where: plain(where), orderBy: plain(orderBy), limit })
-    const c = BigInt(cursor)
-    this.cursor = this.cursor === null || c < this.cursor ? c : this.cursor
+    const rows = await this.read(collection, where, orderBy, limit)
     // Key is derived by the adapter via getKey(row); snap keys are advisory.
     for (const row of rows) handler.onSnap(undefined, row)
     handler.onSnapEnd()
+  }
+
+  /** One snapshot read; its position joins the render's MIN cursor. */
+  private async read(collection: string, where: unknown, orderBy: unknown, limit?: number) {
+    const { rows, cursor } = await this.opts.read({ collection, where: plain(where), orderBy: plain(orderBy), limit })
+    const c = BigInt(cursor)
+    this.cursor = this.cursor === null || c < this.cursor ? c : this.cursor
+    return rows
   }
 
   unsubscribe(): void {
@@ -99,8 +105,25 @@ export class SsrSnapshotTransport<Api = unknown> implements Transport<Api> {
     return Promise.reject(new SsrReadOnlyError("mutation"))
   }
 
-  fetch(_frame: Extract<ClientFrame, { t: "fetch" }>): Promise<Array<unknown>> {
-    return Promise.reject(new SsrReadOnlyError("cursor fetch"))
+  /** A render refuses writes, never reads (ADR-0011 amendment 2026-11-17).
+   *  A fetch without a cursor (a covered on-demand request, ADR-0023 D2) is the
+   *  same where/orderBy/limit read a subscribe makes. A fetch with a cursor is
+   *  the server's two reads (ADR-0003): the boundary ties, unbounded, then the
+   *  next page, bounded. Here they are two reads at two positions; a render has
+   *  no delta stream to slot them into, and both join the MIN cursor, so the
+   *  hydration catch-up replays whatever changed between them. A row in both
+   *  is written once (installPage). */
+  async fetch(frame: Extract<ClientFrame, { t: "fetch" }>): Promise<Array<unknown>> {
+    const { collection, where, cursor, orderBy, limit } = frame
+    if (cursor == null) return this.read(collection, where, orderBy, limit)
+    // As the server: without both halves the ties read would be an unbounded scan.
+    if (cursor.whereCurrent == null || cursor.whereFrom == null) {
+      throw new Error(`fetch on '${collection}' rejected during SSR: malformed cursor`)
+    }
+    const and = (a: unknown, b: unknown): unknown => (a == null ? b : { type: "func", name: "and", args: [plain(a), plain(b)] })
+    const ties = await this.read(collection, and(where, cursor.whereCurrent), orderBy)
+    const page = await this.read(collection, and(where, cursor.whereFrom), orderBy, limit)
+    return [...ties, ...page]
   }
 
   seedCursor(): void {

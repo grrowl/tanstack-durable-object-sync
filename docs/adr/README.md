@@ -10,7 +10,7 @@ explains the displacement.
 | [0000](./0000-record-architecture-decisions.md) | Record architecture decisions | Accepted |
 | [0001](./0001-sync-architecture.md) | Sync architecture: single-ordered-stream over a Durable Object | Accepted (amended by 0002; D11 builder superseded by 0014; D13 base class reframed as a mixin by 0015; D8 on-demand subset model superseded by 0023) |
 | [0002](./0002-adversarial-review-corrections.md) | Corrections from adversarial review: ordering, shaping, retention | Accepted (C5 retention refined by 0009; the upstream behaviour C2 verified changed in db 0.12, see 0028) |
-| [0003](./0003-atomic-cursor-fetch.md) | Cursor load-more is one atomic fetch, not two | Accepted (naming amended by 0005) |
+| [0003](./0003-atomic-cursor-fetch.md) | Cursor load-more is one atomic fetch, not two | Accepted (naming amended by 0005; insert-if-absent also inside one page, 2026-11-17) |
 | [0004](./0004-after-commit-hook.md) | Side effects go in a fire-and-forget `afterCommit`, not the transaction | Accepted |
 | [0005](./0005-fetch-frame-mirrors-loadsubsetoptions.md) | The cursor `fetch` frame mirrors TanStack's `LoadSubsetOptions` | Accepted |
 | [0006](./0006-server-originated-writes.md) | Server-originated writes: `runSyncedWrite` | Accepted (init caveat retired by 0007) |
@@ -18,7 +18,7 @@ explains the displacement.
 | [0008](./0008-orphaned-cdc-triggers.md) | Orphaned CDC triggers when a collection is removed | Accepted |
 | [0009](./0009-changelog-time-retention.md) | Changelog time-based retention; reset stale reconnects | Accepted |
 | [0010](./0010-typed-mutations-collection-manifest.md) | Typed mutations via a collection-row manifest on `SyncRegistry` | Accepted (manifest superseded by 0014) |
-| [0011](./0011-ssr-dehydrate-hydrate.md) | SSR: dehydrate on the worker, hydrate to the cursor | Accepted (experimental; generalizes 0002 C1 → C1′; amended for merged upstream + 0015/0016 lift; D5 peer floor superseded by 0022) |
+| [0011](./0011-ssr-dehydrate-hydrate.md) | SSR: dehydrate on the worker, hydrate to the cursor | Accepted (experimental; generalizes 0002 C1 → C1′; amended for merged upstream + 0015/0016 lift; D5 peer floor superseded by 0022; amended 2026-11-17: a render refuses writes, never reads) |
 | [0012](./0012-wire-input-hardening.md) | Wire-input hardening: frame-shape guards, inbound limits, sanitized execute errors | Accepted (D1 amended by 0025 for op keys; D2 limit order amended by 0025; D4 accepted as a limitation, both effects named, 2026-11-17; amended 2026-11-17: a deliberate refusal is always answered and leaves nothing registered) |
 | [0013](./0013-predicate-floor-one-evaluator.md) | Filtered-subscription membership: one evaluator is the source of truth; the floor is the verified-agreeing set | Accepted (amended 2026-09-29: `isNull`/`isUndefined`; amended 2026-11-17: long `in` lists, `in` compares by kind, SQLite limits refused at compile time) |
 | [0014](./0014-object-sync-schema.md) | `defineSync`: one schema value, mutations on the collection, commands on the connection | Accepted (supersedes 0001 D11 builder; closes 0010 manifest) |
