@@ -141,12 +141,23 @@ export class ConnectionLostError extends Error {
 }
 
 /** Reconnect delay policy (ADR-0016). Called once per reconnect attempt with
- *  the 1-based attempt number (reset to 1 after each successful open) and,
+ *  the 1-based attempt number (back to 1 only after a connection has stayed
+ *  open 5 s, or after a terminal stop or close()) and,
  *  when the drop came from a socket close, that close's code/reason (a failed
  *  `open()` has no close frame, so both are undefined). Return the delay in ms
  *  before the next attempt, or `null` to stop reconnecting (terminal — the
  *  transport surfaces it via `onClosed`). */
 export type ReconnectDelayFn = (attempt: number, closeCode?: number, closeReason?: string) => number | null
+
+/** How long a connection must stay open before its loss resets the attempt
+ *  counter (ADR-0016 §3, amendment 2026-11-17). A successful open is not proof
+ *  of health: a server that accepts and then closes would otherwise hold every
+ *  client at attempt 1 forever. The faults this guards against close within
+ *  the first round trips; 5 s is the default confirmation timeout, so a socket
+ *  that outlived it got past the work it was sent at open. Kept apart from
+ *  `timeoutMs`, which apps tune for other reasons. Compared when the socket
+ *  goes away: no timer. */
+const HEALTHY_OPEN_MS = 5_000
 
 /** The default reconnect policy: capped exponential backoff with full jitter —
  *  a uniform delay in [0, min(cap, base·2^(attempt−1))], cap 30 s (never below
@@ -273,9 +284,12 @@ export class WebSocketTransport<Api = unknown> {
   private reconnecting = false
   private readonly reconnectDelay: ReconnectDelayFn
   private readonly onClosed?: (code: number | undefined, reason: string | undefined) => void
-  /** Consecutive reconnect attempts since the last successful open; the
-   *  1-based value passed to the policy. */
+  /** Consecutive reconnect attempts since the last connection that stayed
+   *  open `HEALTHY_OPEN_MS`, or since a terminal stop or close(); the 1-based
+   *  value passed to the policy. */
   private reconnectAttempt = 0
+  /** When the current socket was installed; judged by `resetBackoffIfHealthy`. */
+  private wsOpenedAt = 0
   /** The one pending reconnect timer, so a successful open, a terminal stop,
    *  or close() can cancel it — a stale timer from an earlier transient drop
    *  must never fire a further attempt after any of those. */
@@ -372,6 +386,8 @@ export class WebSocketTransport<Api = unknown> {
    *  into the normal policy-driven retry via connect()'s failure path. */
   private forceReconnect(): void {
     const old = this.ws
+    // The abandoned socket never reaches the close handler, so judge it here.
+    if (old) this.resetBackoffIfHealthy()
     this.ws = null // the identity guards now ignore the old socket entirely
     this.connectPromise = null
     try {
@@ -456,6 +472,7 @@ export class WebSocketTransport<Api = unknown> {
         this.ws = null
         this.connectPromise = null
         if (this.intentionallyClosed) return // close() owns pendingTx teardown
+        this.resetBackoffIfHealthy()
         // Auto-reconnect on an unexpected drop while subscriptions are active.
         if (this.handlers.size > 0) {
           // Hold in-flight mut/call for dedup replay on reconnect (issue #39)
@@ -470,10 +487,10 @@ export class WebSocketTransport<Api = unknown> {
         }
       })
       this.ws = ws
-      // A successful open resets the backoff: a later blip starts from the
-      // policy's first-attempt delay again, not the accumulated one. It also
-      // supersedes any pending timer (a demand-driven connect beat it).
-      this.reconnectAttempt = 0
+      this.wsOpenedAt = Date.now()
+      // A successful open supersedes any pending timer (a demand-driven connect
+      // beat it). It does NOT reset the backoff: resetBackoffIfHealthy does,
+      // when this socket goes away after proving healthy (ADR-0016 §3).
       this.clearReconnectTimer()
       // On a reconnect, re-establish every subscription from our single applied
       // cursor so the server serves a windowed catch-up rather than a snapshot.
@@ -524,6 +541,9 @@ export class WebSocketTransport<Api = unknown> {
       // accept-then-close auth rejection): retrying cannot help — surface the
       // close to the app instead of looping against the DO.
       this.onClosed?.(closeCode, closeReason)
+      // This run of retries is over. An app-driven connect() (e.g. after
+      // re-auth) starts a new one with the policy's full budget.
+      this.reconnectAttempt = 0
       // No reconnect will ever replay these — settle in-flight mut/call typed now
       // rather than let the parked timer wait out timeoutMs (issue #39).
       this.failPendingConnectionLost()
@@ -535,6 +555,14 @@ export class WebSocketTransport<Api = unknown> {
         /* next attempt retries via the connect-failure path above */
       })
     }, delay)
+  }
+
+  /** Only a connection that stayed open `HEALTHY_OPEN_MS` resets the backoff
+   *  (ADR-0016 §3, amendment 2026-11-17). Called when the current socket goes
+   *  away unexpectedly, with or without subscriptions; one that went young
+   *  leaves the count as it is, however far it got. */
+  private resetBackoffIfHealthy(): void {
+    if (Date.now() - this.wsOpenedAt >= HEALTHY_OPEN_MS) this.reconnectAttempt = 0
   }
 
   private clearReconnectTimer(): void {
@@ -635,6 +663,7 @@ export class WebSocketTransport<Api = unknown> {
     this.openAbort?.abort()
     this.openAbort = null
     this.clearReconnectTimer()
+    this.reconnectAttempt = 0 // a revived transport starts a new run of retries
     for (const w of this.seqWaiters.splice(0)) {
       clearTimeout(w.timer)
       w.reject(new Error("transport closed"))

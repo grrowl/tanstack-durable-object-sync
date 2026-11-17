@@ -10,6 +10,12 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ### Changed
 
+- **The examples run on `@tanstack/db` and `@tanstack/react-db` 1.0.0-rc.1.5.**
+  The ssr example also moves `@tanstack/react-router-with-db` to
+  `^1.0.0-rc.1`, because 0.1.0 cannot be installed beside the release
+  candidate. No example source changed. On 1.0, if the first WebSocket dial of
+  chat or multi-do fails, the page must be reloaded. On 0.9 it recovered by
+  itself (ADR-0024 amendment, ADR-0028 D2).
 - **BREAKING (raw clients only):** the server rejects an insert or update
   whose `cols` carry the primary key with a value different from the op
   `key`, answering with a `VALIDATION` rejection before `authorize` runs.
@@ -20,6 +26,19 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ### Fixed
 
+- **The reconnect backoff now grows when connections keep closing soon after
+  they open.** Before, every successful open reset the attempt counter, so a
+  server that accepted a socket and then closed it held each client at the
+  first-attempt delay (0 to 250 ms by default), and the client resent every
+  subscription several times a second for as long as the cause lasted. Now the
+  counter resets only when a connection that stayed open at least 5 s goes
+  away, and after a terminal stop or `close()`. A link whose sockets live
+  longer than 5 s is not affected. A link that drops sockets younger than 5 s
+  now backs off to the cap, like a broken server. A custom `reconnectDelay`
+  policy keeps its signature, but its attempt number now also counts every
+  socket that went away within 5 s of opening, not only failed dials, so a
+  policy that gives up after N attempts can give up on such a link (ADR-0016
+  §3, amendment 2026-11-17).
 - **A subclass `tickMs` override now takes effect.** The coalescer read the
   tick before subclass fields were set, so it always used 50 ms (ADR-0015
   amendment).
@@ -80,6 +99,13 @@ While pre-1.0, the public API may change between 0.x releases.
   D17 is qualified to match.
 - ADR-0012 D3 points to ADR-0014, which changed how `handleCall` sanitizes
   authorize errors.
+- Two accepted limitations are now documented in the README and in dated ADR
+  amendments. The server orders text by bytes, so a limited query ordered by
+  a text column should set `stringSort: "lexical"` (ADR-0023). Dedup is keyed
+  by `txId` alone, so inside one Durable Object a `txId` works like a
+  password: a connection that presents another's `txId` gets its stored reply,
+  and one that uses it first makes the owner's write answer `committed`
+  without running (ADR-0012 D4).
 
 ## [0.7.1] — 2026-11-17
 
