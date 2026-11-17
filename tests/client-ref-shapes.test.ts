@@ -366,6 +366,27 @@ describe("a rewritten request is shared and released", () => {
     t.close()
   })
 
+  it("a cursor request under a watch that holds its whole where sends nothing", async () => {
+    // Indexed, so growing the window makes core ask for more with a cursor (0.9 and
+    // later; 0.8.6 sends none for this shape). The watch was opened with no limit
+    // and holds every row, so there is nothing to fetch.
+    const r = `refcursor-${crypto.randomUUID()}`
+    await seed(r)
+    const wire: Array<Record<string, unknown>> = []
+    const asked: Array<string> = []
+    const t = transportFor(r, wire)
+    const lq = createLiveQueryCollection({ startSync: true, query: nested("asc")(onDemand(t, "messages", asked, (m) => m.body.length)) })
+    const local = await oracle(r, nested("asc") as Build)
+    await lq.preload()
+    await setWindow(local, 4)
+    await setWindow(lq, 4)
+    await waitFor(() => rowsOf(lq) === rowsOf(local))
+    await sleep(50)
+    expect(asked.some((a) => a.includes(" cursor "))).toBe(!db08)
+    expect(wire.filter((f) => f.t === "sub" || f.t === "fetch").map((f) => f.t)).toEqual(["sub"])
+    t.close()
+  })
+
   it("two such queries with different orders share one sub and send nothing else, and releasing both empties everything", async () => {
     const r = `refshare-${crypto.randomUUID()}`
     await seed(r)
