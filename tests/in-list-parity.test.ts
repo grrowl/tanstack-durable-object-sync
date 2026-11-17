@@ -11,9 +11,10 @@ import type { ClientFrame, ServerFrame } from "../src/wire/frames.ts"
 // per value (Durable Object SQLite allows 100 per statement), so `in` compiles
 // to a different SQL form; this pins that the form agrees with the evaluator
 // for every kind of value the floor admits in a list, at sizes below, at, above
-// the limit and at a few thousand, against columns of every affinity — and
-// that the kinds it does not admit are refused rather than silently diverging.
-// (ADR-0013 amendment 2026-11-17.)
+// the limit and at a few thousand, against columns of every affinity. A value
+// that can equal nothing a stored row holds (a boolean, a bigint, bytes, an
+// object) is dropped, and a Date matches by its time value, as the evaluator
+// compares it. (ADR-0013 amendment 2026-11-17.)
 
 const ref = (col: string): unknown => ({ type: "ref", path: [col] })
 const val = (value: unknown): unknown => ({ type: "val", value })
@@ -44,6 +45,11 @@ const LISTS: Record<string, Array<unknown>> = {
   "infinities": [Infinity, -Infinity],
   "only null": [null],
   "null, undefined and NaN beside values": [null, "a", undefined, NaN, 5],
+  "only NaN": [NaN],
+  "kinds no row holds, beside values": [true, false, 10n, 5n, new Uint8Array([1]), { a: 1 }, [1], ["a"], "a", 5],
+  "only kinds no row holds": [true, 1n, new Uint8Array([1]), {}],
+  "Dates": [new Date(5), new Date(-7), new Date(1.5)],
+  "an invalid Date beside values": [new Date(NaN), "a", new Date(0)],
   "mixed kinds": [1, "1", "abc", 1.5, 5],
   "99 strings": [...strings(97), "a", "1"],
   "100 strings": [...strings(98), "a", "1"],
@@ -129,31 +135,43 @@ describe("`in` membership: compiled SQL agrees with the evaluator", () => {
   })
 })
 
-describe("`in` list values the floor does not admit are refused", () => {
-  // SQLite has no boolean, bigint or date, and a server row never holds a
-  // Uint8Array (BLOBs hydrate as ArrayBuffer), so no SQL form can agree with
-  // the evaluator on these. They used to bind as text ('true', a Date's
-  // toString()), a blob, or throw (bigint).
-  for (const [label, item] of [
-    ["boolean", true],
-    ["bigint", 10n],
-    ["Date", new Date(5)],
-    ["Uint8Array", new Uint8Array([1])],
-    ["object", { a: 1 }],
-    ["array", [1]],
-  ] as const) {
-    it(`${label}`, () => {
-      expect(() => compileSubsetQuery("m", { pk: "id", where: fn("in", ref("id"), val(["a", item])) })).toThrow(
-        UnsupportedPredicateError,
-      )
-    })
-  }
-
+describe("`in` lists the compiler still refuses", () => {
   // Non-integer numbers bind one parameter each (JSON text does not carry
   // every double exactly), so a statement with more than 100 of them is refused.
   it("more than 100 non-integer numbers in one statement", () => {
     const where = fn("in", ref("n"), val(Array.from({ length: 101 }, (_, i) => i + 0.5)))
     expect(() => compileSubsetQuery("m", { pk: "id", where })).toThrow(UnsupportedPredicateError)
+  })
+})
+
+describe("`in` keeps the pk index", () => {
+  // One OR term per kind lets SQLite search the pk index for each (MULTI-INDEX
+  // OR). A single term that mixed kinds made it scan the table.
+  it("for every mix of kinds", async () => {
+    const stub = env.TEST_DO.get(env.TEST_DO.idFromName(`ilp-${crypto.randomUUID()}`))
+    const plans = await runInDurableObject(stub, (_i, s) => {
+      const sql = s.storage.sql
+      sql.exec("CREATE TABLE m (id TEXT PRIMARY KEY, body TEXT)")
+      const lists: Record<string, Array<unknown>> = {
+        strings: ["a", "b"],
+        integers: [1, 2],
+        "non-integers": [1.5],
+        "strings and integers": ["a", 1],
+        "all three": ["a", 1, 1.5],
+      }
+      return Object.entries(lists).map(([label, list]) => {
+        const q = compileSubsetQuery("m", { pk: "id", where: fn("in", ref("id"), val(list)) })
+        const plan = Array.from(sql.exec(`EXPLAIN QUERY PLAN ${q.sql}`, ...q.params)).map((r) => String(r.detail))
+        return `${label}: ${plan.some((d) => /^SCAN m\b/.test(d)) ? "scans m" : "uses the index"}`
+      })
+    })
+    expect(plans).toEqual([
+      "strings: uses the index",
+      "integers: uses the index",
+      "non-integers: uses the index",
+      "strings and integers: uses the index",
+      "all three: uses the index",
+    ])
   })
 })
 

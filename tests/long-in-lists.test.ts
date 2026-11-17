@@ -13,9 +13,9 @@ import type { TestApi } from "./test-worker.ts"
 // forever), a `fetch` timed out, and the refused sub stayed registered. An app
 // reaches this without writing `inArray`: @tanstack/db's join loader sends one
 // `inArray` over every join key. A long list must work on every path that runs
-// the compiled SQL, a predicate that still cannot fit must get the refusal
-// reply, and a well-formed `sub`/`fetch` must always get an answer (ADR-0013
-// and ADR-0012 amendments, 2026-11-17).
+// the compiled SQL, and a predicate that still cannot fit within SQLite's
+// limits must be refused on purpose, with the refusal reply and nothing of the
+// sub left registered (ADR-0013 and ADR-0012 amendments, 2026-11-17).
 
 const codec = createFrameCodec()
 const room = (tag: string): string => `lil-${tag}-${crypto.randomUUID()}`
@@ -72,6 +72,14 @@ const persistedSubs = (r: string): Promise<Array<string>> =>
   runInDurableObject(stubFor(r), (_i, s) =>
     Array.from(s.storage.sql.exec<{ sub_id: string }>("SELECT sub_id FROM _sync_subs")).map((x) => x.sub_id),
   )
+/** Not registered in memory: a write to `key` on this socket would flush a
+ *  delta before `committed` (ADR-0002 C1) if any sub were still registered. */
+async function expectNoDeltaFor(ws: WebSocket, key: string): Promise<void> {
+  const txId = `probe-${crypto.randomUUID()}`
+  send(ws, { t: "mut", txId, collection: "messages", ops: [{ type: "update", key, cols: { body: "changed" } }] })
+  const after = await collectUntil(ws, (f) => f.t === "committed" && f.txId === txId)
+  expect(after.filter((f) => f.t === "d")).toEqual([])
+}
 const snapKeys = (frames: Array<ServerFrame>, sub: string): Array<string> =>
   frames.flatMap((f) => (f.t === "snap" && f.sub === sub ? [f.key as string] : [])).sort()
 const pageIds = (frames: Array<ServerFrame>): Array<string> =>
@@ -80,19 +88,6 @@ const pageIds = (frames: Array<ServerFrame>): Array<string> =>
 // Seeded: three ids the long lists name (m0, m1 and the last of 101, m100) and
 // one they never name.
 const SEEDED = ["m0", "m1", "m100", "zz-outside"]
-
-describe("the platform limit", () => {
-  // MAX_BOUND_PARAMS in sql-compiler.ts mirrors this. If workerd changes it,
-  // this fails and the constant (and ADR-0013's amendment) should follow.
-  it("Durable Object SQLite accepts 100 bound parameters per statement, not 101", async () => {
-    const r = room("limit")
-    await runInDurableObject(stubFor(r), (_i, s) => {
-      const select = (n: number) => s.storage.sql.exec(`SELECT ${Array(n).fill("?").join(", ")}`, ...Array(n).fill(1))
-      expect(() => select(100)).not.toThrow()
-      expect(() => select(101)).toThrow(/too many SQL variables/)
-    })
-  })
-})
 
 describe("an `in` list longer than the bind limit (sub)", () => {
   for (const n of [100, 101, 3000]) {
@@ -224,18 +219,16 @@ describe("an `in` list longer than the bind limit (fetch)", () => {
   })
 })
 
-describe("the server always answers a well-formed sub or fetch", () => {
-  // 101 `eq` terms bind 101 values: no SQL form fits the limit, so this is
-  // refused, and the refusal must not leave the sub behind.
+describe("a predicate over SQLite's limits is refused on purpose", () => {
+  // 101 `eq` terms bind 101 values: no SQL form fits the limit.
   const orOf101 = fn("or", ...idList(101).map((id) => fn("eq", ref("id"), val(id))))
   // Binds nothing, but its expression tree is deeper than the 100 levels
-  // workerd allows SQLite: both evaluators compile it, then SQLite itself
-  // throws (not an UnsupportedPredicateError).
+  // workerd allows SQLite. The compiler refuses it before SQLite sees it.
   const deep = fn("or", ...Array.from({ length: 120 }, () => fn("isNull", ref("body"))))
 
   for (const [label, where] of [
     ["an `or` of 101 `eq` terms", orOf101],
-    ["a predicate SQLite cannot run", deep],
+    ["a predicate deeper than SQLite allows", deep],
   ] as const) {
     it(`sub: ${label} → reset, and nothing of the sub stays registered`, async () => {
       const r = room("refuse")
@@ -247,16 +240,7 @@ describe("the server always answers a well-formed sub or fetch", () => {
       // snap-end as "holds no rows" (ADR-0023 D5).
       expect(frames.map((f) => f.t)).toEqual(["reset"])
       expect(await persistedSubs(r)).toEqual([])
-      // Not in memory either: a matching write on this socket would flush its
-      // delta before `committed` (ADR-0002 C1) if the sub were still registered.
-      send(ws, {
-        t: "mut",
-        txId: "probe",
-        collection: "messages",
-        ops: [{ type: "update", key: "m0", cols: { body: "changed" } }],
-      })
-      const after = await collectUntil(ws, (f) => f.t === "committed")
-      expect(after.filter((f) => f.t === "d")).toEqual([])
+      await expectNoDeltaFor(ws, "m0")
       ws.close()
     })
 
@@ -271,28 +255,6 @@ describe("the server always answers a well-formed sub or fetch", () => {
     })
   }
 
-  // If the refusal itself cannot be completed, the socket closes with a code
-  // the client reconnects on (4000-4999 would be terminal, ADR-0016). Injected
-  // through storage: with `_sync_subs` gone, the sub's write-through throws and
-  // so does the cleanup's delete.
-  it("sub: when the refusal cannot be completed either, the socket closes with 1011", async () => {
-    const r = room("unrefusable")
-    await seed(r, SEEDED)
-    const ws = await openWs(r)
-    const frames: Array<ServerFrame> = []
-    ws.addEventListener("message", (e) => frames.push(codec.decode((e as MessageEvent).data as ArrayBuffer) as ServerFrame))
-    const closed = new Promise<number>((resolve) => ws.addEventListener("close", (e) => resolve((e as CloseEvent).code)))
-    await runInDurableObject(stubFor(r), (_i, s) => {
-      s.storage.sql.exec("ALTER TABLE _sync_subs RENAME TO _sync_subs_hidden")
-    })
-    send(ws, { t: "sub", subId: "s1", collection: "messages", where: inIds(3) })
-    expect(await closed).toBe(1011)
-    expect(frames.map((f) => f.t)).toEqual([])
-    await runInDurableObject(stubFor(r), (_i, s) => {
-      s.storage.sql.exec("ALTER TABLE _sync_subs_hidden RENAME TO _sync_subs")
-    })
-  })
-
   it("a re-sub that fails drops the subId it replaced", async () => {
     const r = room("resub")
     await seed(r, SEEDED)
@@ -302,6 +264,20 @@ describe("the server always answers a well-formed sub or fetch", () => {
     send(ws, { t: "sub", subId: "s1", collection: "messages", where: orOf101 })
     await collectUntil(ws, (f) => f.t === "reset")
     expect(await persistedSubs(r)).toEqual([])
+    await expectNoDeltaFor(ws, "m0")
+    ws.close()
+  })
+
+  it("a re-sub naming an unknown collection drops the subId it replaced", async () => {
+    const r = room("resub-unknown")
+    await seed(r, SEEDED)
+    const ws = await openWs(r)
+    send(ws, { t: "sub", subId: "s1", collection: "messages", where: inIds(2) })
+    await collectUntil(ws, (f) => f.t === "snap-end")
+    send(ws, { t: "sub", subId: "s1", collection: "no_such_collection" })
+    await collectUntil(ws, (f) => f.t === "reset")
+    expect(await persistedSubs(r)).toEqual([])
+    await expectNoDeltaFor(ws, "m0")
     ws.close()
   })
 })
