@@ -321,11 +321,15 @@ function orderByTerm(item: unknown, names: Set<string>): { col: string; desc: bo
     names.add(o.col)
     return { col: `"${o.col}"`, desc: o.dir === "desc", nullsLast: false }
   }
-  throw new UnsupportedPredicateError(`unsupported orderBy clause: ${JSON.stringify(item)}`)
+  // A frame can carry a bigint (MessagePack decodes a 64 bit integer as one), which JSON.stringify throws on.
+  const shown = JSON.stringify(item, (_k, v: unknown) => (typeof v === "bigint" ? `${v}n` : v))
+  throw new UnsupportedPredicateError(`unsupported orderBy clause: ${shown}`)
 }
 
 function compileOrderBy(orderBy: unknown, pk: string, names: Set<string>): string {
-  if (!Array.isArray(orderBy) || orderBy.length === 0) return ""
+  if (orderBy == null) return ""
+  if (!Array.isArray(orderBy)) throw new UnsupportedPredicateError("orderBy must be an array of terms")
+  if (orderBy.length === 0) return ""
   if (!IDENT.test(pk)) throw new UnsupportedPredicateError(`invalid pk column: ${pk}`)
   if (orderBy.length + 1 > MAX_ORDER_BY_TERMS) {
     throw new UnsupportedPredicateError(`orderBy has ${orderBy.length} terms; Durable Object SQLite allows ${MAX_ORDER_BY_TERMS - 1} beside the pk`)

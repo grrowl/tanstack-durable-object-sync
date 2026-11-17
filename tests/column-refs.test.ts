@@ -106,16 +106,23 @@ const SHAPES: Array<{ name: string; cause: RegExp; where?: unknown; orderBy?: un
   { name: "orderBy, a nested path the client sends for a nested field", cause: /nested/, orderBy: by({ type: "ref", path: ["body", "x"] }), limit: 2 },
 ]
 
-// Frames that threw from the compiler instead of being refused, so a `sub` or a
-// `fetch` got no reply at all and stayed loading. Not column refs, but the same
+// Malformed frames the compiler did not refuse. Not column refs, but the same
 // parse: each is now refused with its cause, like the shapes above.
 const MALFORMED: typeof SHAPES = [
+  // These three threw from the compiler, so a `sub` or a `fetch` got no reply.
   { name: "an orderBy term that is null", cause: /orderBy clause/, orderBy: [null], limit: 2 },
   { name: "a function with no args", cause: /args/, where: { type: "func", name: "eq" } },
-  // `name in COMPARATORS` followed the prototype chain and wrote broken SQL.
+  // `JSON.stringify` in the message threw on the bigint (MessagePack decodes a
+  // 64 bit integer as one).
+  { name: "an orderBy term holding a bigint and no column", cause: /orderBy clause/, orderBy: [{ x: 10n }], limit: 2 },
+  // `name in COMPARATORS` followed the prototype chain and wrote broken SQL: a
+  // `fetch` got no reply (a `sub` got `reset` from the evaluator guard).
   { name: "a function named after an Object.prototype member", cause: /not supported/, where: fn("toString", ref("body"), val("b1")) },
-  // The compiler read `args[0]` and `args[1]`; the evaluator calls `args.map` and throws.
+  // The compiler read `args[0]` and `args[1]`, and the evaluator calls `args.map`
+  // and throws: a `fetch` returned rows (a `sub` got `reset` from the guard).
   { name: "a function whose args is not an array", cause: /args/, where: { type: "func", name: "eq", args: { 0: ref("body"), 1: val("b1"), length: 2 } } },
+  // Ignored without a word: with a limit, the first rows by rowid.
+  { name: "an orderBy that is not an array", cause: /orderBy must be an array/, orderBy: { expression: ref("body") }, limit: 2 },
 ]
 
 describe("a column reference the evaluator reads differently from SQL is refused", () => {
