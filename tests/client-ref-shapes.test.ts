@@ -366,7 +366,7 @@ describe("a rewritten request is shared and released", () => {
     t.close()
   })
 
-  it("two such queries with different orders share one sub, and releasing both empties everything", async () => {
+  it("two such queries with different orders share one sub and send nothing else, and releasing both empties everything", async () => {
     const r = `refshare-${crypto.randomUUID()}`
     await seed(r)
     const wire: Array<Record<string, unknown>> = []
@@ -377,7 +377,8 @@ describe("a rewritten request is shared and released", () => {
     await Promise.all([asc.preload(), desc.preload()])
     await waitFor(() => asc.size === 2 && desc.size === 2)
     await sleep(50)
-    expect(wire.filter((f) => f.t === "sub").length).toBe(1)
+    // Both are rewritten to the same request: one acquisition, one sub, no fetch.
+    expect(wire.filter((f) => f.t === "sub" || f.t === "fetch").map((f) => f.t)).toEqual(["sub"])
     await asc.cleanup()
     await sleep(50)
     expect(desc.size).toBe(2) // the other owner still holds the shared load
