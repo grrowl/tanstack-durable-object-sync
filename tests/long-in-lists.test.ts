@@ -225,10 +225,18 @@ describe("a predicate over SQLite's limits is refused on purpose", () => {
   // Binds nothing, but its expression tree is deeper than the 100 levels
   // workerd allows SQLite. The compiler refuses it before SQLite sees it.
   const deep = fn("or", ...Array.from({ length: 120 }, () => fn("isNull", ref("body"))))
+  // workerd cannot bind a bigint; the compiler refuses one as a comparison value.
+  const bigint = fn("eq", ref("id"), val(10n))
+  // Compiles within every limit (the Dates travel as one JSON list of numbers),
+  // but its stored form in `_sync_subs` (tagged values, about 48 bytes per
+  // Date) is over SQLite's value cap.
+  const storedTooBig = fn("in", ref("id"), val(Array.from({ length: 60_000 }, (_, i) => new Date(1_700_000_000_000 + i))))
 
   for (const [label, where] of [
     ["an `or` of 101 `eq` terms", orOf101],
     ["a predicate deeper than SQLite allows", deep],
+    ["a bigint comparison value", bigint],
+    ["a predicate too large to store", storedTooBig],
   ] as const) {
     it(`sub: ${label} → reset, and nothing of the sub stays registered`, async () => {
       const r = room("refuse")
@@ -254,6 +262,23 @@ describe("a predicate over SQLite's limits is refused on purpose", () => {
       ws.close()
     })
   }
+
+  // The backstop: an error SQLite gives for one of its limits, where the
+  // compiler's checks passed, is a refusal too. Here the predicate's stored
+  // form fits, but the `_sync_subs` row (a 600 KB subId beside it) does not.
+  it("sub: a statement SQLite still rejects for a limit → reset, and nothing stays registered", async () => {
+    const r = room("backstop")
+    await seed(r, SEEDED)
+    const ws = await openWs(r)
+    const subId = "s".repeat(600_000)
+    const where = fn("in", ref("id"), val(Array.from({ length: 40_000 }, (_, i) => new Date(1_700_000_000_000 + i))))
+    send(ws, { t: "sub", subId, collection: "messages", where })
+    const frames = await collectUntil(ws, (f) => f.t === "reset" || f.t === "snap-end")
+    expect(frames.map((f) => f.t)).toEqual(["reset"])
+    expect(await persistedSubs(r)).toEqual([])
+    await expectNoDeltaFor(ws, "m0")
+    ws.close()
+  })
 
   it("a re-sub that fails drops the subId it replaced", async () => {
     const r = room("resub")

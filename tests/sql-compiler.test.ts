@@ -47,9 +47,10 @@ describe("IR -> SQL compiler (M6)", () => {
   })
 
   it("refuses a query over 100 bound parameters (Durable Object SQLite's limit)", () => {
-    const or = (n: number) => fn("or", ...Array.from({ length: n }, (_, i) => fn("eq", ref("id"), val(`k${i}`))))
-    expect(compileSubsetQuery("t", { pk: "id", where: or(99), limit: 1 }).params).toHaveLength(100)
-    expect(() => compileSubsetQuery("t", { pk: "id", where: or(100), limit: 1 })).toThrow(UnsupportedPredicateError)
+    // Non-integer numbers bind one each; the list stays shallow.
+    const reals = (n: number) => fn("in", ref("n"), val(Array.from({ length: n }, (_, i) => i + 0.5)))
+    expect(compileSubsetQuery("t", { pk: "id", where: reals(99), limit: 1 }).params).toHaveLength(100)
+    expect(() => compileSubsetQuery("t", { pk: "id", where: reals(100), limit: 1 })).toThrow(UnsupportedPredicateError)
   })
 
   it("rejects operators outside the floor (ne, ilike, functions)", () => {
