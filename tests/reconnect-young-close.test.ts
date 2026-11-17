@@ -6,6 +6,7 @@ import {
   WebSocketTransport,
   type WebSocketLike,
 } from "../src/client/transport.ts"
+import { createFrameCodec } from "../src/wire/frame-codec.ts"
 
 // WHY (ADR-0016 §3, amendment 2026-11-17): the reconnect attempt counter used
 // to reset on every successful open. A server that accepts a socket and then
@@ -14,11 +15,11 @@ import {
 // attempt 1: a delay of 0 to 250 ms, forever, with every subscription resent
 // each time. The backoff must grow across connections that die young, and
 // reset only once a connection has proven healthy by staying open long enough.
-// When auto-reconnect ends (a terminal stop, close(), or the last
-// unsubscribe), the next run starts again at attempt 1.
+// When auto-reconnect ends (a terminal stop or close()), the next run starts
+// again at attempt 1.
 
 /** How long a connection must stay open to count as healthy (ADR-0016 §3). */
-const HEALTHY_OPEN_MS = 30_000
+const HEALTHY_OPEN_MS = 5_000
 
 async function waitFor(pred: () => boolean, timeoutMs = 3000): Promise<void> {
   const start = Date.now()
@@ -125,11 +126,13 @@ function makeFake(): Fake {
   }
 }
 
-/** A transport over fake sockets whose policy records each attempt number. */
+/** A transport over fake sockets whose policy records each attempt number.
+ *  Set `link.down` to make every open fail. */
 function fakeTransport(policy: (attempt: number, code?: number) => number | null) {
   const attempts: Array<number> = []
   const fakes: Array<Fake> = []
   const closed: Array<number | undefined> = []
+  const link = { down: false }
   const t = new WebSocketTransport({
     url: "wss://fake-young-close",
     reconnectDelay: (attempt, code) => {
@@ -138,6 +141,7 @@ function fakeTransport(policy: (attempt: number, code?: number) => number | null
     },
     onClosed: (code) => closed.push(code),
     open: async () => {
+      if (link.down) throw new Error("server unreachable")
       const f = makeFake()
       fakes.push(f)
       return f.ws
@@ -149,8 +153,10 @@ function fakeTransport(policy: (attempt: number, code?: number) => number | null
     fakes[n - 1]!.emit("close", { code })
     await waitFor(() => fakes.length === n + 1)
   }
-  return { t, attempts, fakes, closed, dropYoung }
+  return { t, attempts, fakes, closed, link, dropYoung }
 }
+
+const codec = createFrameCodec()
 
 describe("what proves a connection healthy (ADR-0016 §3)", () => {
   it("a connection that stayed open long enough, then drops once, retries at the first-attempt delay", async () => {
@@ -182,9 +188,9 @@ describe("what proves a connection healthy (ADR-0016 §3)", () => {
   })
 
   it("a connection one moment short of the threshold does not reset the backoff", async () => {
-    // Pins the threshold itself: a rule that resets a little earlier (say on
-    // the first frame, or after a few seconds) lets a server that closes later
-    // than that loop at the first-attempt delay.
+    // Pins the threshold from below; the test above pins it from above. A rule
+    // that resets earlier (say on the first frame) lets a server that closes
+    // a little later than that loop at the first-attempt delay.
     const { t, attempts, fakes, dropYoung } = fakeTransport(() => 1)
     await t.subscribe("s1", "messages", noopHandler())
     await dropYoung()
@@ -231,22 +237,85 @@ describe("the next run of auto-reconnect starts at attempt 1", () => {
     t.close()
   })
 
-  it("after the last unsubscribe ends a pending reconnect, the next subscribe starts from attempt 1", async () => {
-    const { t, attempts, fakes, dropYoung } = fakeTransport(() => 30)
+  it("a moment with zero subscriptions during an outage is not a new run", async () => {
+    // An on-demand app releases one live query and loads the next on each
+    // route change, so the subscription count passes through zero while the
+    // server is unreachable. Each new subscribe dials at once (a demand-driven
+    // connect) and fails. The count must keep growing: if the moment at zero
+    // reset it, ordinary navigation would erase the backoff, and a policy that
+    // gives up after N attempts would never give up while the user navigates.
+    const { t, attempts, fakes, link } = fakeTransport(() => 60_000)
+    await t.subscribe("q0", "messages", noopHandler())
+    link.down = true
+    fakes[0]!.emit("close", { code: 1006 })
+    for (let i = 1; i <= 3; i++) {
+      t.unsubscribe(`q${i - 1}`)
+      await t.subscribe(`q${i}`, "messages", noopHandler()).catch(() => {})
+    }
+    expect(attempts).toEqual([1, 2, 3, 4])
+    t.close()
+  })
+})
+
+describe("every way a socket goes away is judged the same", () => {
+  it("a healthy connection that closes with no subscriptions left still resets the count", async () => {
+    // The app left every view while connected, so the socket closed with zero
+    // subscriptions and nothing reconnected. It had worked for hours; the next
+    // session must not pay for the outage before it. With a policy that gives
+    // up at attempt 3, a stale count would make the next session's first young
+    // drop terminal.
+    const { t, attempts, fakes, closed, dropYoung } = fakeTransport((attempt) => (attempt >= 3 ? null : 1))
     await t.subscribe("s1", "messages", noopHandler())
     await dropYoung()
-    expect(attempts).toEqual([1])
-
-    // Drop again, and unsubscribe before the 30 ms timer fires: ADR-0016 does
-    // not reconnect for zero subscriptions, so this run of retries is over.
-    fakes[1]!.emit("close", { code: 1011 })
+    await dropYoung()
     expect(attempts).toEqual([1, 2])
-    t.unsubscribe("s1")
 
+    t.unsubscribe("s1") // connected: a plain unsub frame
+    ageOpenSocketsBy(3 * 3600_000)
+    fakes[2]!.emit("close", { code: 1006 }) // zero subscriptions, lived 3 h
     await t.subscribe("s2", "messages", noopHandler())
-    expect(fakes.length).toBe(3)
     await dropYoung()
     expect(attempts).toEqual([1, 2, 1])
+    expect(closed).toEqual([])
+    t.close()
+  })
+
+  it("a demand-driven open that beats the timer does not reset the count", async () => {
+    // A mutation or fetch in the reconnect window dials at once. If that open
+    // reset the count, an app that writes during a server loop would hold the
+    // count at 1: the original bug by another door.
+    const { t, attempts, fakes } = fakeTransport(() => 60_000)
+    await t.subscribe("s1", "messages", noopHandler())
+    fakes[0]!.emit("close", { code: 1011 }) // timer armed for 60 s
+    await t.connect() // the demand-driven dial wins
+    expect(fakes.length).toBe(2)
+    fakes[1]!.emit("close", { code: 1011 }) // young
+    expect(attempts).toEqual([1, 2])
+    t.close()
+  })
+
+  it("a cursor-regress reconnect judges the socket it abandons", async () => {
+    // seedCursor below the applied cursor abandons the live socket
+    // (forceReconnect). That socket never reaches the close handler, so it is
+    // judged where it is abandoned: a young one leaves the count alone, a
+    // healthy one resets it.
+    const { t, attempts, fakes, dropYoung } = fakeTransport(() => 1)
+    await t.subscribe("s1", "messages", noopHandler())
+    await dropYoung()
+    await dropYoung()
+    fakes[2]!.emit("message", { data: codec.encode({ t: "snap-end", sub: "s1", seq: "5" }) })
+    t.seedCursor("3") // young socket abandoned
+    await waitFor(() => fakes.length === 4)
+    await dropYoung()
+    expect(attempts).toEqual([1, 2, 3])
+
+    fakes[4]!.emit("message", { data: codec.encode({ t: "snap-end", sub: "s1", seq: "5" }) })
+    ageOpenSocketsBy(HEALTHY_OPEN_MS)
+    t.seedCursor("2") // healthy socket abandoned
+    await waitFor(() => fakes.length === 6)
+    fakes[5]!.emit("close", { code: 1011 })
+    await waitFor(() => fakes.length === 7)
+    expect(attempts).toEqual([1, 2, 3, 1])
     t.close()
   })
 })

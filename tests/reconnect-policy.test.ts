@@ -228,14 +228,17 @@ describe("reconnect attempt counter (drives the backoff)", () => {
     await waitFor(() => fakes.length === 3)
     expect(attempts).toEqual([1, 2, 3, 4])
 
-    // A drop after the connection stayed open 30 s starts over at attempt 1,
+    // A drop after the connection stayed open 5 s starts over at attempt 1,
     // otherwise a long-lived client would pay maximum backoff for every later
-    // blip. Shift the clock so the open socket looks 30 s old.
+    // blip. Shift the clock so the open socket looks 5 s old.
     const realNow = Date.now.bind(Date)
-    const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + 30_000)
-    fakes[2]!.emit("close", { code: 1006 })
-    await waitFor(() => fakes.length === 4)
-    clock.mockRestore()
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + 5_000)
+    try {
+      fakes[2]!.emit("close", { code: 1006 })
+      await waitFor(() => fakes.length === 4)
+    } finally {
+      clock.mockRestore()
+    }
     expect(attempts).toEqual([1, 2, 3, 4, 1])
     t.close()
   })
