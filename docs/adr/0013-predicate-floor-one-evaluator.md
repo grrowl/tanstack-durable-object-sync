@@ -438,13 +438,15 @@ version sends). After the frame codec no version sent `sourceAlias` or any field
 on a ref other than `type` and `path`. Most paths have one element. These do not:
 
 - every version sends a nested field as a longer path (`orderBy(m.meta.x)` sends
-  `["meta", "x"]`), in `orderBy`, in a cursor, and in the `where` of a tie
-  request;
+  `["meta", "x"]`), in `orderBy`, in a cursor, and in a `where`; on 0.9 and later
+  a limited query ordered by one also sends it in the `where` of its tie
+  request, on its first load;
 - 0.8.6 pushes an `orderBy` and its `limit` through a subquery or a join to the
   source collection, keeping the outer alias: a subquery `sub` with
   `select({ body: m.body })` ordered by `sub.body` sends `["sub", "body"]`; with
   `select({ title: m.body })` it sends `["sub", "title"]`; a join ordered by
-  `m.body` then `f.name` sends `["body"]` and `["f", "name"]` to `messages`
+  `m.body` then `f.name` (clauses on two of its collections) sends `["body"]`
+  and `["f", "name"]` to `messages`
   (0.8.6 `normalizeExpressionPaths` strips only the subscriber's own alias, and
   `processOrderBy` pushes the order to the source). 0.9.2 and 1.0.0-rc.1.5 load
   the whole source with no `orderBy` for these three.
@@ -464,12 +466,15 @@ one rule. Anything else is an `UnsupportedPredicateError`, so a `sub` gets
 and the log line name the cause, for example
 `a column reference carries only 'type' and 'path'; got 'sourceAlias'`.
 
-The on-demand adapter uses the same function: it does not send an `orderBy` the
-server would refuse, and loads the request's whole `where` subset instead
-(ADR-0023 amendment 2026-11-17). So the client queries above, which the server
-refuses, work on every version, at the cost of loading every row the `where`
-matches. A `where` on a nested field is still refused and still reads as no
-rows.
+The on-demand adapter uses the same function to send the tightest request the
+server can read that contains the one core asked for: it drops an `orderBy` the
+server would refuse, drops the conjuncts of a `where` that hold such a ref, and
+then asks for the whole readable `where` subset with no `limit` (ADR-0023
+amendment 2026-11-17). The client filters, sorts and cuts the rows it holds. So
+the client queries above, and a `where` on a nested field, never reach the
+server in a shape it refuses, and give the right rows on the socket and in a
+server render, at the cost of loading every row the readable `where` matches.
+A frame built by hand that carries such a ref is still refused.
 
 The shape is strict, not only "no `sourceAlias`", because a field the compiler
 does not read is a field the evaluator may read, in this release of
@@ -498,26 +503,36 @@ there), and its name is looked up in the operator table by own key only.
 The simple `{ col, dir }` orderBy shape is unchanged; the client never sends it,
 and tests use it.
 
-**Frames that threw.** Four frames threw from the compiler instead of being
-refused, so a `sub` or a `fetch` got no reply and stayed loading: an `orderBy`
-term of `null`, a `func` with no `args`, a `func` named after an
-`Object.prototype` member (`name in` the operator table followed the prototype
-chain and wrote broken SQL), and a `func` whose `args` is not an array. Each is
-now an `UnsupportedPredicateError`. The library's client sends none of them.
+**Malformed frames.** Six more frames the compiler did not refuse are now an
+`UnsupportedPredicateError`:
+
+- three threw from the compiler, so a `sub` or a `fetch` got no reply and stayed
+  loading: an `orderBy` term of `null`, a `func` with no `args`, and an `orderBy`
+  term that holds a bigint and no usable `expression` or `col` (`JSON.stringify`
+  in the error message threw; MessagePack decodes a 64 bit integer as a bigint);
+- a `func` named after an `Object.prototype` member: `name in` the operator table
+  followed the prototype chain and wrote broken SQL, so a `fetch` got no reply
+  and a `sub` got `reset` from the evaluator guard;
+- a `func` whose `args` is not an array: it compiled, and the evaluator calls
+  `args.map` and throws, so a `fetch` returned rows and a `sub` got `reset`;
+- an `orderBy` that is not an array: it was ignored without a word, and with a
+  `limit` returned the first rows by `rowid`.
+
+The library's client sends none of them.
 
 **Restore (ADR-0019).** A persisted `where` holding a ref of another shape now
 fails to compile on restore, so its socket closes with 1011, as for any refusal
 of a row written by an older build. An older build could only have persisted
 such a `where` from a hand built frame.
 
-**Evidence.** `tests/column-refs.test.ts` drives each shape above, and the four
-frames that threw, through a `sub` (checking that nothing is persisted), a
+**Evidence.** `tests/column-refs.test.ts` drives each shape above, and the six
+malformed frames, through a `sub` (checking that nothing is persisted), a
 `fetch` and `readSyncSnapshot` on a real Durable Object, checks that a cursor
 whose `whereCurrent` alone carries an aliased ref is refused, and checks that
 the client's shape still works in a `where`, an `orderBy` and a cursor.
 `tests/client-ref-shapes.test.ts` runs a fixed list of query shapes through the
-real adapter on each version, records the refs core asks for, checks that no
-refused ref reaches the wire, and pins that `columnRefProblem` is what the
+real adapter, on the socket and in a server render, records the refs core asks
+for per version line, checks that no refused ref reaches the wire or a read, and pins that `columnRefProblem` is what the
 compiler refuses in an `orderBy`. The tables that cannot be synced correctly,
 which the same review found, are refused at registration (ADR-0007 amendment
 2026-11-17).

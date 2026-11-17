@@ -160,10 +160,13 @@ That is the kind of fault the other `assertSyncCompatible` checks refuse.
   every wake, and it stores the registry only after every collection passes
   (`#registerSync` in `mixin.ts`). So the throw fails the whole object, not only
   that collection: every sync frame, mutation and `readSyncSnapshot` on it fails,
-  on every wake. An app with such a table must rename the column in a migration
-  that runs before `registerSync` in the constructor (`ALTER TABLE … RENAME
-  COLUMN` for a plain column; a generated column is dropped and added again
-  under another name), and deploy that migration with the upgrade.
+  on every wake. An app with such a table must rename the column with
+  `ALTER TABLE … RENAME COLUMN` in a migration that runs before `registerSync`
+  in the constructor, and deploy that migration with the upgrade. `RENAME COLUMN`
+  works for a plain column and for a generated one, virtual or stored, on a
+  table with rows. Dropping a stored generated column and adding it back does
+  not: SQLite refuses to add a STORED column to a table with rows, so the
+  migration would drop the column and then throw.
 - Like every check in `assertSyncCompatible`, these run in `registerSync`. A
   migration that adds such a column while the object is alive, with no
   `registerSync` after it, is caught only at the next `registerSync`, at the latest
@@ -174,5 +177,6 @@ That is the kind of fault the other `assertSyncCompatible` checks refuse.
 
 **Evidence.** `tests/assert-sync-compatible.test.ts` pins both refusals (virtual
 and stored `rowid`, plain and generated `__proto__`), what SQLite and workerd do
-that makes each table wrong, and that `constructor`, `toString` and
-`hasOwnProperty` are still accepted.
+that makes each table wrong, that `constructor`, `toString`, `hasOwnProperty`
+and `__PROTO__` are still accepted, and that `RENAME COLUMN` on each refused
+column, with rows, makes the table register.

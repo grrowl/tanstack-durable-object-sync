@@ -438,13 +438,15 @@ browser-verified.
 > Plane. See ADR-0023.
 
 > [!NOTE]
-> The server can only sort by a column of the table. When a limited on-demand
-> query orders by something else, the client loads **every row its `where`
-> matches** and sorts and cuts them itself, so the query is right but its
-> `limit` saves nothing. This happens for a nested field such as
-> `orderBy(({ m }) => m.title.length)` on every `@tanstack/db` version, and on
-> 0.8.x for an `orderBy` on a subquery's field or on a joined collection's
-> field. See ADR-0023.
+> The server can only sort by, and filter on, a column of the table. When an
+> on-demand query orders by or filters on something else, the client asks for
+> **every row the rest of its `where` matches** and filters, sorts and cuts them
+> itself. The query is right, on the socket and in a server render, but its
+> `limit` saves nothing, and a `where` with nothing else in it loads the whole
+> collection. This happens for a nested field such as `m.title.length`, in an
+> `orderBy` or a `where`, on every `@tanstack/db` version, and on 0.8.x for an
+> `orderBy` on a subquery's field, or one with clauses on two collections of a
+> join. See ADR-0023.
 
 ---
 
@@ -542,10 +544,17 @@ show. The conventions, what's verified and how, and the full
   refusals fail loud, the query reads as no results. Two names that used to
   return rows are refused too: a name in another letter case than the declared
   one (`BODY` for `body`), and `rowid`.
-- **A `where` on a nested field** (`eq(m.title.length, 3)`) is refused and reads
-  as no results: SQLite has no nested value to compare. An `orderBy` on one is not
-  refused, but it loads the whole `where` subset (see the note on ordering
-  above).
+- **A nested field in a query** (`eq(m.title.length, 3)`, or an `orderBy` on one)
+  loads every row the rest of the `where` matches, and the whole collection when
+  nothing else is left (see the note on ordering above). A frame built by hand
+  that sends one to the server is refused.
+- **One 0.8.x subquery orders by the wrong column.** On `@tanstack/db` 0.8.x, a
+  limited query over a subquery whose alias equals the inner alias, ordered by a
+  field the inner `select` renamed to the name of another column
+  (`select(({ f }) => ({ id: f.id, name: f.id }))`, then `orderBy(f.name)`), is
+  sent ordered by the table's own `name` column. The first window can be wrong,
+  with no error. Use another alias for the outer query. 0.9 and later are not
+  affected.
 
 ---
 
