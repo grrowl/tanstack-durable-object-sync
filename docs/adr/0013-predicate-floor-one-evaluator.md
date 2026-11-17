@@ -409,3 +409,90 @@ pins each half of a cursor `fetch` alone, and checks that nothing of a
 refused sub is registered or persisted, that the log line names the column and
 is clipped, that the pk and a column added after the first query (plain or
 generated) are accepted, and the restore after a column is dropped.
+
+## Amendment 2026-11-17: a column reference must have the one shape the client sends
+
+**Context.** The rule behind the previous amendment is that the SQL that builds
+a snapshot and the evaluator that decides the deltas must read the same column.
+The review of that change found two more ways a frame could break it, both in
+how the compiler read a ref. Both were measured in workerd 1.20260721.1 with hand
+built frames.
+
+1. In `where` the compiler read `path[0]` and ignored every other field of the
+   ref. The evaluator reads the whole ref. On 1.0.0-rc.1.5,
+   `compileSingleRowRef` (`query/compiler/evaluators.js`) reads the path through
+   `getPropRefPropertyPath` (`query/ir.js`), which drops the first element when it
+   equals `sourceAlias`. So `{ type: "ref", path: ["body"], sourceAlias: "body" }`
+   was `body` in SQL and the whole row in the evaluator: the snapshot sent the
+   matching row, and a later insert of a matching row sent a synthetic delete.
+   0.8.6 and 0.9.2 have no `sourceAlias` and walk `path` whole.
+2. In `orderBy` the compiler read the last element of the path, and in `where` it
+   required exactly one. An `orderBy` on `["nope", "body"]` sorted by `body`,
+   while the client's comparator reads `row.nope.body`, which is undefined, so it
+   orders by key. The last element rule came in with commit b7f4e2b, which gives
+   no reason for it.
+
+**What the client sends.** Measured on 0.8.6, 0.9.2 and 1.0.0-rc.1.5 by
+recording every frame a real `WebSocketTransport` sent, through
+`doCollectionOptions` in on-demand mode, for these live queries: an `orderBy`
+with a limit, with and without a `where` and with and without a `BTreeIndex`,
+then a window grown with `setWindow` over seeded rows (on 0.8.6 this sends cursor
+fetches); an `orderBy` on either side of a join; a subquery in `from`; a `select`
+before an `orderBy`; `inArray`; `findOne`; an `orderBy` on `upper(...)`; and a
+`where` and an `orderBy` on a nested field. After the frame codec, every ref in
+`where`, `orderBy` and `cursor` had exactly the own keys `type` and `path`, and
+every path had one element, except for the nested field, which sent
+`["meta", "x"]` in both `where` and `orderBy`. No version sent `sourceAlias`, and
+no path started with the query's alias.
+
+**Decision.** A ref is read only when it is exactly `{ type: "ref", path: [name] }`:
+no field other than `type` and `path`, a `path` that is an array of one element,
+and that element a string that passes the identifier check. `column()` in
+`sql-compiler.ts` checks this, and the expression of an `orderBy` term now goes
+through `column()` too, so `where`, `orderBy` and both halves of a cursor follow
+one rule. Anything else is an `UnsupportedPredicateError`, so a `sub` gets
+`reset`, a `fetch` gets the empty page, and `readSyncSnapshot` throws. The message
+and the log line name the cause, for example
+`a column reference carries only 'type' and 'path'; got 'sourceAlias'`.
+
+The shape is strict, not only "no `sourceAlias`", because a field the compiler
+does not read is a field the evaluator may read, in this release of
+@tanstack/db or a later one, and the server cannot tell which. A path that is not
+an array shows the same thing: the compiler read `path.length` and `path[0]`,
+while the evaluator iterates `path`, which throws for a plain object on 0.8.6
+and 0.9.2. A `val` node and a `func` node are not made strict: the evaluator
+reads only `value`, and `name` and `args`, on all three versions, as the compiler
+does.
+
+**What the rule refuses beyond the two examples.**
+
+- A ref with any other field: `sourceAlias` with any value, `bindingId`, or any
+  other key. On 1.0 `bindingId` is not enumerable, so the client never encodes it.
+- A path that is not an array, or whose one element is not a string. Before, an
+  element such as `["body"]` passed the identifier check by string conversion and
+  was refused only by the column check, with a misleading message.
+- An `orderBy` on a path of more than one element, including the nested field the
+  client does send (`orderBy(({ m }) => m.meta.x)`). A `where` on a nested field
+  was already refused. An `orderBy` on one was refused since the previous
+  amendment, unless the table had a column named like the last element of the
+  path, in which case it sorted by that column. The evaluator reads
+  `row.meta.x`, which SQL cannot sort by, so that order was never correct.
+- An `orderBy` expression that is not a ref (a function) is still refused, now
+  with `expected a column reference` instead of `unsupported orderBy clause`.
+
+Nothing else the client sends on 0.8.6, 0.9.2 or 1.0.0-rc.1.5 is refused: the
+whole suite passes on each. The simple `{ col, dir }` orderBy shape is unchanged;
+the client never sends it, and tests use it.
+
+**Restore (ADR-0019).** A persisted `where` holding a ref of another shape now
+fails to compile on restore, so its socket closes with 1011, as for any refusal
+of a row written by an older build. An older build could only have persisted
+such a `where` from a hand built frame.
+
+**Evidence.** `tests/column-refs.test.ts` drives each shape above through a
+`sub` (checking that nothing is persisted), a `fetch` and `readSyncSnapshot` on a
+real Durable Object, checks that a cursor whose `whereCurrent` alone carries an
+aliased ref is refused, and checks that the client's shape still works in a
+`where`, an `orderBy` and a cursor. The tables that cannot be synced correctly,
+which the same review found, are refused at registration (ADR-0007 amendment
+2026-11-17).
