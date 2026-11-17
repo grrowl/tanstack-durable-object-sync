@@ -6,6 +6,7 @@ import { doCollectionOptions } from "../src/client/do-collection.ts"
 import { WebSocketTransport, type WebSocketLike } from "../src/client/transport.ts"
 import { createFrameCodec } from "../src/wire/frame-codec.ts"
 import type { TestApi } from "./test-worker.ts"
+import { settled } from "./settled.ts"
 
 // WHY: realistic on-demand sessions, end to end (live queries → loadSubset →
 // real WebSocketTransport → real DO), pinning ADR-0023 fixes that were only
@@ -272,7 +273,7 @@ describe("a paged list: left mid-scroll, then back with a colliding create", () 
     gate.only = ["rejected"]
     gate.hold = true
     const tx = messages.insert({ id: "m10", body: "99-draft" })
-    tx.isPersisted.promise.catch(() => {})
+    settled(tx).catch(() => {})
     paged.clear() // win1's late page carried m10 too
     void grow(win2, 11).catch(() => {}) // six visible (draft + 20..16), so the page reaches "11"
     await waitFor(() => paged.has("m10"))
@@ -282,7 +283,7 @@ describe("a paged list: left mid-scroll, then back with a colliding create", () 
     // regression here with one extra round trip.
     gate.only = ["page"]
     for (const deliver of gate.queue.splice(0)) deliver() // rejected: the overlay rolls back
-    await expect(tx.isPersisted.promise).rejects.toThrow()
+    await expect(settled(tx)).rejects.toThrow()
     // bugbash C8 (overlay half): installPage writes insert-if-absent against
     // SYNCED state (`syncedHas`). Pre-fix it checked `collection.get`, which
     // sees the optimistic row, so the server row was skipped and was gone once
