@@ -138,6 +138,16 @@ describe("assertSyncCompatible (ADR-0007, D9) — real-table introspection", () 
     })
   })
 
+  it("accepts __PROTO__: the name is compared exactly, as a row's keys are", async () => {
+    await withSql((sql) => {
+      sql.exec("CREATE TABLE t (id TEXT PRIMARY KEY, __PROTO__ TEXT)")
+      sql.exec("INSERT INTO t VALUES ('a', 'x')")
+      const [a] = Array.from(sql.exec("SELECT * FROM t"))
+      expect(Object.keys(a!)).toEqual(["id", "__PROTO__"])
+      expect(() => assertSyncCompatible(sql, "t", "id")).not.toThrow()
+    })
+  })
+
   it("accepts columns named after other Object.prototype members", async () => {
     // Only `__proto__` is an accessor on a plain object; these are set as own keys.
     await withSql((sql) => {
