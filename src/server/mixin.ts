@@ -615,7 +615,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
             return (
               isNonEmptyString(f["subId"]) &&
               isNonEmptyString(f["collection"]) &&
-              (absent(f["since"]) || typeof f["since"] === "string") &&
+              (absent(f["since"]) || (typeof f["since"] === "string" && POSITION.test(f["since"]))) &&
               (absent(f["limit"]) || typeof f["limit"] === "number") &&
               (absent(f["offset"]) || typeof f["offset"] === "number")
             )
@@ -1155,10 +1155,15 @@ export function Syncable<Env = unknown, TUser = unknown>() {
         // still reaches back that far; otherwise fall back to reset + snapshot.
         //
         // The floor is `minChangeSeq` — no persisted watermark needed (ADR-0009).
+        // A `since` past the head was never given out by this object (its
+        // storage was reset, or the client is wrong), so it snapshots too
+        // (ADR-0012 amendment 2026-11-17). The guard bounds `since` to 19
+        // digits; `Number` is exact up to 2^53, and the server reads its own
+        // positions as numbers too, so the comparison is as exact as `seq`.
         const since = frame.since != null ? Number(frame.since) : 0
         if (since > 0) {
           const floor = minChangeSeq(this.#sql)
-          if (floor !== 0 && since >= floor - 1) {
+          if (floor !== 0 && since >= floor - 1 && since <= Number(seq)) {
             this.#emitCatchUp(ws, sub, coll, since, seq)
             return
           }
@@ -1315,3 +1320,9 @@ const LOG_CLIP_CHARS = 128
 function clip(s: string): string {
   return s.length <= LOG_CLIP_CHARS ? s : `${s.slice(0, LOG_CLIP_CHARS)}… [clipped, ${s.length} chars]`
 }
+
+/** A `since` is a position in its plain decimal form, as the client sends it:
+ *  no sign, no leading zero, at most 19 digits, the length of SQLite's largest
+ *  INTEGER (2^63 - 1). Anything else is a malformed frame (ADR-0012 amendment
+ *  2026-11-17). */
+const POSITION = /^(0|[1-9][0-9]{0,18})$/

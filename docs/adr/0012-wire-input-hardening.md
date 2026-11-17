@@ -242,3 +242,39 @@ literal and does not depend on list length.
 
 Pinned by `tests/long-in-lists.test.ts` ("a predicate over SQLite's limits is
 refused on purpose") and `tests/sqlite-limits.test.ts`.
+
+## Amendment 2026-11-17: `since` is a plain decimal position
+
+D1 checked only that a `sub`'s `since` was a string, and `#handleSub` read it
+with `Number()`. So `"1e400"` became `Infinity`, passed every comparison, and was
+answered `uptodate` at the current position: the client was told it was up to
+date and was sent nothing. `"abc"` became `NaN` and got a snapshot. A well formed
+`since` past the current position was also answered `uptodate`, although this
+object never gave out that position.
+
+**What `since` must look like.** A position is a SQLite INTEGER in
+`_sync_changes.seq`, so its largest value is 2^63 - 1, which has 19 digits. The
+library's client only ever sends a position back as the server wrote it
+(`String` of a number) or as `String` of a bigint, both of which give the plain
+decimal form. So D1 now requires `since`, when present, to match
+`^(0|[1-9][0-9]{0,18})$`: digits only, no sign, no leading zero, at most 19
+digits (`POSITION` in `src/server/mixin.ts`). Any other `since` makes the frame
+malformed, and D1 applies: it is dropped with a log line and no reply, and
+nothing of the sub is registered or stored.
+
+**What a value past the end gets.** The server reads its own positions as
+numbers (`currentSeq`, `minChangeSeq`), so it compares `since` as a number too.
+Up to 2^53 that is exact. A 19 digit value above that is not exact, but it is
+still above every position the server can hold as a number, so it compares
+correctly as past the end. A well formed `since` above the current position now
+falls through to `reset` and a snapshot, as a `since` below the log's floor
+already did. That position cannot have come from this object: its storage was
+reset, or the client is wrong. Either way the client must start again from a
+snapshot.
+
+**Breaking for raw clients only.** A raw client that sends any other spelling of
+a number (`"01"`, `"1.0"`, `"1e3"`, a space) now gets no reply for that `sub`.
+The library's client is unaffected; the whole suite passes on the locked
+`@tanstack/db` and on the floor.
+
+Pinned by `tests/since-shape.test.ts`.
