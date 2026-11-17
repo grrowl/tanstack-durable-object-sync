@@ -23,7 +23,7 @@ explains the displacement.
 | [0013](./0013-predicate-floor-one-evaluator.md) | Filtered-subscription membership: one evaluator is the source of truth; the floor is the verified-agreeing set | Accepted |
 | [0014](./0014-object-sync-schema.md) | `defineSync`: one schema value, mutations on the collection, commands on the connection | Accepted (supersedes 0001 D11 builder; closes 0010 manifest) |
 | [0015](./0015-syncable-mixin.md) | `Syncable` mixin: the sync core as a mixin over any DO base | Accepted (reframes 0001 D13; Actor unsupported; wake-test gap closed by 0019) |
-| [0016](./0016-reconnect-policy.md) | Transport reconnect policy: injectable delay function, terminal 4xxx, jittered backoff | Accepted |
+| [0016](./0016-reconnect-policy.md) | Transport reconnect policy: injectable delay function, terminal 4xxx, jittered backoff | Accepted (§3 amended 2026-11-17: only a connection that stayed open 5 s resets the backoff) |
 | [0017](./0017-blob-wire-normalization.md) | BLOB wire normalization: bare ArrayBuffer becomes Uint8Array at emission | Accepted |
 | [0018](./0018-oversize-frames.md) | Oversize frames: client pre-send guard is the rejection surface; outbound is warn-only | Accepted |
 | [0019](./0019-subscription-persistence-across-hibernation.md) | Subscriptions persist in SQLite and restore on hibernation wake | Accepted |

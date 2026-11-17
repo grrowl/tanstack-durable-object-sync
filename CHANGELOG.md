@@ -26,6 +26,19 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ### Fixed
 
+- **The reconnect backoff now grows when connections keep closing soon after
+  they open.** Before, every successful open reset the attempt counter, so a
+  server that accepted a socket and then closed it held each client at the
+  first-attempt delay (0 to 250 ms by default), and the client resent every
+  subscription several times a second for as long as the cause lasted. Now the
+  counter resets only when a connection that stayed open at least 5 s goes
+  away, and after a terminal stop or `close()`. A link whose sockets live
+  longer than 5 s is not affected. A link that drops sockets younger than 5 s
+  now backs off to the cap, like a broken server. A custom `reconnectDelay`
+  policy keeps its signature, but its attempt number now also counts every
+  socket that went away within 5 s of opening, not only failed dials, so a
+  policy that gives up after N attempts can give up on such a link (ADR-0016
+  §3, amendment 2026-11-17).
 - **A subclass `tickMs` override now takes effect.** The coalescer read the
   tick before subclass fields were set, so it always used 50 ms (ADR-0015
   amendment).
