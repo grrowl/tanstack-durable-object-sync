@@ -15,7 +15,7 @@
 // other runtimes (and tests) provide an already-connected socket.
 
 import { createFrameCodec, type FrameCodec, type WireOut } from "../wire/frame-codec.ts"
-import type { ClientFrame, RowOp, ServerFrame } from "../wire/frames.ts"
+import { type ClientFrame, POSITION, type RowOp, type ServerFrame } from "../wire/frames.ts"
 
 /** Minimal structural socket — satisfied by both browser WebSocket and a
  *  workerd accepted client socket, avoiding the DOM-vs-workers type clash. */
@@ -704,6 +704,13 @@ export class WebSocketTransport<Api = unknown> {
      *  (ADR-0011 D3). One-shot: reconnects resume from `appliedCursor`. */
     since?: string,
   ): Promise<void> {
+    // The server drops a `since` in any other form with no reply, so the sub
+    // would wait for ever (ADR-0012 amendment 2026-11-17). Refuse it here.
+    if (since !== undefined && !POSITION.test(since)) {
+      throw new Error(
+        `since must be a position in plain decimal form (digits only, no sign or leading zero, at most 19 digits): ${JSON.stringify(since)}`,
+      )
+    }
     this.handlers.set(subId, { handler, collection, where, orderBy, limit, since, bootstrapped: false })
     await this.connect()
     // Unsubscribed while the connect was in flight (its `unsub` had no socket

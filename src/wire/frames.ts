@@ -10,6 +10,11 @@
 // @tanstack/db expression IR in M5.
 
 export type Cursor = string
+
+/** A position in its plain decimal form, the only form the server accepts as a
+ *  `sub`'s `since`: no sign, no leading zero, at most 19 digits, the length of
+ *  SQLite's largest INTEGER (2^63 - 1) (ADR-0012 amendment 2026-11-17). */
+export const POSITION = /^(0|[1-9][0-9]{0,18})$/
 export type TxId = string
 export type RowOp = "insert" | "update" | "delete"
 

@@ -1,5 +1,6 @@
 import { env, runInDurableObject, SELF } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
+import { encodeResult } from "../src/server/dedup.ts"
 import { createFrameCodec } from "../src/wire/frame-codec.ts"
 import type { ClientFrame, ServerFrame } from "../src/wire/frames.ts"
 
@@ -139,6 +140,30 @@ describe("ids over 256 UTF-8 bytes are refused with their own reply (ADR-0012 am
       ws.close()
     })
   }
+
+  it("a receipt stored under a long txId before the limit still replays, for a mut and a call (ADR-0025)", async () => {
+    // The dedup lookup runs before every rejection, the length check included,
+    // so a receipt recorded before this limit existed is still answered.
+    const room = `idlim-replay-${crypto.randomUUID()}`
+    const ws = await openWs(room)
+    const r = recorder(ws)
+    const mutTx = "m".repeat(300)
+    const callTx = "c".repeat(300)
+    await runInDurableObject(env.SYNC_DO.get(env.SYNC_DO.idFromName(room)), (_i, s) => {
+      const row = "INSERT INTO _sync_seen_tx(tx_id, ok, cursor, error, error_code, result, ts) VALUES (?, 1, ?, NULL, NULL, ?, ?)"
+      s.storage.sql.exec(row, mutTx, "7", null, Date.now())
+      s.storage.sql.exec(row, callTx, "7", encodeResult({ ok: true }), Date.now())
+    })
+    send(ws, insert(mutTx, "a"))
+    send(ws, { t: "call", txId: callTx, name: "clearMessages", args: null })
+    await r.until((f) => f.txId === callTx)
+    const mutFrames = r.frames.filter((f) => f.txId === mutTx)
+    expect(mutFrames).toHaveLength(1)
+    expect(mutFrames[0]).toMatchObject({ t: "committed", txId: mutTx, seq: "7" })
+    expect(r.frames.find((f) => f.txId === callTx)).toEqual({ t: "committed", txId: callTx, seq: "7", result: { ok: true } })
+    expect(await query(room, "SELECT id FROM messages")).toEqual([]) // replayed, not run
+    ws.close()
+  })
 
   it("unsub over the limit is ignored: no reply, and the socket's subs keep their deltas", async () => {
     const room = `idlim-unsub-${crypto.randomUUID()}`

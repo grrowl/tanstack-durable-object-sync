@@ -21,7 +21,7 @@
 
 import { DurableObject } from "cloudflare:workers"
 import { createFrameCodec, type FrameCodec } from "../wire/frame-codec.ts"
-import type { ClientFrame, ServerFrame } from "../wire/frames.ts"
+import { type ClientFrame, POSITION, type ServerFrame } from "../wire/frames.ts"
 import {
   compactChanges,
   currentSeq,
@@ -762,7 +762,6 @@ export function Syncable<Env = unknown, TUser = unknown>() {
        * optimistic overlay is never dropped before the authoritative row lands.
        */
       async #handleMut(ws: WebSocket, f: Extract<ClientFrame, { t: "mut" }>): Promise<void> {
-        if (exceedsBytes(f.txId, MAX_ID_BYTES)) return this.#refuseTxId(ws, f.txId)
         // Dedup first: a resent txId gets its stored outcome, never a fresh
         // rejection from a check in #applyMut (ADR-0025).
         return this.#oncePerTx(ws, f.txId, () => this.#applyMut(ws, f))
@@ -874,7 +873,6 @@ export function Syncable<Env = unknown, TUser = unknown>() {
 
       /** Run a named command (outside any transaction) and confirm with its result. */
       async #handleCall(ws: WebSocket, f: Extract<ClientFrame, { t: "call" }>): Promise<void> {
-        if (exceedsBytes(f.txId, MAX_ID_BYTES)) return this.#refuseTxId(ws, f.txId)
         return this.#oncePerTx(ws, f.txId, () => this.#applyCall(ws, f))
       }
 
@@ -928,7 +926,9 @@ export function Syncable<Env = unknown, TUser = unknown>() {
        *  its receipt. A txId whose attempt is still running (its authorize or a
        *  command's execute awaits, and the input gate lets this frame in) waits
        *  for that attempt, then checks again, so it replays the outcome rather
-       *  than running a second time. Otherwise reserve the txId and run. */
+       *  than running a second time. A txId over the id limit is refused here,
+       *  after the lookup and before it is reserved, so it is neither recorded nor
+       *  left in flight. Otherwise reserve the txId and run. */
       async #oncePerTx(ws: WebSocket, txId: string, run: () => Promise<void>): Promise<void> {
         for (;;) {
           const seen = lookupTx(this.#sql, txId)
@@ -940,6 +940,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           if (!running) break
           await running
         }
+        if (exceedsBytes(txId, MAX_ID_BYTES)) return this.#refuseTxId(ws, txId)
         let settle!: () => void
         this.#inflight.set(txId, new Promise<void>((r) => (settle = r)))
         try {
@@ -962,10 +963,11 @@ export function Syncable<Env = unknown, TUser = unknown>() {
         sweepDedup(this.#sql, this.dedupRetentionMs, now)
       }
 
-      /** A txId over the limit is refused before the dedup lookup and is not
-       *  recorded: no receipt is ever stored under such an id, so there is none
-       *  to replay (ADR-0012 amendment 2026-11-17). The reply echoes it once, so
-       *  the client's pending write fails at once. */
+      /** Refuse a txId over the id limit, without recording it (ADR-0012
+       *  amendment 2026-11-17). It runs after the dedup lookup like every
+       *  rejection (ADR-0025), so a receipt stored under such an id before the
+       *  limit existed still replays. The reply echoes the id once, so the
+       *  client's pending write fails at once. */
       #refuseTxId(ws: WebSocket, txId: string): void {
         console.error(`txId '${clip(txId)}' refused: over ${MAX_ID_BYTES} bytes`)
         const message = `txId is over ${MAX_ID_BYTES} bytes`
@@ -1375,9 +1377,3 @@ function clip(s: string): string {
  *  over it is refused with its own reply, and nothing is stored (ADR-0012
  *  amendment 2026-11-17). */
 const MAX_ID_BYTES = 256
-
-/** A `since` is a position in its plain decimal form, as the client sends it:
- *  no sign, no leading zero, at most 19 digits, the length of SQLite's largest
- *  INTEGER (2^63 - 1). Anything else is a malformed frame (ADR-0012 amendment
- *  2026-11-17). */
-const POSITION = /^(0|[1-9][0-9]{0,18})$/
