@@ -327,15 +327,16 @@ published source of each version was read, and the files are named below.
   sends the bounded request with `limit: offset + limit` and the order, and
   nothing checks the string order. Later pages use a plain `gt` or `lt` cursor
   (`utils/cursor.js`, lines 3 to 11). The first window is kept, so it can be
-  wrong. Measured with a limit of 3 over 8 rows: window `Banana, Date, Fig`, wanted
+  wrong. The independent check of 2026-11-17 measured it with a limit of 3 over
+  8 rows: window `Banana, Date, Fig`, wanted
   `apple, Banana, cherry`, 3 of 8 rows loaded.
 - `@tanstack/db` 0.9.2. The same bounded request goes out first
   (`query/live/ordered-source-loader.js`, `loadPage`, line 210). When it settles,
   `loadBoundary` (lines 303 to 311) calls `canExpressCursorOrder`
   (`utils/cursor.js`, lines 37 to 46), which is false for a string unless
   `stringSort` is `lexical`, and then calls `loadFullSource`. The final window is
-  right and the cost is the whole subset. Measured the same way: right window, 8 of 8 rows
-  loaded. With `lexical`: right window, 3 of 8 rows.
+  right and the cost is the whole subset. The same check measured: right window,
+  8 of 8 rows loaded. With `lexical`: right window, 3 of 8 rows.
 - `@tanstack/db` 1.0.0-rc.1.5 (the version this repo develops against). The same
   steps as 0.9.2: `query/live/ordered-source-loader.js` (lines 371 and 437) and
   `utils/cursor.js` (line 35). `tests/order-by-nulls.test.ts` passes on it with
