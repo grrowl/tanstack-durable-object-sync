@@ -14,8 +14,8 @@ import {
 // loop against the DO, and a fixed retry interval turns a DO outage into a
 // thundering herd. So the reconnect delay is a POLICY function: the default
 // treats 4000-4999 as terminal (surfaced via onClosed) and otherwise backs off
-// exponentially with full jitter, resetting the attempt counter on a
-// successful open.
+// exponentially with full jitter, resetting the attempt counter once a
+// connection has proven healthy by staying open (amendment 2026-11-17).
 
 function noopHandler(): SubHandler {
   return { onSnap: () => {}, onSnapEnd: () => {}, onDelta: () => {}, onUptodate: () => {}, onReset: () => {} }
@@ -187,7 +187,7 @@ function makeFake(): Fake {
 }
 
 describe("reconnect attempt counter (drives the backoff)", () => {
-  it("grows across consecutive failed opens and resets after a successful open", async () => {
+  it("grows across failed opens and young closes; resets after a connection proves healthy", async () => {
     const attempts: Array<number> = []
     const fakes: Array<Fake> = []
     let failNext = 0
@@ -220,11 +220,23 @@ describe("reconnect attempt counter (drives the backoff)", () => {
     await waitFor(() => fakes.length === 2)
     expect(attempts).toEqual([1, 2, 3])
 
-    // A drop after the successful open starts over at attempt 1 — otherwise a
-    // long-lived client would pay maximum backoff for every later blip.
+    // A successful open is not proof of health (ADR-0016 §3, amendment
+    // 2026-11-17): a socket that closes soon after it opened keeps growing the
+    // count, or a server that accepts and then closes holds every client at
+    // attempt 1 forever.
     fakes[1]!.emit("close", { code: 1006 })
     await waitFor(() => fakes.length === 3)
-    expect(attempts).toEqual([1, 2, 3, 1])
+    expect(attempts).toEqual([1, 2, 3, 4])
+
+    // A drop after the connection stayed open 30 s starts over at attempt 1,
+    // otherwise a long-lived client would pay maximum backoff for every later
+    // blip. Shift the clock so the open socket looks 30 s old.
+    const realNow = Date.now.bind(Date)
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + 30_000)
+    fakes[2]!.emit("close", { code: 1006 })
+    await waitFor(() => fakes.length === 4)
+    clock.mockRestore()
+    expect(attempts).toEqual([1, 2, 3, 4, 1])
     t.close()
   })
 
