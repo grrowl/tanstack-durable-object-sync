@@ -13,8 +13,8 @@
   },
   "dependencies": {
     "@msgpack/msgpack": "^3.0.0",
-    "@tanstack/db": "0.9.2",
-    "@tanstack/react-db": "0.4.1",
+    "@tanstack/db": "1.0.0-rc.1.5",
+    "@tanstack/react-db": "1.0.0-rc.1.5",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "ulid": "^2.3.0"
