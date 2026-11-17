@@ -53,6 +53,10 @@ describe("log lines clip the strings a client chose", () => {
   // longer than a log line keeps. The refusals below come after the id check,
   // so only an id within the limit reaches them.
   const longest = "s".repeat(256)
+  /** How a log line shows a clipped client string. Asserting on the id's own
+   *  clipped form pins the clip of that one id: the refusal reason in the same
+   *  line is clipped separately. */
+  const clipped = (s: string): string => `${s.slice(0, 128)}… [clipped, ${s.length} chars]`
 
   it("a refused sub with a long id or a long column name", async () => {
     const ws = await openWs(`clip-sub-${crypto.randomUUID()}`)
@@ -108,6 +112,32 @@ describe("log lines clip the strings a client chose", () => {
     await next(ws, (f) => f.t === "page")
     ws.close()
     expectClipped("operator 'ne' is not supported")
+    expect(lines.some((l) => l.includes(`fetch '${clipped(longest)}' on 'messages' rejected: `))).toBe(true)
+  })
+
+  it("a sub refused by the compiler", async () => {
+    const ws = await openWs(`clip-sub-compiler-${crypto.randomUUID()}`)
+    send(ws, { t: "sub", subId: longest, collection: "messages", where: fn("ne", ref("body"), val("x")) })
+    await next(ws, (f) => f.t === "reset")
+    ws.close()
+    expect(lines.some((l) => l.includes(`sub '${clipped(longest)}' on 'messages' rejected: `))).toBe(true)
+  })
+
+  it("a fetch with a malformed cursor", async () => {
+    const ws = await openWs(`clip-fetch-cursor-${crypto.randomUUID()}`)
+    send(ws, { t: "fetch", fetchId: longest, collection: "messages", cursor: { whereFrom: null } })
+    await next(ws, (f) => f.t === "page")
+    ws.close()
+    expect(lines.some((l) => l.includes(`fetch '${clipped(longest)}' on 'messages' rejected: malformed cursor`))).toBe(true)
+  })
+
+  it("a mutation refused for its txId", async () => {
+    const ws = await openWs(`clip-txid-${crypto.randomUUID()}`)
+    const txId = "t".repeat(600_000)
+    send(ws, { t: "mut", txId, collection: "messages", ops: [{ type: "insert", key: "a", cols: { id: "a", body: "x" } }] })
+    await next(ws, (f) => f.t === "rejected")
+    ws.close()
+    expect(lines.some((l) => l.includes(`txId '${clipped(txId)}' refused`))).toBe(true)
   })
 
   it("a sub whose predicate is too large to store", async () => {

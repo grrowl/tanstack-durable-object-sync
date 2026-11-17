@@ -2,8 +2,8 @@ import { env, evictDurableObject, runInDurableObject, SELF } from "cloudflare:te
 import { describe, expect, it } from "vitest"
 import { type SubHandler, WebSocketTransport, type WebSocketLike } from "../src/client/transport.ts"
 
-// WHY: two ACCEPTED limitations of the single cursor, pinned as `it.fails` so a
-// future fix has a target. Both end the same way: the client's cursor claims a
+// WHY: three ACCEPTED limitations of the single cursor, pinned as `it.fails` so
+// a future fix has a target. All end the same way: the client's cursor claims a
 // position whose changes it never applied, and nothing ever repairs it.
 //
 // - L2 (ADR-0009 "Out of scope"): the DO is torn down while a delta sits in the
@@ -12,6 +12,12 @@ import { type SubHandler, WebSocketTransport, type WebSocketLike } from "../src/
 // - L1 (ADR-0011 "Known limitations"): no incarnation epoch. After a storage
 //   reset the new change log reuses seqs; a client cursor from before the reset
 //   passes the retention floor check and catches up silently wrong.
+// - L3 (ADR-0012 amendment 2026-11-17, decision 2): a `since` above the head
+//   gets `reset` and a snapshot, so the rows are right on that connection, but
+//   the cursor only grows and stays above the head. Once the log passes it while
+//   the client is away, the reconnect catches up from there and misses the rows
+//   in between. The same root as L1; closing it means moving the cursor back,
+//   which belongs with the cursor rules (ADR-0002, ADR-0026).
 //
 // Each asserts convergence (client rows == DO rows), not a mechanism, so any
 // fix (a delivered delta, a detected gap + resnapshot, an epoch reset) passes.
@@ -176,9 +182,58 @@ describe("single-cursor known limitations", () => {
     }
   })
 
+  // ADR-0012 amendment 2026-11-17, decision 2: the reset does not repair the cursor.
+  it.fails("L3: after a reset for a since above the head, a later reconnect still converges", async () => {
+    const r = `ckl-l3-${crypto.randomUUID()}`
+    let gate: Promise<void> = Promise.resolve()
+    let release: () => void = () => {}
+    const t = new WebSocketTransport({
+      url: `https://example.com/sync/${r}`,
+      reconnectDelay: () => 10,
+      open: async () => {
+        await gate
+        const res = await SELF.fetch(`https://example.com/sync/${r}`, { headers: { Upgrade: "websocket" } })
+        const ws = res.webSocket!
+        ws.accept()
+        return ws as unknown as WebSocketLike
+      },
+    })
+    try {
+      // The object is at position 1; the client holds 5 from an older incarnation,
+      // claimed as SSR hydration claims it: seed the cursor, subscribe from it.
+      await serverWrite(r, "INSERT INTO messages(id,body) VALUES('a', 'x')")
+      const sink = rowSink()
+      t.seedCursor("5")
+      await t.subscribe("s", "messages", sink.handler, undefined, undefined, undefined, "5")
+      await waitFor(() => sink.terminals.includes("snap-end"))
+      expect(sink.terminals).toEqual(["reset", "snap-end"]) // decision 2: right rows on this connection
+      expect([...sink.rows.keys()]).toEqual(["a"])
+
+      // Drop; while the client is away the log passes its cursor.
+      gate = new Promise<void>((res) => (release = res))
+      await runInDurableObject(stubFor(r), (_i, s) => {
+        for (const w of s.getWebSockets()) w.close(1000, "drop")
+      })
+      await waitFor(() => (t as unknown as { ws: unknown }).ws === null)
+      for (let i = 2; i <= 6; i++) await serverWrite(r, "INSERT INTO messages(id,body) VALUES(?, 'x')", `b${i}`)
+      const server = await serverIds(r)
+
+      const mark = sink.terminals.length
+      release()
+      await waitFor(() => sink.terminals.slice(mark).some((e) => e === "uptodate(own)" || e === "snap-end"))
+      await settle(() => JSON.stringify([...sink.rows.keys()].sort()) === JSON.stringify(server))
+
+      const client = [...sink.rows.keys()].sort()
+      reached.add("L3")
+      expect(client).toEqual(server)
+    } finally {
+      t.close()
+    }
+  })
+
   it("harness: every limitation pin ran to its convergence check", () => {
     // A pin that threw before its convergence check passed `it.fails` for the
     // wrong reason; this is what catches it.
-    expect([...reached].sort()).toEqual(["L1", "L2"])
+    expect([...reached].sort()).toEqual(["L1", "L2", "L3"])
   })
 })
