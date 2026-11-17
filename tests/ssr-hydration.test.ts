@@ -1,4 +1,4 @@
-import { createLiveQueryCollection, DbClient, collectionOptions, eq } from "@tanstack/db"
+import { and, createLiveQueryCollection, DbClient, collectionOptions, eq } from "@tanstack/db"
 import { env, runInDurableObject, SELF } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
 import { doCollectionOptions } from "../src/client/do-collection.ts"
@@ -327,6 +327,71 @@ describe("SSR round trip: dehydrate on the worker, hydrate + converge in the bro
     await waitFor(() => col.get("f") !== undefined)
     expect(col.get("e")).toBeUndefined()
     expect(col.get("c")).toBeUndefined() // never loaded; on-demand stayed on-demand
+    writer.close()
+    ws.close()
+  })
+
+  it("on-demand with a covered query: its rows dehydrate under the min cursor, and both queries go live", async () => {
+    // A list and a detail row of one table: the detail's request is covered by
+    // the list's watch, so the render answers it with a fetch (ADR-0023 D2,
+    // ADR-0011 amendment 2026-11-17). Its row z is written AFTER the list's
+    // read, so the fetch reads at a later position than the list did. The
+    // exported cursor must stay at the list's position (D3: MIN across reads),
+    // or the catch-up would skip changes the list's rows never saw.
+    const room = `rt-od-cover-${crypto.randomUUID()}`
+    await sql(room, "INSERT INTO messages(id,body) VALUES('a','keep'),('b','keep'),('c','drop')")
+
+    const keep = (m: Msg) => eq(m.body, "keep")
+    const isZ = (m: Msg) => and(eq(m.body, "keep"), eq(m.id, "z"))
+
+    const ssr = new SsrSnapshotTransport<Api>({ read: makeRead(room) })
+    const server = new DbClient()
+    const serverCol = server.collection(makeOptions(ssr, "on-demand"))
+    const serverList = createLiveQueryCollection((q) => q.from({ m: serverCol as never }).where(({ m }: { m: Msg }) => keep(m)))
+    await serverList.preload()
+    const listCursor = ssr.appliedCursor
+    await sql(room, "INSERT INTO messages(id,body) VALUES('z','keep')")
+    const serverDetail = createLiveQueryCollection((q) => q.from({ m: serverCol as never }).where(({ m }: { m: Msg }) => isZ(m)))
+    await serverDetail.preload()
+    expect(serverDetail.status).toBe("ready")
+    const state = server.dehydrate()
+
+    const chunk = state.collections[0]!
+    expect(chunk.rows.map((r) => (r.value as unknown as Msg).id).sort()).toEqual(["a", "b", "z"])
+    expect((chunk.syncMeta as { cursor: string }).cursor).toBe(listCursor)
+
+    // While in flight: a leaves the list, z dies, d joins the list.
+    await sql(
+      room,
+      "UPDATE messages SET body='drop' WHERE id='a'",
+      "DELETE FROM messages WHERE id='z'",
+      "INSERT INTO messages(id,body) VALUES('d','keep')",
+    )
+
+    const ws = makeWsTransport(room)
+    const db = new DbClient()
+    db.hydrate(state as never)
+    const colRaw = db.collection(makeOptions(ws, "on-demand"))
+    const col = colRaw as unknown as { get: (k: string) => Msg | undefined }
+    const list = createLiveQueryCollection((q) => q.from({ m: colRaw as never }).where(({ m }: { m: Msg }) => keep(m)))
+    const detail = createLiveQueryCollection((q) => q.from({ m: colRaw as never }).where(({ m }: { m: Msg }) => isZ(m)))
+    await Promise.all([list.preload(), detail.preload()])
+
+    const ids = (c: { toArray: Array<unknown> }) => (c.toArray as Array<Msg>).map((r) => r.id).sort()
+    await waitFor(() => ids(list).join() === "b,d" && col.get("z") === undefined && col.get("a")?.body === "drop")
+    expect(ids(detail)).toEqual([])
+
+    // Both are live on the WebSocket: z comes back through a real mutation.
+    const writer = makeWsTransport(room)
+    await writer.sendMut({
+      t: "mut",
+      txId: `tx-z-${crypto.randomUUID()}`,
+      collection: "messages",
+      ops: [{ type: "insert", key: "z", cols: { id: "z", body: "keep" } }],
+    })
+    await waitFor(() => ids(detail).join() === "z")
+    expect(ids(list)).toEqual(["b", "d", "z"])
+    expect([list.status, detail.status]).toEqual(["ready", "ready"])
     writer.close()
     ws.close()
   })
