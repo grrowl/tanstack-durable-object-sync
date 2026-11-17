@@ -74,8 +74,8 @@ On unexpected close, forced seed reconnect, explicit close or superseding
 socket installation, discard the pending set and candidate without releasing.
 The next round captures currently registered, bootstrapped entries anew and
 starts from `appliedSeq`, or the lower seed chosen by D5. Keep ADR-0016's
-scheduling-time reconnect flag, demand-driven connect, backoff and terminal
-stop (`transport.ts:514`), except D3 rider 1.
+scheduling-time reconnect flag, demand-driven connect, backoff (as amended,
+D3 rider 1) and terminal stop (`transport.ts:514`).
 
 Every resubscription keeps D7 (`transport.ts:552`), not the cohort test: a
 bootstrapped entry uses the captured cursor; an unfinished explicit-since
@@ -117,11 +117,13 @@ keeps rows (ADR-0028 D3/D4); it need not delete kept eager rows first.
 **A reset is not catch-up.** For the affected entries, clear `bootstrapped`
 and explicit `since`, run their reset handlers and retire their obligations,
 as one dispatch that clears eligibility before any callback. Release only
-after all affected callbacks return. A socket change stops the old dispatch;
-skip entries replaced by earlier callbacks. A surviving entry snapshots
-without `since` on every attempt until its own `snap-end`. A below-floor reset
-brings that snapshot on the same socket (`mixin.ts:1118`); a refusal does not
-(`mixin.ts:1037`, D4). Today reset only calls handlers (`transport.ts:884`).
+after all affected callbacks return. A socket change inside an unscoped reset
+stops release and completion accounting, not cleanup: every affected callback
+not replaced by an earlier one still runs. A reseed dials asynchronously
+(`transport.ts:384,398-404`), so the truncates land before the new batch. A
+surviving entry snapshots without `since` on every attempt until its own
+`snap-end`. A below-floor reset brings that snapshot on the same socket
+(`mixin.ts:1118`); a deliberate refusal does not (`mixin.ts:1037`, D4). Today reset only calls handlers (`transport.ts:884`).
 P11 showed the bug: after reset and a partial snapshot the third socket sent b
 with `since=50`; with this rule it sent b without `since`. On-demand reset may
 retire all watches in its generation (ADR-0023 D5); each removal retires its
@@ -138,11 +140,19 @@ callback removed its entry. Discard the round as D2 does. Unless the callback
 already closed or replaced the socket, replace it as the close handler does
 for an unexpected drop (`transport.ts:451-471`): park in-flight mut/call and
 consult the policy with no close code, or settle them under ADR-0021 if no
-subscription is left. Rethrow the original error, as today. Flags are
-unchanged, so the next round resumes the cohort from the held cursor and
-idempotent replay repairs what the callback left half done. This is safe
-whether the callback threw before or after its commit, which the transport
-cannot tell (`do-collection.ts:338,353,364`).
+subscription is left. Rethrow the original error, as today; a restart
+callback's error must also be reported uncaught, since its dial rejection is
+swallowed on a timer-driven reconnect (`transport.ts:384-386,534-536`). Flags
+are unchanged, so the next round resumes the cohort from the held cursor and
+idempotent replay repairs what the callback left half done, whether it threw
+before or after its commit (`do-collection.ts:338,353,364`).
+
+The cost is liveness, not safety. A row write that throws every round, such
+as a duplicate key, abandons every round at that frame, so entries whose
+frames come later (batch order is registration order, `transport.ts:555`)
+never get their catch-up: the rest of each socket is dropped as stale
+(`:449`). The cursor stays held and the backoff grows to the cap; a custom
+policy returning `null` is the app's only signal. Today the row is skipped.
 
 Outside a held round today's behaviour stays: the error leaves through the
 message listener (`transport.ts:435-450`), the rest of that frame is skipped,
@@ -150,24 +160,33 @@ and the transport and its other collections keep working. ADR-0028 D2 holds:
 the error goes uncaught and the collection stays ready. No latch, lifecycle
 state or app API is added; ADR-0020 is unchanged. Four riders apply:
 
-1. **Backoff.** After this abandonment, or rider 4's, a later open does not
-   reset the attempt counter (`transport.ts:476`). It resets when a later
-   round releases, or when an attempt with an empty cohort has sent its whole
-   batch and replay. Otherwise a throw that repeats every round reconnects at
-   the first-attempt delay, 0 to 250 ms by default (`transport.ts:156-160,296`).
-   With it the default settles at its 30 s cap, and a custom policy can
-   return `null`, which fires `onClosed` (`transport.ts:521-530`).
+1. **Backoff is the ADR-0016 §3 amendment of 2026-11-17**: only a socket that
+   stayed open past a threshold resets the attempt counter, checked at close.
+   This ADR adds no reset rule. An abandonment here or under rider 4 must take
+   the close path through the policy, never `forceReconnect`
+   (`transport.ts:373-387`), which skips the policy and would loop unpaced. A
+   round abandoned on a young socket then never resets the backoff; one on an
+   older socket does, but cycles no faster than once per threshold.
 2. **Set `bootstrapped` only after the terminal callback returns**, on the
    entry captured at dispatch start. Today it is set first (`transport.ts:835,850`).
    An excluded entry whose first terminal callback throws before commit would
    then join the next cohort and resume without its snapshot rows, breaking
-   D1's premise that each cohort entry has its baseline. Outside a hold this
-   also changes behaviour, safely: that entry resnapshots after the next drop.
+   D1's premise. Outside a hold the entry also restarts after the next drop.
+   For eager that costs one reconciling snapshot. A watch would restart
+   through `dropHolds` (`do-collection.ts:706`), deleting rows of fetches it
+   covered (`:515-534`) that its snapshot never restores; today, after the
+   common throw after commit, it resumes with `since` and loses nothing. So a
+   watch the adapter has accepted (`w.bootstrapped`, set at `:668` before the
+   commit) treats `onRestart` as its `onReset` does
+   (`afterApplied(truncateAll(), onReady, onFail)`, `:701`), and core's
+   truncate replay reloads every demand. Its unsubscribes retire those entries
+   (D3) and drop them from the batch (D1). This one adapter change means the
+   build touches `src/client/do-collection.ts`; the ADR is not transport only.
 3. **A reset dispatch runs every affected callback even if one throws**, then
    rethrows the first error. Flags are cleared before any callback, so
-   stopping early leaves entries invalidated without cleanup. A watch would
-   skip `truncateAll` and restart through `dropHolds`, keeping rows that
-   covered fetches (`do-collection.ts:701,706`). This applies in and out of a hold.
+   stopping early leaves entries invalidated without cleanup: a watch would
+   restart through `dropHolds`, which deletes rows that covered fetches and
+   does not restore them (`do-collection.ts:701,706`). In and out of a hold.
 4. **A restart callback that throws abandons that socket attempt**, as a
    failed sub send does (D4), with or without a cohort. Today the throw in
    `resubscribeAll` (`transport.ts:556`) follows install (`:472,481`), so the
@@ -175,53 +194,53 @@ state or app API is added; ADR-0020 is unchanged. Four riders apply:
    swallowed (`:534`) and `connect()` returns at once (`:390`): later
    subscriptions are dead on a live socket.
 
-These rules are unprobed; their pins must pass before shipment. Asynchronous
-receipt failures after a callback returns stay under the adapter contract.
+These rules are unprobed; their pins must pass before shipment.
 
 ### D4: Receipts follow the complete resubscribe batch
 
-**Prerequisite: the server answers or closes.** The long-list read fix must
-ship first with the coordinator's rule (`briefs/fix-long-in-lists.md` and its
-follow-up, under `thr_vusf2ue5ry`): every well-formed `sub` or `fetch` gets a
-terminal reply. If its handler throws, the server removes what it registered,
-in memory and durably, and sends the existing refusal (`reset` for sub, empty
-`page` for fetch); if that fails, it closes with 1011, which the policy
-retries, as ADR-0019's failed restore does. At this ADR's base `mixin.ts:1102`
-can throw before replying, then dedup replay at `:918` can send a receipt.
+**Prerequisite: the server refuses or closes** (the coordinator's decided
+rule, under `thr_vusf2ue5ry`). A deliberate refusal (unknown collection, the
+sub cap, an unsupported predicate, a query over a known SQLite limit) gets
+`reset`, with nothing of the sub left registered, in memory or durably; this
+is in review on `bb/bugbash-long-in-lists-hang-server-always-answers-thr_vf9229qjsy`.
+An unexpected handler failure closes the socket with 1011, which the policy
+retries, as for ADR-0019's failed restore. It never gets a bare `reset`,
+which would tell the client a snapshot follows when none does. The close rule
+is not built. Merge order: the ADR-0016 amendment, then the close rule, then
+this ADR's transport build. At this ADR's base `mixin.ts:1102` can throw
+before replying, then dedup replay at `:918` can send a receipt.
 
-D4 needs only that no reply reaches the client on that socket after the
-failure, not that the server stops running later requests. The built change
-(`8f7d766`, `mixin.ts:1143-1154`) does not stop them: its socket check is by
-tag (`:469-470`), so a replayed `mut` queued behind the failed `sub` still
-runs, and dedup answers it on the next socket. No reply reaches the client,
+The close needs only that no reply reaches the client on that socket after
+the failure. The server may still run later requests: the existing close
+helper (`8f7d766`, `mixin.ts:1143-1154`) checks the socket by tag
+(`:469-470`), so a replayed `mut` queued behind the failed `sub` still runs,
+and dedup answers it on the next socket. Its reply cannot reach the client,
 because an endpoint sends no data frame after its Close frame (RFC 6455
-section 5.5.1). That workerd honours this, and whether its `send` after
-`close` throws, is not verified. ADR-0027 typed refusals are not required.
+section 5.5.1); that workerd honours this is not verified.
 
-**A refused or closed cohort entry.** The coordinator may make the server
-close instead of refuse for failures that are not deliberate refusals. D4
-holds under either rule and does not choose. A refusal runs D3: the entry is
-invalidated and retired, and the round may release over the other claims. A
-close abandons the round (D2). Neither releases over a still-valid claim. What
-the client shows, read from code and not run:
+**A refused or closed cohort entry.** A refusal runs D3: the entry is retired
+and the round may release over the other claims. A close abandons the round
+(D2). Neither releases over a still-valid claim. The client shows, read from
+code and not run:
 
-- **Refusal.** A resumed eager entry's reset handler truncates and marks ready
-  (`do-collection.ts:354-364`), so the collection is empty and `ready`. The
-  client still lists the sub but the server holds none, so it gets no changes
-  until the next drop resnapshots it (D3). A refused watch runs `truncateAll`
-  (`:701`), and core reloads each demand with fresh subs (`:466-470`).
-- **Close.** Rows stay, stale but present. 1011 is not terminal by default
-  (`transport.ts:156-160`), so the cohort resumes from the held cursor on the
-  next socket. A failure that repeats reconnects at the first-attempt delay,
-  since each open resets the backoff (`:476`); rider 1 is for callbacks only.
+- **Deliberate refusal.** A resumed eager entry's reset handler truncates and
+  marks ready (`do-collection.ts:354-364`), so the collection is empty and
+  `ready`. The client still lists the sub but the server holds none, so it
+  gets no changes until the next drop resnapshots it (D3). A refused watch
+  runs `truncateAll` (`:701`), and core reloads each demand (`:466-470`).
+- **Unexpected failure, so close.** Rows stay, stale but present. 1011 is not
+  terminal by default (`transport.ts:156-160`), so the cohort resumes from the
+  held cursor on the next socket. A failure that repeats is paced by the
+  ADR-0016 amendment, as rider 1 describes.
 
 Send all surviving captured subscriptions synchronously before replaying
 parked mutations or commands, then allow new mut/call sends; restart
 callbacks must not interleave one. Check socket, attempt and entry identity
 after every callback, before each sub send and before parked replay. Close or
-reseed invalidates the old attempt: stop its remaining callbacks and sends.
-A send failure or a throwing restart callback (D3 rider 4) abandons the
-attempt; no mutation follows a partial batch (`transport.ts:479,552,585`).
+reseed invalidates the old attempt: stop its remaining callbacks and sends;
+only the new attempt resubscribes and replays. A send failure or a throwing
+restart callback (D3 rider 4) abandons the attempt; no mutation follows a
+partial batch (`transport.ts:479,552,585`).
 
 With the prerequisite, synchronous `handleSub` (`mixin.ts:1035`) emits a
 terminal or reset, or closes, before a later mutation can produce a receipt
@@ -306,8 +325,11 @@ This commit changes documentation only. The builder must:
 3. In `reconnect-window.test.ts`, "a mutation-driven connect still resubscribes
    from the cursor", send s1's terminal before the receipt. Assert sub before
    mut and C1 at settlement. Its current fake skips a required terminal.
-4. Leave the original proposal's three `ssr-adapter.test.ts` export changes
-   deferred with the baseline gate.
+4. Leave the original proposal's three `ssr-adapter.test.ts` changes deferred
+   with the baseline gate: "export round-trips through import; the eager
+   where is fingerprinted", "a DIFFERENT where downgrades the cursor to the
+   snapshot-reconcile path", and "exportSyncMeta never claims a boundary
+   whose receipt is unsettled".
 
 The sixteen convergence flips are the original cuts:
 
@@ -330,8 +352,9 @@ Add behavioral pins before shipping, with these observable outcomes:
   whose callbacks remove multiple watches; no release halfway through reset.
 - Interrupted rounds at different cuts discard every old candidate; a parked
   mutation keeps its first-drop deadline and still times out typed. Last-entry
-  removal, externally and within a terminal, releases once; close or reseed
-  in a callback discards.
+  removal, externally and within a terminal, releases once; a terminal at 15
+  whose callback removes the last entry releases 15, not the earlier
+  candidate. Close or reseed in a callback discards.
 - Unequal boundaries: A completes at 12, B at 15; release 15. Separately, A at
   12, broadcast 20, then last pending B retires; release exactly 20 and resolve
   its waiter. An unknown scoped boundary at 99, during the hold or after,
@@ -344,20 +367,30 @@ Add behavioral pins before shipping, with these observable outcomes:
   release. Assert the transport cursor and `awaitSeq`, not adapter exports.
 - New mut/call and parked replay, with async authorization and refusal: cohort
   sub sends precede mutation sends, cohort terminals or resets precede
-  receipts, C1 holds. Cover a sub after a mutation send, restart-callback sends,
-  a failed sub send, and close or reseed in a restart callback.
-- With a parked mutation, inject a server throw for a bootstrapped cohort entry
-  before its terminal: cleanup and reset precede the replay receipt, D3 retires
-  it, and an eager one is empty and ready. With cleanup or reply failure the
-  server closes, no reply reaches the client on that socket, and the client
-  reconnects from its safe cursor and settles from dedup. Use the real server.
+  receipts, C1 holds. Cover a sub after a mutation send, restart-callback sends
+  and a failed sub send. Close or reseed in a restart callback stops the old
+  batch before its next sub or replay; only the replacement attempt continues.
+- With a parked mutation and the real server, a deliberate refusal of a
+  bootstrapped cohort entry (for example an unknown collection after a
+  deploy): the reset precedes the replay receipt, D3 retires the entry, and an
+  eager one is empty and ready. Separately, inject a handler throw for such an
+  entry before its terminal: the server closes with 1011, no reply reaches the
+  client on that socket, and the client reconnects from its safe cursor, rows
+  intact, and settles the mutation from dedup.
 - In a held round, throw before and after commit from row, terminal, broadcast
   and reset callbacks, also after removal or reseed: no release, the socket is
-  replaced through the policy, work replays, the error is rethrown, and data
-  converges. A repeating throw backs off. An excluded entry whose first
-  terminal throws resnapshots. Outside a hold the transport keeps working. A
-  fake-peer unscoped reset runs every callback after one throws. A restart
-  callback throw, with or without a cohort, sends nothing more and retries.
+  replaced through the policy (not `forceReconnect`), work replays, the error
+  is rethrown, and data converges. A repeating throw backs off, and a cohort
+  entry behind a row that throws every round gets no catch-up while the
+  cursor stays held. An excluded eager entry whose first terminal throws
+  resnapshots. Outside a hold the transport keeps working. A fake-peer
+  unscoped reset runs every callback after one throws or changes the socket.
+  A restart callback throw, with or without a cohort, sends nothing more,
+  reports the error uncaught, and retries.
+- A watch whose first `snap-end` callback throws after its commit, then serves
+  a covered fetch: after a drop the fetched rows are present once core's
+  truncate replay settles. Restarting through `dropHolds` loses them, which
+  the resnapshot assertion alone does not see.
 
 Run affected suites at the supported floor and locked db version (ADR-0022,
 ADR-0028), keeping reconnect, bootstrap, barrier, catch-up, recovery, txId,
@@ -373,17 +406,23 @@ repair gaps, no loss from unsubscribe order, and no C1 counterexample with a
 complete batch. The check then overturned the all-entry cohort (P4), and
 established seed repair (P1), the export gap (P2) and reset eligibility (P11).
 
-Reviews 1 and 2 are `adversary-adr-0026-report-{1,2}.md` in
+Reviews 1 to 3 are `adversary-adr-0026-report-{1,2,3}.md` in
 `/Users/tom/.bb/thread-storage/thr_vusf2ue5ry/`. Review 1, of `3da4744`, found
 a throwing server handler broke D4, callback exceptions had no policy, export
 wording exceeded transport scope, and pins were missing; `fa14b5c` added the
 server prerequisite, a transport stop on callback failure, and the pins.
 Review 2, of `fa14b5c`, rejected the stop: one app callback error silently
 froze every collection on the transport, also with no round held, against
-ADR-0028 D2 and ADR-0020. This revision abandons only a held round, keeps
-today's behaviour outside one, adds the review's four riders, narrows the
-prerequisite, states the refusal and close outcomes, and records the scoped
-resets and the unknown-boundary change. Both reviews read code only.
+ADR-0028 D2 and ADR-0020. `582316e` abandoned only a held round, kept today's
+behaviour outside one, added the review's four riders, narrowed the
+prerequisite, and recorded the scoped resets and the unknown-boundary change.
+Review 3, of `582316e`, found no blocker. This revision makes an accepted
+watch restart as a reset (rider 2, an adapter change), states the liveness
+cost of a repeating throw, lets an unscoped reset finish cleanup after a
+socket change, and restores two pin details and three test names. It takes
+in two outside decisions: the server rule (refuse deliberately, close on
+unexpected failure) and the ADR-0016 backoff amendment, which replaces rider
+1's own rule. All reviews read code only.
 
 Partial fresh rows can stay visible while the resume cursor is older. Replay
 must stay idempotent, as the full-row catch-up at `mixin.ts:1147` is. Retention
