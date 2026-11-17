@@ -85,7 +85,11 @@ synchronous SQLite read) that gives us an equivalent guarantee more cheaply.
   window must not be re-inserted (a differing value throws
   `DuplicateKeySyncError` and aborts the sync transaction; see
   [ADR-0002](./0002-adversarial-review-corrections.md) verification notes), and
-  a key the live sub already holds keeps its fresher value.
+  a key the live sub already holds keeps its fresher value. *(2026-11-17)* The
+  rule also holds inside one page: a key written earlier in the same page is
+  skipped. A page from the server never repeats a key, but a server render reads
+  the two halves at two positions, where one row can be in both
+  ([ADR-0011](./0011-ssr-dehydrate-hydrate.md) amendment 2026-11-17).
 - The live `where` subscription remains the source of truth for anything
   currently in the collection; `fetch` only backfills older rows.
 - **Still deferred:** an unbounded `whereCurrent` tie-set over-fetches if the
