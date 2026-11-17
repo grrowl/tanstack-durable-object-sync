@@ -1,10 +1,12 @@
 # 0026: Hold the single cursor until a resubscribe round is complete
 
-**Status:** Proposed. Amends [ADR-0002 C1](./0002-adversarial-review-corrections.md)
-and [ADR-0011 D3/C1′](./0011-ssr-dehydrate-hydrate.md). Extends
+**Status:** Accepted as a design, not built yet; the server close rule (D4)
+is built first, then the transport part. Amends
+[ADR-0002 C1](./0002-adversarial-review-corrections.md) and
+[ADR-0011 D3/C1′](./0011-ssr-dehydrate-hydrate.md). Extends
 [ADR-0016](./0016-reconnect-policy.md) and
 [ADR-0023 D7](./0023-on-demand-watches-acquisitions-holds.md).
-**Date:** 2026-09-29. Revised 2026-11-17 after the independent check and two reviews.
+**Date:** 2026-09-29. Revised 2026-11-17 after the independent check and four reviews.
 
 ## Context and evidence
 
@@ -14,12 +16,12 @@ delete; a second drop then resumes files past that delete. A broadcast
 boundary can do the same. `tests/cursor-resubscribe-round.test.ts` reproduces
 both.
 
-The original proposal is `90c4bdb`. Line references are at `9ea1932`; the
-server is `src/server/mixin.ts`. The independent evidence, the **check**, is
-**Call 1** in `/Users/tom/.bb/thread-storage/thr_6qqtzubfx3/report.md`, run at
-`c23e1ee` with db 0.9.2. Its `evidence/` holds the hold spikes, P1 to P5
-(`probes-cursor.test.ts`) and P11 (`probe-reset-then-drop.test.ts`), as
-experiment records, not production code.
+Line references are at `9ea1932`; the server is `src/server/mixin.ts`. The
+**check** is an independent check of the original proposal, run at `c23e1ee`
+with db 0.9.2. It used hold spikes and probes P1 to P11. These were throwaway
+experiments and are not kept in the repository. Each fact this ADR takes from
+them is pinned in the validation contract, except P2, which motivates the
+deferred export work.
 
 The suite has 29 scenarios and one harness check. With plain assertions the
 check found 16 convergence failures and 14 passes. A hold passed all 30 tests;
@@ -161,10 +163,11 @@ and the transport and its other collections keep working. ADR-0028 D2 holds:
 the error goes uncaught and the collection stays ready. No latch, lifecycle
 state or app API is added; ADR-0020 is unchanged. Four riders apply:
 
-1. **Backoff is the ADR-0016 §3 amendment of 2026-11-17**: only a socket that
-   stayed open past a threshold resets the attempt counter, checked at close.
-   This ADR adds no reset rule. An abandonment here or under rider 4 must take
-   the close path through the policy, never `forceReconnect`
+1. **Backoff is the ADR-0016 §3 amendment of 2026-11-17** (pull request #59,
+   merged): only a socket that stayed open past a threshold resets the
+   attempt counter, checked at close. This ADR adds no reset rule. An
+   abandonment here or under rider 4 must take the close path through the
+   policy, never `forceReconnect`
    (`transport.ts:373-387`), which skips the policy and would loop unpaced. A
    round abandoned on a young socket then never resets the backoff; one on an
    older socket does, but cycles no faster than once per threshold.
@@ -202,23 +205,23 @@ These rules are unprobed; their pins must pass before shipment.
 
 ### D4: Receipts follow the complete resubscribe batch
 
-**Prerequisite: the server refuses or closes** (the coordinator's decided
-rule, under `thr_vusf2ue5ry`). A deliberate refusal (unknown collection, the
-sub cap, an unsupported predicate, a query over a known SQLite limit) gets
-`reset`, with nothing of the sub left registered, in memory or durably; this
-is in review on `bb/bugbash-long-in-lists-hang-server-always-answers-thr_vf9229qjsy`.
-An unexpected handler failure closes the socket with 1011, which the policy
-retries, as for ADR-0019's failed restore. It never gets a bare `reset`,
-which would tell the client a snapshot follows when none does. The close rule
-is not built. Merge order: the ADR-0016 amendment, then the close rule, then
-this ADR's transport build. At this ADR's base `mixin.ts:1102` can throw
-before replying, then dedup replay at `:918` can send a receipt.
+**Prerequisite: the server refuses or closes.** A deliberate refusal (unknown
+collection, the sub cap, an unsupported predicate, a query over a known SQLite
+limit) gets `reset`, with nothing of the sub left registered, in memory or
+durably. That is the long in lists change, pull request #60, with the
+ADR-0012 and ADR-0013 amendments of 2026-11-17. An unexpected handler failure
+closes the socket with 1011, which the policy retries, as for ADR-0019's
+failed restore. It never gets a bare `reset`, which would tell the client a
+snapshot follows when none does. This close rule is decided but has no ADR or
+code yet; the transport part of this ADR must not ship before it. At this
+ADR's base `mixin.ts:1102` can throw before replying, then dedup replay at
+`:918` can send a receipt.
 
 The close needs only that no reply reaches the client on that socket after
-the failure. The server may still run later requests: the existing close
-helper (`8f7d766`, `mixin.ts:1143-1154`) checks the socket by tag
-(`:469-470`), so a replayed `mut` queued behind the failed `sub` still runs,
-and dedup answers it on the next socket. Its reply cannot reach the client,
+the failure. The server may still run later requests: it checks a socket by
+tag (`mixin.ts:469-470`), not by whether it closed, so a replayed `mut`
+queued behind the failed `sub` may still run, and dedup answers it on the
+next socket. Its reply cannot reach the client,
 because an endpoint sends no data frame after its Close frame (RFC 6455
 section 5.5.1); that workerd honours this is not verified.
 
@@ -414,30 +417,27 @@ this ADR ran tests or spikes.
 
 ## Review record and consequences
 
-The earliest review (`thr_g97yu5bmbz`) found the now deferred export and
-repair gaps, no loss from unsubscribe order, and no C1 counterexample with a
-complete batch. The check then overturned the all-entry cohort (P4), and
-established seed repair (P1), the export gap (P2) and reset eligibility (P11).
+A review of the original proposal, which held every registered entry, found
+the deferred export and repair gaps, no loss from unsubscribe order, and no
+C1 counterexample with a complete batch. The check then overturned that
+cohort (P4), and established seed repair (P1), the export gap (P2) and reset
+eligibility (P11).
 
-Reviews 1 to 3 are `adversary-adr-0026-report-{1,2,3}.md` in
-`/Users/tom/.bb/thread-storage/thr_vusf2ue5ry/`. Review 1, of `3da4744`, found
-a throwing server handler broke D4, callback exceptions had no policy, export
-wording exceeded transport scope, and pins were missing; `fa14b5c` added the
-server prerequisite, a transport stop on callback failure, and the pins.
-Review 2, of `fa14b5c`, rejected the stop: one app callback error silently
-froze every collection on the transport, also with no round held, against
-ADR-0028 D2 and ADR-0020. `582316e` abandoned only a held round, kept today's
-behaviour outside one, added the review's four riders, narrowed the
-prerequisite, and recorded the scoped resets and the unknown-boundary change.
-Review 3, of `582316e`, found no blocker. This revision makes an accepted
-watch restart as a reset (rider 2, an adapter change), states the liveness
-cost of a repeating throw, lets an unscoped reset finish cleanup after a
-socket change, and restores two pin details and three test names. It takes
-in two outside decisions: the server rule (refuse deliberately, close on
-unexpected failure) and the ADR-0016 backoff amendment, which replaces rider
-1's own rule. Review 4, of `99f04b8` (`-report-4.md`), found no blocker; it
-tightened the watch pin to a bounded watch and restored the receipt scope
-note. All reviews read code only.
+Four reviews of this ADR followed; all read code only. Review 1, of the text
+that first held only bootstrapped entries, found a throwing server handler
+broke D4, callback exceptions had no policy, export wording exceeded transport
+scope, and pins were missing. The next text added the server prerequisite, a
+transport stop on callback failure, and the pins. Review 2 rejected the stop:
+one app callback error silently froze every collection on the transport, also
+with no round held, against ADR-0028 D2 and ADR-0020. The next text abandoned
+only a held round, kept today's behaviour outside one, added the review's four
+riders, narrowed the prerequisite, and recorded the scoped resets and the
+unknown-boundary change. After review 3 an accepted watch restarts as a
+reset (rider 2, an adapter change), the liveness cost of a repeating throw is
+stated, an unscoped reset finishes cleanup after a socket change, lost pin
+details and two wordings are fixed, and the decided server rule and the
+ADR-0016 backoff amendment replace text of our own. Review 4 tightened the
+watch pin to a bounded watch and restored the receipt scope note.
 
 Partial fresh rows can stay visible while the resume cursor is older. Replay
 must stay idempotent, as the full-row catch-up at `mixin.ts:1147` is. Retention
