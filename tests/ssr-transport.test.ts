@@ -404,6 +404,24 @@ describe("SsrSnapshotTransport.fetch", () => {
     expect(transport.appliedCursor).toBe("4")
   })
 
+  it("refuses a cursor with a missing half, as the server does, and reads nothing", async () => {
+    // The server refuses it (`#handleFetch`, "malformed cursor"): the ties read
+    // would be an unbounded scan. A render refuses it loud, like any refused read.
+    let reads = 0
+    const transport = new SsrSnapshotTransport<Api>({
+      read: async () => {
+        reads++
+        return { rows: [{ id: "a", body: "keep" }], cursor: "1" }
+      },
+    })
+    const from = { type: "func", name: "gt", args: [{ type: "ref", path: ["id"] }, { type: "val", value: "m" }] }
+    for (const cursor of [{ whereFrom: from }, { whereCurrent: from }, {}]) {
+      const p = transport.fetch({ t: "fetch", fetchId: "f", collection: "messages", cursor: cursor as never, limit: 3 })
+      await expect(p).rejects.toThrow(/malformed cursor/)
+    }
+    expect(reads).toBe(0)
+  })
+
   it("writes still fail loud", async () => {
     const transport = new SsrSnapshotTransport<Api>({ read: async () => ({ rows: [], cursor: "1" }) })
     await expect(transport.sendMut({ t: "mut", txId: "t", collection: "messages", ops: [] })).rejects.toThrow(SsrReadOnlyError)
