@@ -97,14 +97,29 @@ function isNode(x: unknown): x is Node {
 /** Validate a column reference, record its name in `names`, and quote it. The
  *  quoting alone does not make an unknown name fail: SQLite reads a double quoted
  *  name that matches no column as a string. The caller checks `names` against
- *  the table (ADR-0013 amendment 2026-11-17). */
+ *  the table (ADR-0013 amendment 2026-11-17).
+ *
+ *  A ref must be exactly `{ type: "ref", path: [name] }`, the shape the library's
+ *  client sends (0.8.6 to 1.0), so the evaluator reads `row[name]` as SQL does.
+ *  It reads any other shape differently: on 1.0 it drops `path[0]` when it equals
+ *  `sourceAlias`, and it walks a longer path into the value (ADR-0013 amendment
+ *  2026-11-17, column references). `where` and `orderBy` both come here. */
 function column(node: unknown, names: Set<string>): string {
   if (!isNode(node) || node.type !== "ref") throw new UnsupportedPredicateError("expected a column reference")
-  if (node.path.length !== 1) {
-    throw new UnsupportedPredicateError(`nested/aliased column paths are not supported: [${node.path.join(", ")}]`)
+  const extra = Object.keys(node).find((k) => k !== "type" && k !== "path")
+  if (extra !== undefined) {
+    throw new UnsupportedPredicateError(`a column reference carries only 'type' and 'path'; got '${extra}'`)
   }
-  const name = node.path[0]!
-  if (!IDENT.test(name)) throw new UnsupportedPredicateError(`invalid column name: ${name}`)
+  const path: unknown = node.path
+  if (!Array.isArray(path)) throw new UnsupportedPredicateError("a column reference's path must be an array")
+  if (path.length !== 1) {
+    const shown = path.map((p) => (typeof p === "string" ? p : typeof p)).join(", ")
+    throw new UnsupportedPredicateError(`nested/aliased column paths are not supported: [${shown}]`)
+  }
+  const name: unknown = path[0]
+  if (typeof name !== "string" || !IDENT.test(name)) {
+    throw new UnsupportedPredicateError(`invalid column name: ${typeof name === "string" ? name : typeof name}`)
+  }
   names.add(name)
   return `"${name}"`
 }
@@ -288,23 +303,28 @@ export function compileWhere(where: unknown): { sql: string; params: Array<unkno
   return { sql: compileExpr(where, params, new Set()).sql, params }
 }
 
-/** Extract (column, descending, nulls last) from an orderBy clause. Accepts @tanstack/db's
- *  OrderByClause ({ expression: PropRef, compareOptions: { direction, nulls } }) — the
- *  real wire shape from a live query — or a simple { col, dir }. Nulls default to
- *  first, as in TanStack's comparator, in either direction. */
-function orderByTerm(item: unknown): { col: string; desc: boolean; nullsLast: boolean } {
+/** Extract (quoted column, descending, nulls last) from an orderBy clause, recording
+ *  the column in `names`. Accepts @tanstack/db's OrderByClause ({ expression:
+ *  PropRef, compareOptions: { direction, nulls } }), the real wire shape from a
+ *  live query, whose expression is read by the same rule as a ref in `where`; or a
+ *  simple { col, dir }. Nulls default to first, as in TanStack's comparator, in
+ *  either direction. */
+function orderByTerm(item: unknown, names: Set<string>): { col: string; desc: boolean; nullsLast: boolean } {
   const o = item as {
-    expression?: { type?: string; path?: Array<string> }
+    expression?: unknown
     compareOptions?: { direction?: string; nulls?: string }
     col?: unknown
     dir?: unknown
   }
-  if (o.expression?.type === "ref" && Array.isArray(o.expression.path) && o.expression.path.length > 0) {
-    const path = o.expression.path
+  if (o.expression !== undefined) {
     const nullsLast = o.compareOptions?.nulls === "last"
-    return { col: path[path.length - 1]!, desc: o.compareOptions?.direction === "desc", nullsLast }
+    return { col: column(o.expression, names), desc: o.compareOptions?.direction === "desc", nullsLast }
   }
-  if (typeof o.col === "string") return { col: o.col, desc: o.dir === "desc", nullsLast: false }
+  if (typeof o.col === "string") {
+    if (!IDENT.test(o.col)) throw new UnsupportedPredicateError(`invalid orderBy column: ${o.col}`)
+    names.add(o.col)
+    return { col: `"${o.col}"`, desc: o.dir === "desc", nullsLast: false }
+  }
   throw new UnsupportedPredicateError(`unsupported orderBy clause: ${JSON.stringify(item)}`)
 }
 
@@ -315,10 +335,8 @@ function compileOrderBy(orderBy: unknown, pk: string, names: Set<string>): strin
     throw new UnsupportedPredicateError(`orderBy has ${orderBy.length} terms; Durable Object SQLite allows ${MAX_ORDER_BY_TERMS - 1} beside the pk`)
   }
   const terms = orderBy.map((item) => {
-    const { col, desc, nullsLast } = orderByTerm(item)
-    if (!IDENT.test(col)) throw new UnsupportedPredicateError(`invalid orderBy column: ${col}`)
-    names.add(col)
-    return `"${col}" ${desc ? "DESC" : "ASC"} NULLS ${nullsLast ? "LAST" : "FIRST"}`
+    const { col, desc, nullsLast } = orderByTerm(item, names)
+    return `${col} ${desc ? "DESC" : "ASC"} NULLS ${nullsLast ? "LAST" : "FIRST"}`
   })
   // Final tie-break by pk, ascending whatever the order direction: @tanstack/db
   // breaks value ties by row key ascending (db-ivm `createKeyedComparator`, same in
