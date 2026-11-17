@@ -83,12 +83,18 @@ export class SsrSnapshotTransport<Api = unknown> implements Transport<Api> {
     limit?: number,
     _since?: string,
   ): Promise<void> {
-    const { rows, cursor } = await this.opts.read({ collection, where: plain(where), orderBy: plain(orderBy), limit })
-    const c = BigInt(cursor)
-    this.cursor = this.cursor === null || c < this.cursor ? c : this.cursor
+    const rows = await this.read(collection, where, orderBy, limit)
     // Key is derived by the adapter via getKey(row); snap keys are advisory.
     for (const row of rows) handler.onSnap(undefined, row)
     handler.onSnapEnd()
+  }
+
+  /** One snapshot read; its position joins the render's MIN cursor. */
+  private async read(collection: string, where: unknown, orderBy: unknown, limit?: number) {
+    const { rows, cursor } = await this.opts.read({ collection, where: plain(where), orderBy: plain(orderBy), limit })
+    const c = BigInt(cursor)
+    this.cursor = this.cursor === null || c < this.cursor ? c : this.cursor
+    return rows
   }
 
   unsubscribe(): void {
@@ -99,8 +105,14 @@ export class SsrSnapshotTransport<Api = unknown> implements Transport<Api> {
     return Promise.reject(new SsrReadOnlyError("mutation"))
   }
 
-  fetch(_frame: Extract<ClientFrame, { t: "fetch" }>): Promise<Array<unknown>> {
-    return Promise.reject(new SsrReadOnlyError("cursor fetch"))
+  /** A cursor-less fetch is a covered on-demand request (ADR-0023 D2): the same
+   *  where/orderBy/limit read a subscribe makes, so one snapshot read answers it,
+   *  and its rows dehydrate under the MIN cursor like any other read's. A cursor
+   *  fetch (load more) has no snapshot-read equivalent and fails loud (ADR-0011
+   *  amendment 2026-11-17). */
+  fetch(frame: Extract<ClientFrame, { t: "fetch" }>): Promise<Array<unknown>> {
+    if (frame.cursor != null) return Promise.reject(new SsrReadOnlyError("cursor fetch"))
+    return this.read(frame.collection, frame.where, frame.orderBy, frame.limit)
   }
 
   seedCursor(): void {

@@ -353,3 +353,60 @@ decision, not drift:
   the adapter — dehydrated live-query results ride upstream's own state, and
   source-collection hydration is exactly the D3 path. The example app is the
   right home for that surface.
+
+## Amendment 2026-11-17: the snapshot transport answers a covered fetch
+
+**What changed underneath D2.** D2 says `fetch` throws `SsrReadOnlyError`. When
+it was written, every fetch was a cursor fetch (load more, ADR-0003). ADR-0023
+D2 later made an on-demand request that an open or pending watch covers load
+its rows with a fetch that has no cursor. The snapshot transport still refused
+every fetch, so in one render a covered query went to `error`, whether it was
+mounted in the same tick as its cover or after the cover loaded. A list and a
+detail row of one table is enough. On `@tanstack/db` 0.9 and later a single
+query with `orderBy` and `limit` hits it too, because core sends its
+full-source and tie requests as covered requests. Reproduced on 0.8.6 (two
+queries), 0.9.2 and 1.0.0-rc.1.5 (both shapes). The error also said "cursor
+fetch" for a request that was not one.
+
+**Decision.** `SsrSnapshotTransport.fetch` answers a fetch without a cursor
+with one snapshot read of the same collection, `where`, `orderBy` and `limit`.
+On the server that is the same read the WebSocket path makes for it: both
+`readSyncSnapshot` and the cursor-less branch of the `fetch` handler compile
+those three fields with `compileSubsetQuery`. The read's position joins the
+render's MIN cursor like any other read. A fetch with a cursor still rejects
+with `SsrReadOnlyError("cursor fetch")`: the snapshot read takes no cursor, and
+the cursor fetch's ties-plus-page read (ADR-0003) has no snapshot equivalent.
+SSR stays read-only. What it refuses is writes and load more, not reads.
+
+**The D3 cursor rule for the rows a covered query adds.** The adapter installs
+a covered fetch's rows insert-if-absent and attributes them to the covering
+watch (ADR-0023 D2, D3), and they dehydrate with every other row. The fetch
+reads after its cover's read, so at the same or a later position. MIN keeps the
+exported cursor at the earliest read, and the hydrated collection's unfiltered
+catch-up (D3, on-demand) replays every change from there, including changes to
+rows the fetch read later. Replay is idempotent, so nothing is skipped or
+doubled. `tests/ssr-hydration.test.ts` pins this with a row written between the
+two reads; `tests/ssr-transport.test.ts` pins both mount orders, the single
+ordered query, the MIN, and the cursor fetch refusal.
+
+**A refused predicate fails loud.** `readSyncSnapshot` throws on an unsupported
+predicate, so a covered load whose predicate the DO refuses rejects during SSR,
+where the WebSocket path answers an empty page. That matches how a subscribe's
+read already fails during SSR.
+
+**Rejected.**
+
+- *The adapter does not treat a request as covered when the transport cannot
+  fetch*, so the request opens its own watch and a snapshot read answers it.
+  This needs a new capability member on `Transport` (or the adapter knowing the
+  SSR class), and it makes the render take a different path from the browser
+  for the same query. D2 rests on one adapter code path swapped at the
+  transport seam. More surface and two paths, for the same rows.
+- *The adapter falls back to its own watch when the fetch rejects with
+  `SsrReadOnlyError`.* The adapter would learn an SSR error type, every covered
+  request would pay a rejected fetch first, and the rule for when a covered
+  fetch falls back on an error would be decided here as a side effect of SSR.
+  That rule deserves its own decision.
+
+The chosen fix changes only the snapshot transport. The adapter and the
+WebSocket transport are unchanged.
