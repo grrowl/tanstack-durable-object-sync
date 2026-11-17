@@ -8,6 +8,8 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-11-17
+
 ### Changed
 
 - **The `@tanstack/db` peer range is `>=0.8.6 || >=1.0.0-rc.1`.** npm can
