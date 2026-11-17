@@ -191,6 +191,14 @@ navigation. Resetting there would restart the fast retries on each click, and
 a policy that gives up after N attempts would never give up while the user
 navigates.
 
+One case is worse than before, and it is accepted. If an outage ends with the
+app holding no subscription, the count stays where it was, with no socket, for
+any length of time. If the first socket of the next session then goes away
+within 5 s of opening, that is counted on top of the old outage, where it was
+attempt 1 before. The cost is one long delay, or one early terminal stop under
+a policy that gives up after N attempts. Expiring the count would need a
+second constant.
+
 ### The candidates
 
 A rule for "proven healthy" was compared against these loops: a server that
@@ -212,18 +220,22 @@ on a call the app makes whenever it connects.
   and one comparison when it goes away. This is the simplest rule and the only
   one of the three that stops every loop above. It is the decision.
 
-A rule with no constant does not work. "Reset when the socket outlived the
-delay before it" fails because full jitter can draw a delay near 0 at any
-attempt, so a server that closes at once still resets often and loops hot.
-Stopping a close on accept needs an absolute floor.
+A rule with no constant is weaker. "Reset when the socket outlived the delay
+before it" does stop a server that closes at once, because the delays soon
+exceed the lifetime. It does not stop a server that closes a little later
+than the first-attempt delay. Every such close resets, so under the default
+policy a server that closes at 250 ms is dialled about 160 times a minute, and
+one that closes at 1 s about 53 times, where a 5 s floor gives 4 (simulated
+over 24 hours). The rule also depends on the delays a custom policy returns,
+which the transport cannot see into.
 
 ### Where 5 seconds comes from
 
 The faults this guards against (a throw on the first frame, a failed
 resubscribe, a failed replayed write) close the socket within the first round
 trips. 5 s is the default confirmation timeout, the time the transport gives
-a parked write to be answered after a reconnect. A socket that outlived it has
-got past the work it was sent at open.
+a write to be answered. A socket that outlived it has got past the work it was
+sent at open.
 
 It is a separate constant, not `timeoutMs`. Apps set `timeoutMs` for other
 reasons, from tens of milliseconds to a minute. Tying the threshold to it would
@@ -236,7 +248,10 @@ sockets die within 5 s drives the counter to the cap, where each delay is
 uniform from 0 to 30 s with a mean of 15 s, about four dials a minute per
 client. A server that closes each socket just after 5 s gets one dial per
 5 s plus a delay of at most 250 ms, about twelve a minute per client. That is
-the worst any server can do to a quiet client. It is not a bound on dials an
+the worst a steady fault can do to a quiet client. A server that alternates,
+holding one socket for 5 s and then closing the next few on accept, gets the
+fast early attempts after each reset, about 35 a minute at worst in
+simulation. No natural fault looks like that. It is not a bound on dials an
 app causes: a mutation, fetch or subscribe while disconnected dials at once,
 outside the policy, as it did before this change.
 
