@@ -42,7 +42,7 @@ const MAX_SQL_BYTES = 100_000
  *  workerd's main branch sets 8 MiB + 34; the workerd this package is tested on
  *  rejects a plain string over 2 200 000 bytes and a `json_each` list of exactly
  *  2 200 000. The smaller holds on both. */
-const MAX_VALUE_BYTES = 2_200_000
+export const MAX_VALUE_BYTES = 2_200_000
 /** SQLITE_LIMIT_LIKE_PATTERN_LENGTH: bytes in a LIKE pattern. SQLite only
  *  throws when the LIKE is evaluated on a row, so this is refused up front. */
 const MAX_LIKE_PATTERN_BYTES = 50

@@ -441,6 +441,43 @@ export class SyncOverHostOptInDO extends Syncable<unknown, Claims>()(FakeHost) {
   }
 }
 
+// ---- Names at the bound (id-limits.test.ts) --------------------------------
+//
+// A table and a command whose names are MAX_NAME_BYTES (128) long, the longest
+// a schema may register. Every id the library's client builds from them must
+// stay under the server's id limit (ADR-0012 amendment 2026-11-17).
+
+export const LONG_TABLE = "long_" + "x".repeat(123)
+export const LONG_COMMAND = "cmd_" + "y".repeat(124)
+
+export const longSchema = sync.schema({
+  collections: {
+    [LONG_TABLE]: sync.collection<MsgRow>({
+      pk: "id",
+      mutations: {
+        insert: {
+          execute: ({ op, sql }) => {
+            sql.exec(`INSERT INTO ${LONG_TABLE}(id, body) VALUES (?, ?)`, op.cols.id, op.cols.body)
+          },
+        },
+      },
+    }),
+  },
+  commands: {
+    [LONG_COMMAND]: sync.command()(() => ({ ok: true })),
+  },
+})
+
+export class LongNameDO extends SyncDurableObject<unknown, Claims> {
+  constructor(ctx: DurableObjectState, env: unknown) {
+    super(ctx, env)
+    ctx.blockConcurrencyWhile(async () => {
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS ${LONG_TABLE} (id TEXT PRIMARY KEY, body TEXT)`)
+      this.registerSync(longSchema)
+    })
+  }
+}
+
 interface Env {
   TEST_DO: DurableObjectNamespace
   SYNC_DO: DurableObjectNamespace
@@ -450,6 +487,7 @@ interface Env {
   GATED_DO: DurableObjectNamespace
   HOST_DO: DurableObjectNamespace
   HOST_OPTIN_DO: DurableObjectNamespace
+  LONG_DO: DurableObjectNamespace
 }
 
 export default {
@@ -474,6 +512,10 @@ export default {
     if (url.pathname.startsWith("/gated/")) {
       const name = url.pathname.slice("/gated/".length) || "default"
       return env.GATED_DO.get(env.GATED_DO.idFromName(name)).fetch(req)
+    }
+    if (url.pathname.startsWith("/long/")) {
+      const name = url.pathname.slice("/long/".length) || "default"
+      return env.LONG_DO.get(env.LONG_DO.idFromName(name)).fetch(req)
     }
     // Host-matrix routes: /host/<name>/... and /host-optin/<name>/... forward the
     // WHOLE request so the DO sees the trailing /_sync or /_host discriminator.

@@ -33,4 +33,23 @@ describe("compileSchema — identifier + registration guards", () => {
   it("rejects an invalid pk identifier", () => {
     expect(compile("t", "1bad")).toThrow(/invalid pk/)
   })
+
+  // ADR-0012 amendment 2026-11-17: the server refuses a frame whose collection or
+  // command name is over 128 UTF-8 bytes, and the library's client builds its
+  // sub and fetch ids from the table name. So a schema must not register a
+  // longer name, or the client would trip the server's limits.
+  it("accepts a table name of 128 bytes and refuses 129, naming the limit", () => {
+    expect(compile("t" + "x".repeat(127), "id")).not.toThrow()
+    expect(compile("t" + "x".repeat(128), "id")).toThrow(/is over 128 bytes/)
+  })
+
+  it("accepts a command name of 128 UTF-8 bytes and refuses 129, counting bytes", () => {
+    const command = (name: string) => () =>
+      compileSchema({ collections: {}, commands: { [name]: { execute: () => null } } } as unknown as SyncSchema)
+    expect(command("c".repeat(128))).not.toThrow()
+    expect(command("c".repeat(129))).toThrow(/is over 128 bytes/)
+    // 64 two-byte characters are 128 bytes; one more ASCII character is 129.
+    expect(command("é".repeat(64))).not.toThrow()
+    expect(command("é".repeat(64) + "c")).toThrow(/is over 128 bytes/)
+  })
 })

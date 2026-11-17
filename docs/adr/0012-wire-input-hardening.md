@@ -242,3 +242,218 @@ literal and does not depend on list length.
 
 Pinned by `tests/long-in-lists.test.ts` ("a predicate over SQLite's limits is
 refused on purpose") and `tests/sqlite-limits.test.ts`.
+
+## Amendment 2026-11-17: `since` is a plain decimal position
+
+D1 checked only that a `sub`'s `since` was a string, and `#handleSub` read it
+with `Number()`. So `"1e400"` became `Infinity`, passed every comparison, and was
+answered `uptodate` at the current position: the client was told it was up to
+date and was sent nothing. `"abc"` became `NaN` and got a snapshot.
+
+### Decision 1: what `since` must look like
+
+A position is a SQLite INTEGER in `_sync_changes.seq`, so its largest value is
+2^63 - 1, which has 19 digits. D1 now requires `since`, when present, to match
+`^(0|[1-9][0-9]{0,18})$`: digits only, no sign, no leading zero, at most 19
+digits (`POSITION` in `src/server/mixin.ts`). Any other `since` makes the frame
+malformed, and D1 applies: it is dropped with a log line and no reply, and
+nothing of the sub is registered or stored. We drop rather than refuse with a
+`reset` because a malformed `since` is a shape error, like a `since` that is
+not a string, and the library's client never sends one (decision 3).
+
+The server reads its own positions as numbers (`currentSeq`, `minChangeSeq`), so
+it compares `since` as a number too. Up to 2^53 that is exact. A 19 digit value
+above that is not exact, but it is still above every position the server can
+hold as a number, so it is correctly found to be past the end.
+
+### Decision 2: a `since` past the current position gets `reset` and a snapshot
+
+The position the server compares `since` with is the head of its change log,
+`MAX(seq)`. A well formed `since` above the head of a log that is not empty
+happens when the object's storage was recreated and its positions started
+again, while a client kept its cursor, or its SSR meta, from before. (A log
+that is empty, after pruning, already sent every `since` to a snapshot.) Such a
+`since` used to be answered `uptodate`, so the client kept the old object's
+rows for ever. It now gets `reset` and a snapshot. This is a change of
+behaviour on its own, separate from decision 1, and each kind of subscription in
+`src/client/do-collection.ts` already handles that `reset`:
+
+- **An eager sub** (`makeHandler`, `onReset`): it truncates the collection in
+  one sync transaction, and the snapshot that follows repopulates it. A hydrated
+  eager collection sends its dehydrated cursor as `since`, so this is the path
+  that replaces the old object's hydrated rows.
+- **An on-demand watch** (`onReset`, the bootstrapped branch): a watch first
+  subscribes with no `since`, so it can only meet this on a reconnect, when the
+  transport resumes it from its cursor. It truncates every subset
+  (`truncateAll`), and upstream's truncate replay reloads each demand with fresh
+  subs, as for a reconnect below the floor.
+- **The hydrated catch-up** of an on-demand collection (`#hydrate#`, `onReset`):
+  it truncates every subset, unsubscribes before the trailing snapshot arrives,
+  and marks the collection ready. The live queries' subs then load from the new
+  object.
+
+`tests/ssr-cursor-form.test.ts` pins the eager sub and the hydrated catch-up
+through the real client, with rows rendered from one object and hydrated
+against another whose log is shorter. The watch's path is the one a reconnect
+below the floor already takes, and is read from the code.
+
+**The limit: the `reset` does not repair the client's cursor.** It gives a
+recreated object's client the right rows on that connection, and that is all.
+Below the floor, the snapshot's position is above the client's cursor, so the
+cursor ends up right. Above the head it does not: the transport's cursor only
+grows, a `reset` does not touch it, and it stays above the head. So each later
+reconnect sends the same `since` and gets `reset` and a full snapshot again,
+until the object's position passes the cursor. If it passes the cursor while
+the client is away, the reconnect gets a catch-up from the cursor, and the rows
+written between the old head and the cursor never arrive. The case is closed
+only while the object's position stays below the client's cursor. This is the
+known limitation "No incarnation epoch" of
+[ADR-0011](./0011-ssr-dehydrate-hydrate.md), seen from the other side. Repairing it means
+moving the single cursor backwards, which belongs with the cursor rules of
+ADR-0002 and ADR-0026 and not in a frame guard, so this change does not do it.
+`tests/cursor-known-limitations.test.ts` pins it as L3, an `it.fails` for the
+change that closes it to turn around.
+
+### Decision 3: the client sends `since` only in the plain form
+
+A cursor in SSR meta is checked by `parseSyncMeta`, which accepted any string
+`BigInt` parses, such as `" 5"`, `"05"` or `"0x5"`, and the eager and on-demand
+paths sent it on as `since` unchanged. The server always writes the plain form,
+so only meta that was changed on the way can hold another spelling. But after
+decision 1 such meta would leave the collection with a sub the server never
+answers, after `markReady`, so it would silently stop receiving updates.
+`parseSyncMeta` now returns the plain form (`String(BigInt(cursor))`), and
+refuses a cursor above the largest the server accepts (`MAX_CURSOR`, 19 nines,
+in `src/client/transport.ts`) as it refuses a negative or unparseable one: the
+hydrate call throws, and sync start takes the safe route: an eager collection
+subscribes with no `since` and reconciles its rows against the snapshot, and an
+on-demand collection truncates and reloads its queries. `seedCursor` refuses a
+cursor above that bound too. Everything else the library sends as `since` is
+`appliedCursor`, which is `String` of a bigint taken from the server's own
+positions. `Transport.subscribe`, which is exported, refuses a `since` that is
+not in the plain form at the call, with a message that names the form, so an
+app that calls it directly with `"05"` fails at once instead of waiting for
+ever (`POSITION`, shared from `src/wire/frames.ts` by the server and the
+client).
+
+**Breaking for raw clients only.** A raw client that sends any other spelling of
+a number (`"01"`, `"1.0"`, `"1e3"`, a space) now gets no reply for that `sub`. A
+client of 0.7.1 or earlier sends such a `since` only from SSR meta that was
+changed on the way, and that collection then stops receiving updates; the
+server itself always writes the plain form.
+
+Pinned by `tests/since-shape.test.ts`, `tests/ssr-cursor-form.test.ts`, and the
+sync meta tests in `tests/ssr-adapter.test.ts` and `tests/ssr-cursor.test.ts`.
+
+## Amendment 2026-11-17: ids and names have a length limit
+
+The only bound on an id a client chooses was the frame size. A `sub` id is
+echoed in every frame for its sub (each `snap`, delta, `snap-end`, catch-up
+`uptodate` and `reset`) and stored in `_sync_subs`, so a 600 000 character sub
+id made every delta for it at least that long. Each outbound frame over
+1 048 576 bytes logs a warning, and a long sub id brought every frame of its sub
+closer to that size, so with a large row the client chose how many such lines
+the server wrote. A
+`txId` is stored in `_sync_seen_tx` for `dedupRetentionMs`. A `fetchId` is
+echoed once. A collection or command name that is not registered is refused,
+but a `mut` or `call` refusal quoted it in its message, which is stored with the
+receipt.
+
+### Decision 1: the limits, and where they come from
+
+- **An id** (`subId`, `fetchId`, `txId`) may be at most **256 bytes**
+  (`MAX_ID_BYTES` in `src/server/mixin.ts`).
+- **A collection or command name** may be at most **128 bytes**
+  (`MAX_NAME_BYTES` in `src/server/registry.ts`).
+
+The library's client builds its ids from a table name: a sub id is
+`<table>#<n>`, a fetch id `<table>#fetch#<n>`, and the hydration catch-up's sub
+id `<table>#hydrate#<n>` (`src/client/do-collection.ts`). `n` is a counter that
+prints as at most 21 digits. A call's `txId` is `crypto.randomUUID()`, 36
+characters, and a mutation's is TanStack's transaction id, which is a UUID unless
+the app supplies one with `createTransaction({ id })`. Nothing bounded a table
+name before: `IDENT` checks its characters only, and SQLite has no identifier
+limit of its own. So `compileSchema` now refuses a table name (in
+`assertValidCollection`) or a command name over 128 bytes, with a message that
+names the limit. Those are the only places a name enters the registry:
+`registerSync` compiles the schema with `compileSchema`, and mutations are keyed
+by their table name. With that bound, the longest id the library builds is
+128 + 9 + 21 = 158 bytes, under 256. The library's client can still reach the
+limit in three ways, each of them an input the app chose: a transaction id the
+app supplies with `createTransaction({ id })`, a collection's `table` option
+that is not a key of the server's schema and is long enough to make its ids
+over 256 bytes, and direct calls to the exported transport's `subscribe`,
+`fetch` and `sendMut` with long ids. Decision 2 answers each of them at once: the
+transaction id is rejected with `LIMIT_EXCEEDED`, and a sub or fetch gets its
+refusal, which for a collection reads as empty and ready, as an unknown
+collection already did.
+
+Both are fixed numbers, not options beside D2: they describe the protocol's
+shape, not how a deployment is tuned, and a client must be able to rely on them.
+
+**The unit is the UTF-8 byte.** SQLite stores TEXT as UTF-8 and MessagePack sends
+a string as UTF-8, so bytes bound what is stored and sent. A limit in characters
+would let a client send four times as many bytes in four byte characters. A
+UTF-16 unit is at least one UTF-8 byte, so a string longer than the limit in
+`length` is over it without being encoded (`exceedsBytes`).
+
+### Decision 2: a frame over a limit gets its own refusal, echoing the id once
+
+Each refusal is the reply that frame type already has, so a client handles it
+as it handles any other refusal of that frame:
+
+- **`sub`, id over the limit:** `reset` for that sub id. It is refused before
+  anything else is checked or read. No sub can hold such an id, so nothing is
+  removed or stored.
+- **`fetch`, id over the limit:** an empty `page` with `seq: "0"`, as for an
+  unknown collection, before anything is read.
+- **`mut` or `call`, `txId` over the limit:** `rejected` with code
+  `LIMIT_EXCEEDED` and the message `txId is over 256 bytes`. ADR-0025 runs
+  every check that can answer a `txId` with `rejected` after the dedup lookup,
+  so that a resent `txId` keeps its stored outcome, and this check keeps that
+  rule: it runs in `#oncePerTx`, after the lookup and after any attempt still in
+  flight, and before the `txId` is reserved as in flight. It is **not**
+  recorded and leaves no in-flight entry. No receipt is recorded under such an
+  id from now on, but one recorded before this change still replays. The cost is
+  one primary key lookup with a key no longer than the frame. One corner
+  remains: if a subclass raises `maxFrameBytes` above the SQLite value cap of
+  2 200 000 bytes, a `txId` over that cap cannot be bound for the lookup, so it
+  throws and gets no reply, as before this change. Nothing is stored.
+- **`unsub`, id over the limit:** ignored. No sub can hold the id.
+- **A name over the limit:** a `mut` gets `rejected` with `LIMIT_EXCEEDED` and
+  `collection name is over 128 bytes`, and a `call` gets `command name is over
+  128 bytes`. Neither message quotes the name. The `txId` is within its limit
+  here, so this is an ordinary per transaction rejection: it runs after the
+  dedup lookup and first in `#applyMut` and `#applyCall`, and is recorded as
+  every rejection is. A `sub` or `fetch` needs no check of its own: no
+  collection can have such a name, so it is refused as an unknown collection
+  already is, with nothing stored.
+
+A frame over more than one limit gets one answer: the id is checked first, then
+the name, then everything else. For a `mut` or `call`, a stored receipt for its
+`txId` comes before all three.
+
+The reply echoes the id once. That costs about what the client spent to send
+it, and the problem was the echo in every delta, the storage and the log lines,
+none of which remain. Log lines clip the id as before. Two other answers were
+considered:
+
+- **Drop the frame as D1 does, with no reply.** A raw client would wait for ever
+  for a `sub`, and until its timeout for anything else. A library app with an
+  app supplied transaction id over the limit would wait `timeoutMs` and then see
+  a vague `confirmation timeout`. ADR-0025 chose a reply over a drop for the empty
+  op key for the same reason, and the amendment above says a deliberate refusal
+  always gets its reply.
+- **A reply with a clipped id.** The client matches a reply to its request by
+  the id, so a clipped id matches nothing, and the client waits as it would for
+  a drop.
+
+**Breaking.** A raw client whose ids are over 256 bytes, or whose collection or
+command names are over 128, is now refused. An app that supplies a transaction
+id over 256 bytes now has the transaction rejected with `LIMIT_EXCEEDED`. A
+schema with a table or command name over 128 bytes now fails to register.
+
+Pinned by `tests/id-limits.test.ts` (raw frames at and one byte over each limit,
+in one, two and four byte characters), `tests/id-limits-client.test.ts` (the real
+client with a table and a command name at 128 bytes, and a watch refused for its
+id), and `tests/registry.test.ts`.

@@ -27,6 +27,7 @@ export default defineConfig({
           GATED_DO: { className: "GatedTestDO", useSQLite: true },
           HOST_DO: { className: "SyncOverHostDO", useSQLite: true },
           HOST_OPTIN_DO: { className: "SyncOverHostOptInDO", useSQLite: true },
+          LONG_DO: { className: "LongNameDO", useSQLite: true },
         },
       },
     }),

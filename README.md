@@ -199,7 +199,8 @@ export class SessionDO extends SyncDurableObject<Env, Claims> {
 > aliases rowid (server-assigned) and breaks optimistic id parity. Evolve
 > freely: the CDC triggers capture only the row key, so `ALTER TABLE ADD COLUMN`
 > flows to clients with no re-wiring, and re-running `registerSync` on the next
-> deploy is idempotent (ADR-0007).
+> deploy is idempotent (ADR-0007). A table or command name over 128 bytes fails
+> `registerSync` (ADR-0012).
 
 > [!NOTE]
 > Server-side writes outside the client flow — an agent inserting a row, a
@@ -518,6 +519,8 @@ show. The conventions, what's verified and how, and the full
   `createTransaction` or `transport.sendMut`, and do not show client error
   messages (some contain the `txId`) to other users. If commands return secrets,
   do not put users who distrust each other in one Durable Object (ADR-0012 D4).
+  An id you supply must be at most 256 bytes: a longer `txId` is rejected with
+  `LIMIT_EXCEEDED` (ADR-0012).
 - **`like` patterns over 50 bytes:** SQLite in a Durable Object accepts a LIKE
   pattern of at most 50 bytes (`SQLITE_LIMIT_LIKE_PATTERN_LENGTH`, set by workerd;
   Cloudflare's Durable Objects limits page lists it). A longer pattern is refused,

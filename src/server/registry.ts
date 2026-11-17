@@ -28,6 +28,20 @@ export type { StandardSchemaV1 }
 
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/
 
+/** The longest collection (table) or command name, in UTF-8 bytes. The server
+ *  refuses a frame whose name is longer, so a schema must not register one: the
+ *  bound keeps every id the library's client builds from a table name (at most
+ *  the name plus `#fetch#` plus a counter) under the server's id limit of 256
+ *  bytes (ADR-0012 amendment 2026-11-17). */
+export const MAX_NAME_BYTES = 128
+
+const utf8 = new TextEncoder()
+/** Whether `s` is longer than `max` UTF-8 bytes. A UTF-16 unit is at least one
+ *  UTF-8 byte, so a string of more than `max` units is over without encoding. */
+export function exceedsBytes(s: string, max: number): boolean {
+  return s.length > max || utf8.encode(s).byteLength > max
+}
+
 // ---------------------------------------------------------------------------
 // Standard Schema — the dependency-free `~standard` interface that zod/valibot/
 // arktype all satisfy, vendored verbatim in `./standard-schema.ts` (we import no
@@ -341,6 +355,7 @@ export function compileSchema<TUser, Env>(schema: SyncSchema<TUser, Env>): Compi
   }
 
   for (const [name, entry] of Object.entries(schema.commands)) {
+    if (exceedsBytes(name, MAX_NAME_BYTES)) throw new Error(`command name '${name}' is over ${MAX_NAME_BYTES} bytes`)
     if (commands.has(name)) throw new Error(`command '${name}' is already defined`)
     commands.set(name, compileCommand(entry as CommandEntry<TUser, Env, unknown, unknown>))
   }
@@ -410,6 +425,7 @@ async function validateStandard(schema: StandardSchemaV1, value: unknown): Promi
 export function assertValidCollection(def: CollectionDef): void {
   const { table, pk } = def
   if (!IDENT.test(table)) throw new Error(`invalid table name '${table}'`)
+  if (exceedsBytes(table, MAX_NAME_BYTES)) throw new Error(`table name '${table}' is over ${MAX_NAME_BYTES} bytes`)
   if (!IDENT.test(pk)) throw new Error(`invalid pk name '${pk}'`)
   if (table.startsWith(SYNC_PREFIX)) {
     throw new Error(`table name '${table}' uses the reserved '${SYNC_PREFIX}' prefix`)
