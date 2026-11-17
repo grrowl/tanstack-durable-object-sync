@@ -23,6 +23,11 @@ export class UnsupportedPredicateError extends Error {
 }
 
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/
+/** Bound parameters SQLite in a Durable Object accepts per statement: workerd's
+ *  `SqliteDatabase::setupSecurity` sets SQLITE_LIMIT_VARIABLE_NUMBER to 100, and
+ *  Cloudflare's Durable Objects limits page lists "Maximum bound parameters per
+ *  query: 100". Pinned in workerd by tests/long-in-lists.test.ts. */
+const MAX_BOUND_PARAMS = 100
 const COMPARATORS: Record<string, string> = {
   eq: "=",
   gt: ">",
@@ -57,6 +62,54 @@ function literal(node: unknown, params: Array<unknown>): string {
   if (!isNode(node) || node.type !== "val") throw new UnsupportedPredicateError("comparison value must be a literal")
   params.push(node.value)
   return "?"
+}
+
+/** `col IN list` without one bound parameter per value: Durable Object SQLite
+ *  allows 100 per statement, and @tanstack/db's join loader sends one `in` over
+ *  every join key (ADR-0013 amendment 2026-11-17). Strings and safe integers
+ *  travel as one JSON array each, read with `json_each` (exact for both, and
+ *  the pk index is still used); other numbers bind one each, because JSON text
+ *  does not carry every double exactly.
+ *
+ *  @tanstack/db's `in` compares by kind (a string never equals a number) where
+ *  SQLite converts by column affinity (`1` would match the text "1.0" in a TEXT
+ *  column, "5" the integer 5 in an INTEGER one), so each kind matches only
+ *  stored values of that kind. Allowing `typeof … 'null'` keeps a NULL column
+ *  NULL (unknown), as the evaluator does, so `not` leaves it out too. null,
+ *  undefined and NaN never match in the evaluator and are dropped; other kinds
+ *  (boolean, bigint, Date, bytes, objects) have no agreeing SQL form. */
+function compileIn(col: string, list: Array<unknown>, params: Array<unknown>): string {
+  const texts: Array<string> = []
+  const ints: Array<number> = []
+  const others: Array<number> = []
+  for (const v of list) {
+    if (v === null || v === undefined || Number.isNaN(v)) continue
+    if (typeof v === "string") texts.push(v)
+    else if (Number.isSafeInteger(v)) ints.push(v as number)
+    else if (typeof v === "number") others.push(v)
+    else {
+      const kind = typeof v === "object" ? Object.prototype.toString.call(v).slice(8, -1) : typeof v
+      throw new UnsupportedPredicateError(`'in' list values must be strings or numbers, got ${kind}`)
+    }
+  }
+  const terms: Array<string> = []
+  if (texts.length > 0) {
+    params.push(JSON.stringify(texts))
+    terms.push(`(${col} IN (SELECT value FROM json_each(?)) AND typeof(${col}) IN ('text', 'null'))`)
+  }
+  const numeric: Array<string> = []
+  if (ints.length > 0) {
+    params.push(JSON.stringify(ints))
+    numeric.push(`${col} IN (SELECT value FROM json_each(?))`)
+  }
+  if (others.length > 0) {
+    params.push(...others)
+    numeric.push(`${col} IN (${others.map(() => "?").join(", ")})`)
+  }
+  if (numeric.length > 0) terms.push(`((${numeric.join(" OR ")}) AND typeof(${col}) IN ('integer', 'real', 'null'))`)
+  // Nothing can match: false, or NULL for a NULL column (as above).
+  if (terms.length === 0) return `CASE WHEN ${col} IS NULL THEN NULL ELSE 0 END`
+  return terms.length === 1 ? terms[0]! : `(${terms.join(" OR ")})`
 }
 
 function compileExpr(node: unknown, params: Array<unknown>): string {
@@ -106,12 +159,7 @@ function compileExpr(node: unknown, params: Array<unknown>): string {
     if (args.length !== 2 || !Array.isArray(arr)) {
       throw new UnsupportedPredicateError("'in' expects a column and an array literal")
     }
-    if (arr.length === 0) return "0" // IN () is always false
-    const placeholders = arr.map((v) => {
-      params.push(v)
-      return "?"
-    })
-    return `${column(args[0])} IN (${placeholders.join(", ")})`
+    return compileIn(column(args[0]), arr, params)
   }
   throw new UnsupportedPredicateError(
     `operator '${name}' is not supported for server-side filtering ` +
@@ -230,5 +278,11 @@ export function compileSubsetQuery(tbl: string, opts: SubsetQuery): { sql: strin
     params.push(nonNegInt(opts.offset, "offset"))
   }
 
+  // Over the limit, SQLite would throw at run time; refuse it here instead.
+  if (params.length > MAX_BOUND_PARAMS) {
+    throw new UnsupportedPredicateError(
+      `query binds ${params.length} values; Durable Object SQLite allows ${MAX_BOUND_PARAMS} per statement`,
+    )
+  }
   return { sql, params }
 }

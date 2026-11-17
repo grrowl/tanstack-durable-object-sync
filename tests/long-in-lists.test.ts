@@ -81,6 +81,19 @@ const pageIds = (frames: Array<ServerFrame>): Array<string> =>
 // one they never name.
 const SEEDED = ["m0", "m1", "m100", "zz-outside"]
 
+describe("the platform limit", () => {
+  // MAX_BOUND_PARAMS in sql-compiler.ts mirrors this. If workerd changes it,
+  // this fails and the constant (and ADR-0013's amendment) should follow.
+  it("Durable Object SQLite accepts 100 bound parameters per statement, not 101", async () => {
+    const r = room("limit")
+    await runInDurableObject(stubFor(r), (_i, s) => {
+      const select = (n: number) => s.storage.sql.exec(`SELECT ${Array(n).fill("?").join(", ")}`, ...Array(n).fill(1))
+      expect(() => select(100)).not.toThrow()
+      expect(() => select(101)).toThrow(/too many SQL variables/)
+    })
+  })
+})
+
 describe("an `in` list longer than the bind limit (sub)", () => {
   for (const n of [100, 101, 3000]) {
     it(`in(${n}) gets its snapshot`, async () => {
@@ -257,6 +270,28 @@ describe("the server always answers a well-formed sub or fetch", () => {
       ws.close()
     })
   }
+
+  // If the refusal itself cannot be completed, the socket closes with a code
+  // the client reconnects on (4000-4999 would be terminal, ADR-0016). Injected
+  // through storage: with `_sync_subs` gone, the sub's write-through throws and
+  // so does the cleanup's delete.
+  it("sub: when the refusal cannot be completed either, the socket closes with 1011", async () => {
+    const r = room("unrefusable")
+    await seed(r, SEEDED)
+    const ws = await openWs(r)
+    const frames: Array<ServerFrame> = []
+    ws.addEventListener("message", (e) => frames.push(codec.decode((e as MessageEvent).data as ArrayBuffer) as ServerFrame))
+    const closed = new Promise<number>((resolve) => ws.addEventListener("close", (e) => resolve((e as CloseEvent).code)))
+    await runInDurableObject(stubFor(r), (_i, s) => {
+      s.storage.sql.exec("ALTER TABLE _sync_subs RENAME TO _sync_subs_hidden")
+    })
+    send(ws, { t: "sub", subId: "s1", collection: "messages", where: inIds(3) })
+    expect(await closed).toBe(1011)
+    expect(frames.map((f) => f.t)).toEqual([])
+    await runInDurableObject(stubFor(r), (_i, s) => {
+      s.storage.sql.exec("ALTER TABLE _sync_subs_hidden RENAME TO _sync_subs")
+    })
+  })
 
   it("a re-sub that fails drops the subId it replaced", async () => {
     const r = room("resub")

@@ -46,7 +46,6 @@ import {
   loadPersistedSubs,
   persistSub,
   SubscriptionRegistry,
-  type Sub,
   sweepOrphanSubs,
 } from "./subscriptions.ts"
 
@@ -697,12 +696,18 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           rows.push(...Array.from(this.#sql.exec(nq.sql, ...nq.params)))
           this.#send(ws, { t: "page", fetchId: frame.fetchId, rows, seq })
         } catch (e) {
+          // Any failure answers with the refusal reply, an empty page: a fetch
+          // with no reply times out on the client (ADR-0012 amendment 2026-11-17).
           if (e instanceof UnsupportedPredicateError) {
             console.error(`fetch '${frame.fetchId}' on '${frame.collection}' rejected: ${e.message}`)
-            this.#send(ws, { t: "page", fetchId: frame.fetchId, rows: [], seq })
-            return
+          } else {
+            console.error(`fetch '${frame.fetchId}' on '${frame.collection}' failed`, e)
           }
-          throw e
+          try {
+            this.#send(ws, { t: "page", fetchId: frame.fetchId, rows: [], seq })
+          } catch (e2) {
+            this.#closeForResubscribe(ws, `fetch '${frame.fetchId}' could not be refused`, e2)
+          }
         }
       }
 
@@ -1051,78 +1056,102 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           this.#send(ws, { t: "reset", sub: frame.subId })
           return
         }
-        // Lower where/orderBy/limit/offset into SQLite. An un-lowerable predicate
-        // (outside the supported floor) is rejected, not silently full-scanned.
-        let query: { sql: string; params: Array<unknown> }
+        // From here on, any failure (a predicate outside either floor, a query
+        // over SQLite's limits, SQLite itself) answers with `reset` and leaves
+        // nothing of the sub registered, in memory or durably. A sub with no
+        // reply stays loading forever (ADR-0012 amendment 2026-11-17).
         try {
-          query = compileSubsetQuery(frame.collection, {
+          // Lower where/orderBy/limit/offset into SQLite. An un-lowerable predicate
+          // (outside the supported floor) is rejected, not silently full-scanned.
+          const query = compileSubsetQuery(frame.collection, {
             pk: coll.pk,
             where: frame.where,
             orderBy: frame.orderBy,
             limit: frame.limit,
             offset: frame.offset,
           })
+
+          // C1′ (ADR-0011, generalizing ADR-0002 C1): what follows is a synchronous
+          // cursor-advancing emission — a snapshot's `snap-end` or a catch-up's
+          // `uptodate` carries the CURRENT seq, which may include changes whose
+          // deltas are still buffered in the coalescer for this socket. Flush them
+          // first, or the client's cursor claims a seq it never applied and a drop
+          // before the tick loses the write (reconnect resumes past it).
+          this.#broadcaster.flushOne(ws)
+
+          // Registering compiles the predicate in @tanstack/db's evaluator. If the
+          // predicate is outside the JS floor (e.g. an operator the SQL floor somehow
+          // let through), that throws UnsupportedPredicateError — reject with `reset`
+          // rather than letting it escape uncaught and hang the client (ADR-0013).
+          const sub = this.#subs.add(ws, frame.subId, frame.collection, frame.where)
+          // Write through (ADR-0019): the accepted sub becomes durable, so a
+          // hibernation wake can restore it onto the surviving socket. Only
+          // after `add` succeeds — a rejected predicate must not persist.
+          {
+            const sid = this.#socketIdFor(ws)
+            if (sid) persistSub(this.#sql, sid, frame.subId, frame.collection, frame.where)
+          }
+          const seq = String(currentSeq(this.#sql))
+
+          // Reconnect catch-up: a `since` cursor asks for changes after that point
+          // rather than a fresh snapshot. Serve a windowed delta while the change log
+          // still reaches back that far; otherwise fall back to reset + snapshot.
+          //
+          // The floor is `minChangeSeq` — no persisted watermark needed (ADR-0009).
+          const since = frame.since != null ? Number(frame.since) : 0
+          if (since > 0) {
+            const floor = minChangeSeq(this.#sql)
+            if (floor !== 0 && since >= floor - 1) {
+              this.#emitCatchUp(ws, sub, coll, since, seq)
+              return
+            }
+          }
+
+          // Every row is read before the first frame is sent, so a failure never
+          // follows a `snap`: the client takes a reset before `snap-end` as a
+          // refusal that holds no rows (ADR-0023 D5).
+          const rows = Array.from(this.#sql.exec(query.sql, ...query.params)) as Array<Record<string, SqlStorageValue>>
+          if (since > 0) this.#send(ws, { t: "reset", sub: frame.subId })
+          for (const row of rows) {
+            this.#send(ws, { t: "snap", sub: frame.subId, key: row[coll.pk], row, seq })
+          }
+          this.#send(ws, { t: "snap-end", sub: frame.subId, seq })
         } catch (e) {
           if (e instanceof UnsupportedPredicateError) {
             console.error(`sub '${frame.subId}' on '${frame.collection}' rejected: ${e.message}`)
-            this.#send(ws, { t: "reset", sub: frame.subId })
-            return
+          } else {
+            console.error(`sub '${frame.subId}' on '${frame.collection}' failed`, e)
           }
-          throw e
+          try {
+            this.#subs.remove(ws, frame.subId)
+            const sid = this.#socketIdFor(ws)
+            if (sid) deletePersistedSub(this.#sql, sid, frame.subId)
+            this.#send(ws, { t: "reset", sub: frame.subId })
+          } catch (e2) {
+            this.#closeForResubscribe(ws, `sub '${frame.subId}' could not be refused`, e2)
+          }
         }
+      }
 
-        // C1′ (ADR-0011, generalizing ADR-0002 C1): what follows is a synchronous
-        // cursor-advancing emission — a snapshot's `snap-end` or a catch-up's
-        // `uptodate` carries the CURRENT seq, which may include changes whose
-        // deltas are still buffered in the coalescer for this socket. Flush them
-        // first, or the client's cursor claims a seq it never applied and a drop
-        // before the tick loses the write (reconnect resumes past it).
-        this.#broadcaster.flushOne(ws)
-
-        // Registering compiles the predicate in @tanstack/db's evaluator. If the
-        // predicate is outside the JS floor (e.g. an operator the SQL floor somehow
-        // let through), that throws UnsupportedPredicateError — reject with `reset`
-        // rather than letting it escape uncaught and hang the client (ADR-0013).
-        let sub: Sub
+      /** Last resort when a request can be neither answered nor cleaned up
+       *  (ADR-0012 amendment 2026-11-17): close the socket with 1011, which the
+       *  client's reconnect policy retries (4000-4999 would be terminal,
+       *  ADR-0016), so it reconnects and resubscribes — the same move as a
+       *  restore that cannot compile (ADR-0019 D3). Memory goes first; if the
+       *  durable rows cannot be deleted now, compaction sweeps a closed socket's
+       *  rows (ADR-0019 D4). */
+      #closeForResubscribe(ws: WebSocket, what: string, e: unknown): void {
+        console.error(`${what}; closing socket for a clean resubscribe`, e)
+        this.#broadcaster.discard(ws)
+        this.#subs.removeAll(ws)
+        this.#liveWs.delete(ws)
         try {
-          sub = this.#subs.add(ws, frame.subId, frame.collection, frame.where)
-        } catch (e) {
-          if (e instanceof UnsupportedPredicateError) {
-            console.error(`sub '${frame.subId}' on '${frame.collection}' rejected: ${e.message}`)
-            this.#send(ws, { t: "reset", sub: frame.subId })
-            return
-          }
-          throw e
-        }
-        // Write through (ADR-0019): the accepted sub becomes durable, so a
-        // hibernation wake can restore it onto the surviving socket. Only
-        // after `add` succeeds — a rejected predicate must not persist.
-        {
           const sid = this.#socketIdFor(ws)
-          if (sid) persistSub(this.#sql, sid, frame.subId, frame.collection, frame.where)
+          if (sid) deletePersistedSocketSubs(this.#sql, sid)
+        } catch (e2) {
+          console.error(`${what}: durable subscriptions left for the compaction sweep`, e2)
         }
-        const seq = String(currentSeq(this.#sql))
-
-        // Reconnect catch-up: a `since` cursor asks for changes after that point
-        // rather than a fresh snapshot. Serve a windowed delta while the change log
-        // still reaches back that far; otherwise fall back to reset + snapshot.
-        //
-        // The floor is `minChangeSeq` — no persisted watermark needed (ADR-0009).
-        const since = frame.since != null ? Number(frame.since) : 0
-        if (since > 0) {
-          const floor = minChangeSeq(this.#sql)
-          if (floor !== 0 && since >= floor - 1) {
-            this.#emitCatchUp(ws, sub, coll, since, seq)
-            return
-          }
-          this.#send(ws, { t: "reset", sub: frame.subId })
-        }
-
-        const rows = Array.from(this.#sql.exec(query.sql, ...query.params)) as Array<Record<string, SqlStorageValue>>
-        for (const row of rows) {
-          this.#send(ws, { t: "snap", sub: frame.subId, key: row[coll.pk], row, seq })
-        }
-        this.#send(ws, { t: "snap-end", sub: frame.subId, seq })
+        ws.close(1011, "sync request failed; resubscribe")
       }
 
       /** Windowed catch-up: the latest op per changed key since `since`, resolved
