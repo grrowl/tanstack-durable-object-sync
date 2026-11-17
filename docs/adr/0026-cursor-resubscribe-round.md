@@ -119,11 +119,12 @@ and explicit `since`, run their reset handlers and retire their obligations,
 as one dispatch that clears eligibility before any callback. Release only
 after all affected callbacks return. A socket change inside an unscoped reset
 stops release and completion accounting, not cleanup: every affected callback
-not replaced by an earlier one still runs. A reseed dials asynchronously
-(`transport.ts:384,398-404`), so the truncates land before the new batch. A
-surviving entry snapshots without `since` on every attempt until its own
-`snap-end`. A below-floor reset brings that snapshot on the same socket
-(`mixin.ts:1118`); a deliberate refusal does not (`mixin.ts:1037`, D4). Today reset only calls handlers (`transport.ts:884`).
+not removed or replaced by an earlier one still runs. A reseed dials
+asynchronously (`transport.ts:384,398-404`), so the truncates land before the
+new batch. A surviving entry snapshots without `since` on every attempt until
+its own `snap-end`. A below-floor reset brings that snapshot on the same
+socket (`mixin.ts:1118`); a deliberate refusal does not (`mixin.ts:1037`, D4).
+Today reset only calls handlers (`transport.ts:884`).
 P11 showed the bug: after reset and a partial snapshot the third socket sent b
 with `since=50`; with this rule it sent b without `since`. On-demand reset may
 retire all watches in its generation (ADR-0023 D5); each removal retires its
@@ -173,15 +174,18 @@ state or app API is added; ADR-0020 is unchanged. Four riders apply:
    then join the next cohort and resume without its snapshot rows, breaking
    D1's premise. Outside a hold the entry also restarts after the next drop.
    For eager that costs one reconciling snapshot. A watch would restart
-   through `dropHolds` (`do-collection.ts:706`), deleting rows of fetches it
-   covered (`:515-534`) that its snapshot never restores; today, after the
-   common throw after commit, it resumes with `since` and loses nothing. So a
-   watch the adapter has accepted (`w.bootstrapped`, set at `:668` before the
-   commit) treats `onRestart` as its `onReset` does
+   through `dropHolds` (`do-collection.ts:706`), deleting every row it holds,
+   including rows from live deltas beyond its snapshot window (`:672-676`) and
+   from fetches it covered (`:515-534`). Its bounded resnapshot restores
+   neither. Today, after the common throw after commit, it resumes with `since`
+   and loses nothing. So a watch the adapter has accepted (`w.bootstrapped`,
+   set at `:668` before the commit) treats `onRestart` as its `onReset` does
    (`afterApplied(truncateAll(), onReady, onFail)`, `:701`), and core's
-   truncate replay reloads every demand. Its unsubscribes retire those entries
-   (D3) and drop them from the batch (D1). This one adapter change means the
-   build touches `src/client/do-collection.ts`; the ADR is not transport only.
+   truncate replay reloads every demand. The cost is that the restart reloads
+   every watch of that collection, as a below-floor reset does. Its
+   unsubscribes retire those entries (D3) and drop them from the batch (D1).
+   This one adapter change means the build touches
+   `src/client/do-collection.ts`; the ADR is not transport only.
 3. **A reset dispatch runs every affected callback even if one throws**, then
    rethrows the first error. Flags are cleared before any callback, so
    stopping early leaves entries invalidated without cleanup: a watch would
@@ -309,6 +313,11 @@ boundary advances the cursor past rows that never committed, so a later drop
 resumes beyond them. Rider 2 covers only a first terminal. This gap exists
 today and is not F1.
 
+**Not covered: a commit receipt that rejects after its callback returned.**
+That work did not commit, but the transport has already completed the entry.
+It stays under the adapter contract: the transport sees only synchronous
+callback outcomes, and the gap exists today with or without a hold.
+
 ## Validation contract
 
 This commit changes documentation only. The builder must:
@@ -387,10 +396,14 @@ Add behavioral pins before shipping, with these observable outcomes:
   unscoped reset runs every callback after one throws or changes the socket.
   A restart callback throw, with or without a cohort, sends nothing more,
   reports the error uncaught, and retries.
-- A watch whose first `snap-end` callback throws after its commit, then serves
-  a covered fetch: after a drop the fetched rows are present once core's
-  truncate replay settles. Restarting through `dropHolds` loses them, which
-  the resnapshot assertion alone does not see.
+- A bounded watch (`orderBy` and `limit`) whose first `snap-end` callback
+  throws after its commit, then covers a fetch that returns rows outside its
+  snapshot window, such as a scroll-back page (`do-collection.ts:732-750`):
+  after a drop those rows are present once core's truncate replay settles.
+  Restarting through `dropHolds` loses them; an unbounded watch would hide
+  that, because its resnapshot brings every row back. Also assert that the
+  old watch's sub id is not sent on the new socket, and that each replacement
+  sub id is sent exactly once.
 
 Run affected suites at the supported floor and locked db version (ADR-0022,
 ADR-0028), keeping reconnect, bootstrap, barrier, catch-up, recovery, txId,
@@ -422,7 +435,9 @@ cost of a repeating throw, lets an unscoped reset finish cleanup after a
 socket change, and restores two pin details and three test names. It takes
 in two outside decisions: the server rule (refuse deliberately, close on
 unexpected failure) and the ADR-0016 backoff amendment, which replaces rider
-1's own rule. All reviews read code only.
+1's own rule. Review 4, of `99f04b8` (`-report-4.md`), found no blocker; it
+tightened the watch pin to a bounded watch and restored the receipt scope
+note. All reviews read code only.
 
 Partial fresh rows can stay visible while the resume cursor is older. Replay
 must stay idempotent, as the full-row catch-up at `mixin.ts:1147` is. Retention
