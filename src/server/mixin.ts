@@ -319,13 +319,29 @@ export function Syncable<Env = unknown, TUser = unknown>() {
        *  cursor advances — codex review), whereas a close engages the
        *  reconnect machinery, which re-subscribes everything recoverable and
        *  routes the bad predicate through `#handleSub`'s pre-existing,
-       *  app-visible rejection. */
+       *  app-visible rejection.
+       *
+       *  The whole SQL compiler runs on each persisted `where`, with the
+       *  table's columns checked (ADR-0013 amendment 2026-11-17), so any
+       *  compile refusal closes the socket, including a column a migration
+       *  dropped. Within one build only that can fire: the statement compiled
+       *  here is the sub's own with the same `where` and no `orderBy`, `limit`
+       *  or `offset`, so it has no more parameters, bytes or depth than the one
+       *  accepted at sub time. Any other refusal means the row was written by
+       *  an older build, which is what this close is for. A sub on a
+       *  collection that is no longer registered is left to `#reconcileSubs`. */
       #restoreSubs(): void {
+        const columns = new Map<string, ReadonlySet<string>>() // read once per table, for this restore only
         for (const ws of this.#liveWs) {
           const sid = this.#socketIdFor(ws)
           if (!sid) continue // legacy pre-0.6 socket: nothing was persisted
           for (const row of loadPersistedSubs(this.#sql, sid)) {
             try {
+              const coll = this.#registry.collections.get(row.collection)
+              if (coll) {
+                const q = compileSubsetQuery(coll.table, { pk: coll.pk, where: row.where })
+                this.#refuseUnknownColumns(coll.table, q.columns, columns)
+              }
               this.#subs.add(ws, row.subId, row.collection, row.where)
             } catch (e) {
               if (e instanceof UnsupportedPredicateError) {
@@ -400,6 +416,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           orderBy: req.orderBy,
           limit: req.limit,
         })
+        this.#refuseUnknownColumns(coll.table, query.columns)
         const rows = Array.from(this.#sql.exec(query.sql, ...query.params)).map((row) => {
           let out: Record<string, SqlStorageValue> | undefined
           for (const [k, v] of Object.entries(row)) {
@@ -685,15 +702,16 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           // Cursor present: ties first (base AND whereCurrent, unbounded boundary
           // set), then the bounded next page (base AND whereFrom). The cursor
           // expressions arrive raw — excluding the base — so we compose them here.
-          // No cursor: a plain bounded `where` read.
-          if (frame.cursor != null) {
-            const tq = compileSubsetQuery(frame.collection, {
-              pk: coll.pk,
-              where: andPredicates(frame.where, frame.cursor.whereCurrent),
-              orderBy: frame.orderBy,
-            })
-            rows.push(...Array.from(this.#sql.exec(tq.sql, ...tq.params)))
-          }
+          // No cursor: a plain bounded `where` read. Both are compiled and their
+          // columns checked before either runs.
+          const tq =
+            frame.cursor != null
+              ? compileSubsetQuery(frame.collection, {
+                  pk: coll.pk,
+                  where: andPredicates(frame.where, frame.cursor.whereCurrent),
+                  orderBy: frame.orderBy,
+                })
+              : undefined
           const nextWhere = frame.cursor != null ? andPredicates(frame.where, frame.cursor.whereFrom) : frame.where
           const nq = compileSubsetQuery(frame.collection, {
             pk: coll.pk,
@@ -701,6 +719,8 @@ export function Syncable<Env = unknown, TUser = unknown>() {
             orderBy: frame.orderBy,
             limit: frame.limit,
           })
+          this.#refuseUnknownColumns(coll.table, [...(tq?.columns ?? []), ...nq.columns])
+          if (tq) rows.push(...Array.from(this.#sql.exec(tq.sql, ...tq.params)))
           rows.push(...Array.from(this.#sql.exec(nq.sql, ...nq.params)))
           this.#send(ws, { t: "page", fetchId: frame.fetchId, rows, seq })
         } catch (e) {
@@ -1064,7 +1084,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
         // Lower where/orderBy/limit/offset into SQLite. An un-lowerable predicate
         // (outside the supported floor, or over one of SQLite's limits) is
         // rejected, not silently full-scanned.
-        let query: { sql: string; params: Array<unknown> }
+        let query: { sql: string; params: Array<unknown>; columns: Array<string> }
         try {
           query = compileSubsetQuery(frame.collection, {
             pk: coll.pk,
@@ -1073,6 +1093,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
             limit: frame.limit,
             offset: frame.offset,
           })
+          this.#refuseUnknownColumns(coll.table, query.columns)
         } catch (e) {
           if (e instanceof UnsupportedPredicateError) {
             console.error(`sub '${clip(frame.subId)}' on '${clip(frame.collection)}' rejected: ${clip(e.message)}`)
@@ -1159,6 +1180,25 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           this.#send(ws, { t: "snap", sub: frame.subId, key: row[coll.pk], row, seq })
         }
         this.#send(ws, { t: "snap-end", sub: frame.subId, seq })
+      }
+
+      /** Refuse a query that names a column the table does not have, as
+       *  `SELECT *` names them (ADR-0013 amendment 2026-11-17). SQLite reads such a
+       *  name as a string, and resolves `rowid` or a name in another case, none of
+       *  which the evaluator sees on a row. The columns are read from SQLite only
+       *  when the query names one, and kept only in `cache` (the caller's own),
+       *  so a column added since the last query is never refused. */
+      #refuseUnknownColumns(table: string, named: Array<string>, cache = new Map<string, ReadonlySet<string>>()): void {
+        for (const name of named) {
+          let columns = cache.get(table)
+          if (!columns) {
+            // `table_xinfo`, not `table_info`: it lists generated columns, which
+            // `SELECT *` returns. Rows read: one per column of the table.
+            const rows = this.#sql.exec<{ name: string }>("SELECT name FROM pragma_table_xinfo(?)", table)
+            cache.set(table, (columns = new Set(Array.from(rows, (r) => r.name))))
+          }
+          if (!columns.has(name)) throw new UnsupportedPredicateError(`column '${name}' is not in table '${table}'`)
+        }
       }
 
       /** The backstop behind the compiler's limit checks (ADR-0012 amendment
