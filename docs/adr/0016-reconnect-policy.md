@@ -1,6 +1,6 @@
 # 0016 — Transport reconnect policy: injectable delay function, terminal 4xxx, jittered backoff
 
-**Status:** Accepted. Fixes issues #25 and #26.
+**Status:** Accepted. Fixes issues #25 and #26. §3 amended 2026-11-17 (see the end).
 
 ## Context
 
@@ -136,3 +136,104 @@ re-enters backoff on the very next close anyway, one attempt later).
   here: the current shape is pinned by the race tests and has passed two
   adversarial reviews; unify when this file is next touched, with those same
   tests as the harness.
+
+## Amendment 2026-11-17: only a connection that stayed open resets the backoff
+
+### What was wrong
+
+§3 reset the attempt counter on every successful open. Its reason was that "an
+open that immediately drops re-enters backoff on the very next close anyway,
+one attempt later". That is false. The open had already set the counter to 0,
+so the next close is attempt 1 again, never attempt 2. A server that accepts a
+socket and then closes it holds every client at attempt 1: with the default
+policy, a delay from 0 to 250 ms, then a new socket that resends every
+subscription, for as long as the cause lasts. In a test, a real Durable
+Object that answers each subscription and then closes with 1011 drew 93 dials
+in 500 ms from one client whose policy starts at 2 ms and doubles.
+
+The loop is reachable today. A Durable Object can throw on the first frame
+after a deploy. ADR-0019 closes a socket whose restored predicate cannot be
+compiled. A handler can fail on every resubscribe. In each case the failure
+repeats while the cause persists, and every open succeeds.
+
+### Decision
+
+A connection proves healthy by **staying open for at least 30 seconds**. The
+transport records the time when it installs a socket. When that socket closes
+unexpectedly, the transport compares the time: if the socket lived at least
+30 s, the counter goes back to 0 before the next attempt is counted, so a
+later blip retries at the first-attempt delay as before. Otherwise the close
+counts as one more failed attempt, the same as a failed open. A successful
+open no longer resets anything. The check runs once, at close, so it needs no
+timer.
+
+The counter also goes back to 0 when a run of retries ends: on a terminal stop
+(the policy returned `null`), on `close()`, and when the last unsubscribe
+cancels a pending reconnect. The next run, whether an app-driven `connect()`
+after re-auth, a revived transport (ADR-0020), or a new `subscribe`, starts at
+attempt 1 as it did before. Without this a policy that gives up after N
+attempts would give up at once on the next run.
+
+### The candidates
+
+A rule for "proven healthy" was compared against these loops: a server that
+closes as soon as it accepts; one that answers every subscription and then
+closes; one that answers some subscriptions and closes on the next; and one
+that answers everything and closes later, for example on a replayed write or
+on a call the app makes whenever it connects.
+
+- **The first server frame arrived.** §3 named this and set it aside. It does
+  not stop a server that answers one subscription and closes on the next, or
+  any server that answers and then closes.
+- **Every subscription in the resubscribe batch received its terminal.** This
+  stops the partial answer. It does not stop a server that answers everything
+  and then closes, which is the loop of a call the app makes on every connect
+  that crashes the object. It also needs a set of pending ids per socket that
+  must track subscriptions added or removed during the batch, and it says
+  nothing about the first connection, which has no resubscribe batch.
+- **The connection stayed open for a minimum time.** One timestamp per socket
+  and one comparison at close. Every loop whose connections die before the
+  threshold grows to the policy's cap. A loop whose connections outlive the
+  threshold cannot dial faster than once per threshold, whatever the server
+  does. This is the simplest rule and the only one of the three that stops
+  every loop above. It is the decision.
+
+### Where 30 seconds comes from
+
+It is the default policy's cap. With the threshold equal to the cap, no
+reconnect cycle runs faster than about one dial per 30 s once the counter has
+grown: a cycle whose sockets die young reaches the cap, and a cycle whose
+sockets live 30 s or longer is already that slow. A shorter threshold would
+leave a server that closes just after it free to loop faster than the cap.
+
+The cost falls on a connection that drops more than once within 30 s of
+opening, for example on a flapping mobile link. Each such drop now doubles the
+delay's ceiling instead of returning it to 250 ms. That is the backoff doing its job:
+a link that cannot hold a socket for 30 s is failing. The threshold is fixed,
+not an option, because no app has needed another value. A custom policy still
+sees every attempt number and can shape its own delays.
+
+### What does not change
+
+- The policy keeps its signature. A custom policy sees larger attempt numbers
+  in the looping case and nothing else.
+- Terminal stops, `onClosed`, and the tracked reconnect timer are unchanged.
+- A demand-driven connect (a mutation, fetch, or subscribe in the reconnect
+  window) still dials at once and still supersedes the pending timer. Its
+  socket is judged at close like any other.
+- A cursor-regress reconnect (`forceReconnect`) still bypasses the policy and
+  consumes no attempt. It no longer resets the counter either.
+- The parked write deadline of ADR-0021 is a separate timer that starts at
+  the first drop. It is not touched. In a looping case the longer delays make
+  it more likely that a parked write settles with `ConnectionLostError` before
+  a replay answers, which is the outcome ADR-0021 defines for that case.
+
+### A later design
+
+A proposed design (ADR-0026, not accepted) holds the cursor through a
+resubscribe round and wants an abandoned round not to reset the backoff. This
+rule gives that without knowing about rounds. Resets now happen only at a
+close after 30 s and when a run of retries ends, so a socket abandoned within
+30 s never resets the counter, whatever path abandons it. A round abandoned
+after 30 s does reset it, but such a cycle already dials no faster than the
+cap.
