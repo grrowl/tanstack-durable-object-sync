@@ -15,6 +15,8 @@
 // sets `PRAGMA case_sensitive_like = ON` (SyncDurableObject constructor), which
 // makes SQLite LIKE case-sensitive to match @tanstack/db's case-sensitive `like`.
 
+import { columnRefProblem, IDENT } from "../wire/column-ref.ts"
+
 export class UnsupportedPredicateError extends Error {
   constructor(message: string) {
     super(message)
@@ -22,7 +24,6 @@ export class UnsupportedPredicateError extends Error {
   }
 }
 
-const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/
 // SQLite limits in a Durable Object, set by workerd's `SqliteDatabase::setupSecurity`
 // (Cloudflare's Durable Objects limits page lists the same). A query over one is
 // refused when it is compiled (ADR-0013 amendment 2026-11-17). The checks are
@@ -97,14 +98,16 @@ function isNode(x: unknown): x is Node {
 /** Validate a column reference, record its name in `names`, and quote it. The
  *  quoting alone does not make an unknown name fail: SQLite reads a double quoted
  *  name that matches no column as a string. The caller checks `names` against
- *  the table (ADR-0013 amendment 2026-11-17). */
+ *  the table (ADR-0013 amendment 2026-11-17).
+ *
+ *  The ref must have the one shape `columnRefProblem` accepts (ADR-0013
+ *  amendment 2026-11-17, column references). `where` and `orderBy` both come
+ *  here, and the on-demand adapter uses the same rule to decide which `orderBy`
+ *  it can send. */
 function column(node: unknown, names: Set<string>): string {
-  if (!isNode(node) || node.type !== "ref") throw new UnsupportedPredicateError("expected a column reference")
-  if (node.path.length !== 1) {
-    throw new UnsupportedPredicateError(`nested/aliased column paths are not supported: [${node.path.join(", ")}]`)
-  }
-  const name = node.path[0]!
-  if (!IDENT.test(name)) throw new UnsupportedPredicateError(`invalid column name: ${name}`)
+  const problem = columnRefProblem(node)
+  if (problem !== null) throw new UnsupportedPredicateError(problem)
+  const name = (node as { path: [string] }).path[0]
   names.add(name)
   return `"${name}"`
 }
@@ -213,8 +216,13 @@ function compileExpr(node: unknown, params: Array<unknown>, names: Set<string>):
     )
   }
   const { name, args } = node
+  // The evaluator calls `args.map`; a map with `length` would compile here and throw there.
+  if (typeof name !== "string" || !Array.isArray(args)) {
+    throw new UnsupportedPredicateError("a function expression needs a string name and an args array")
+  }
 
-  if (name in COMPARATORS) {
+  // Own keys only: `in` would find `toString` on the prototype and write broken SQL.
+  if (Object.hasOwn(COMPARATORS, name)) {
     if (args.length !== 2) throw new UnsupportedPredicateError(`'${name}' expects 2 arguments`)
     if (name === "like") {
       // @tanstack/db's evaluateLike returns false unless BOTH operands are
@@ -288,37 +296,47 @@ export function compileWhere(where: unknown): { sql: string; params: Array<unkno
   return { sql: compileExpr(where, params, new Set()).sql, params }
 }
 
-/** Extract (column, descending, nulls last) from an orderBy clause. Accepts @tanstack/db's
- *  OrderByClause ({ expression: PropRef, compareOptions: { direction, nulls } }) — the
- *  real wire shape from a live query — or a simple { col, dir }. Nulls default to
- *  first, as in TanStack's comparator, in either direction. */
-function orderByTerm(item: unknown): { col: string; desc: boolean; nullsLast: boolean } {
+/** Extract (quoted column, descending, nulls last) from an orderBy clause, recording
+ *  the column in `names`. Accepts @tanstack/db's OrderByClause ({ expression:
+ *  PropRef, compareOptions: { direction, nulls } }), the real wire shape from a
+ *  live query, whose expression is read by the same rule as a ref in `where`; or a
+ *  simple { col, dir }. Nulls default to first, as in TanStack's comparator, in
+ *  either direction. */
+function orderByTerm(item: unknown, names: Set<string>): { col: string; desc: boolean; nullsLast: boolean } {
+  if (typeof item !== "object" || item === null) {
+    throw new UnsupportedPredicateError(`unsupported orderBy clause: ${String(item)}`)
+  }
   const o = item as {
-    expression?: { type?: string; path?: Array<string> }
+    expression?: unknown
     compareOptions?: { direction?: string; nulls?: string }
     col?: unknown
     dir?: unknown
   }
-  if (o.expression?.type === "ref" && Array.isArray(o.expression.path) && o.expression.path.length > 0) {
-    const path = o.expression.path
+  if (o.expression !== undefined) {
     const nullsLast = o.compareOptions?.nulls === "last"
-    return { col: path[path.length - 1]!, desc: o.compareOptions?.direction === "desc", nullsLast }
+    return { col: column(o.expression, names), desc: o.compareOptions?.direction === "desc", nullsLast }
   }
-  if (typeof o.col === "string") return { col: o.col, desc: o.dir === "desc", nullsLast: false }
-  throw new UnsupportedPredicateError(`unsupported orderBy clause: ${JSON.stringify(item)}`)
+  if (typeof o.col === "string") {
+    if (!IDENT.test(o.col)) throw new UnsupportedPredicateError(`invalid orderBy column: ${o.col}`)
+    names.add(o.col)
+    return { col: `"${o.col}"`, desc: o.dir === "desc", nullsLast: false }
+  }
+  // A frame can carry a bigint (MessagePack decodes a 64 bit integer as one), which JSON.stringify throws on.
+  const shown = JSON.stringify(item, (_k, v: unknown) => (typeof v === "bigint" ? `${v}n` : v))
+  throw new UnsupportedPredicateError(`unsupported orderBy clause: ${shown}`)
 }
 
 function compileOrderBy(orderBy: unknown, pk: string, names: Set<string>): string {
-  if (!Array.isArray(orderBy) || orderBy.length === 0) return ""
+  if (orderBy == null) return ""
+  if (!Array.isArray(orderBy)) throw new UnsupportedPredicateError("orderBy must be an array of terms")
+  if (orderBy.length === 0) return ""
   if (!IDENT.test(pk)) throw new UnsupportedPredicateError(`invalid pk column: ${pk}`)
   if (orderBy.length + 1 > MAX_ORDER_BY_TERMS) {
     throw new UnsupportedPredicateError(`orderBy has ${orderBy.length} terms; Durable Object SQLite allows ${MAX_ORDER_BY_TERMS - 1} beside the pk`)
   }
   const terms = orderBy.map((item) => {
-    const { col, desc, nullsLast } = orderByTerm(item)
-    if (!IDENT.test(col)) throw new UnsupportedPredicateError(`invalid orderBy column: ${col}`)
-    names.add(col)
-    return `"${col}" ${desc ? "DESC" : "ASC"} NULLS ${nullsLast ? "LAST" : "FIRST"}`
+    const { col, desc, nullsLast } = orderByTerm(item, names)
+    return `${col} ${desc ? "DESC" : "ASC"} NULLS ${nullsLast ? "LAST" : "FIRST"}`
   })
   // Final tie-break by pk, ascending whatever the order direction: @tanstack/db
   // breaks value ties by row key ascending (db-ivm `createKeyedComparator`, same in
@@ -382,8 +400,8 @@ export function compileSubsetQuery(
     // across inserts regardless of intervening deletes. Every synced table
     // exposes a real internal rowid: `assertSyncCompatible` (changes.ts) forbids
     // an `INTEGER PRIMARY KEY` pk (which aliases it), a `WITHOUT ROWID` table
-    // (which has none), and a declared `rowid` column (which shadows it), so this
-    // reference always resolves to insertion order.
+    // (which has none), and a column named `rowid`, generated or not (which
+    // shadows it), so this reference always resolves to insertion order.
     sql += ` ORDER BY rowid`
   }
 

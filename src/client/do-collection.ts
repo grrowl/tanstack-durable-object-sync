@@ -25,6 +25,7 @@ import {
   type CollectionConfig,
 } from "@tanstack/db"
 import { encode as codecEncode } from "../wire/codec.ts"
+import { columnRefProblem } from "../wire/column-ref.ts"
 import type { MutOp, RowOp } from "../wire/frames.ts"
 import { MAX_CURSOR, type SubHandler, type Transport } from "./transport.ts"
 
@@ -114,6 +115,47 @@ interface LoadSubsetOptions {
   offset?: number
   cursor?: { whereFrom: unknown; whereCurrent: unknown; lastKey?: unknown }
   signal?: AbortSignal
+}
+
+/** True when the server can sort by every term of `orderBy`: each term orders by
+ *  a column ref in the one shape the server reads (`columnRefProblem`, ADR-0013
+ *  amendment 2026-11-17). @tanstack/db 0.8 pushes an `orderBy` through a subquery
+ *  or a join to the source with refs such as `["sub", "body"]`, and every version
+ *  sends a nested field as a longer path. The server refuses those. */
+function serverCanSort(orderBy: unknown): boolean {
+  return (
+    Array.isArray(orderBy) &&
+    orderBy.every((t) => typeof t === "object" && t !== null && columnRefProblem((t as { expression?: unknown }).expression) === null)
+  )
+}
+
+/** The top-level conjuncts of a `where`, flattened through nested `and`s. */
+function conjuncts(e: unknown): Array<unknown> {
+  const f = e as { type?: unknown; name?: unknown; args?: unknown } | null
+  return f?.type === "func" && f.name === "and" && Array.isArray(f.args) ? f.args.flatMap(conjuncts) : [e]
+}
+
+/** True when `node` holds a column ref the server cannot read (`columnRefProblem`). */
+function holdsUnreadableRef(node: unknown): boolean {
+  if (typeof node !== "object" || node === null) return false
+  const n = node as { type?: unknown; args?: unknown }
+  if (n.type === "ref") return columnRefProblem(node) !== null
+  return n.type === "func" && Array.isArray(n.args) && n.args.some(holdsUnreadableRef)
+}
+
+/** A `where` the server can read that every row of `where` matches
+ *  (ADR-0023 amendment 2026-11-17). A top-level conjunct that holds a ref the
+ *  server cannot read is dropped; any other node that holds one is dropped
+ *  whole, as the conjunct it is part of, so nothing is widened inside an `or` or
+ *  a `not`. `where` itself when nothing is dropped, `undefined` when nothing is
+ *  left. The rebuilt `and` keeps the original node's keys in order, so a request
+ *  key matches core's own request for the same conjuncts. Operators off the
+ *  floor are not touched: the server still refuses them. */
+function readableWhere(where: unknown): unknown {
+  if (!holdsUnreadableRef(where)) return where
+  const kept = conjuncts(where).filter((c) => !holdsUnreadableRef(c))
+  if (kept.length <= 1) return kept[0]
+  return { ...(where as object), args: kept }
 }
 
 function compilePredicate(where: unknown): (row: Record<string, unknown>) => boolean {
@@ -397,6 +439,8 @@ export function doCollectionOptions(opts: {
         pins: number
         /** Reached its first snap-end: the DO accepted it. */
         bootstrapped: boolean
+        /** Opened with no limit: once bootstrapped it holds every row of its `where`. */
+        whole: boolean
         /** Settles true at its first snap-end, false if refused or retired;
          *  rejects if its subscribe itself fails. */
         accepted: Promise<boolean>
@@ -505,10 +549,6 @@ export function doCollectionOptions(opts: {
         unsubscribeQuietly(w.subId)
         dropHolds(w)
         flush()
-      }
-      const conjuncts = (e: unknown): Array<unknown> => {
-        const f = e as { type?: unknown; name?: unknown; args?: unknown } | null
-        return f?.type === "func" && f.name === "and" && Array.isArray(f.args) ? f.args.flatMap(conjuncts) : [e]
       }
       const conjunctKeys = (where: unknown): Array<string> => conjuncts(where).map((c) => codecEncode(c ?? null))
       /** A watch of this generation that keeps every row of `where` live:
@@ -661,6 +701,7 @@ export function doCollectionOptions(opts: {
           conjunctKeys: conjunctKeys(o.where),
           pins: 1,
           bootstrapped: false,
+          whole: o.limit == null,
           accepted,
           accept,
           gen,
@@ -741,18 +782,26 @@ export function doCollectionOptions(opts: {
       // DuplicateKeySyncError and abort the transaction), and a key the live sub
       // already holds keeps its fresher value. The live `where` sub stays the
       // source of truth for anything currently in the collection.
+      //
+      // A request the server cannot read as asked (see `sendable`) has a cursor
+      // built from the same order, which it cannot read either: the page is then
+      // the whole readable `where` subset, with no cursor, order or limit. Rows
+      // already held are kept (insert-if-absent). When the covering watch was
+      // opened with no limit and has its snapshot, it already holds every row of
+      // its `where`, and so of this request's: nothing to fetch.
       const loadMore = async (o: LoadSubsetOptions): Promise<void> => {
         const { whereFrom, whereCurrent } = o.cursor!
         const g = gen
-        const cover = findCover(o.where) // the watch that keeps these rows live, as of the request
+        const where = readableWhere(o.where)
+        const exact = where === o.where && serverCanSort(o.orderBy)
+        const cover = findCover(where) // the watch that keeps these rows live, as of the request
+        if (cover?.whole) return
         const page = await transport.fetch({
           t: "fetch",
           fetchId: `${table}#fetch#${++subSeq}`,
           collection: table,
-          where: o.where,
-          cursor: { whereFrom, whereCurrent },
-          orderBy: o.orderBy,
-          limit: o.limit,
+          where,
+          ...(exact ? { cursor: { whereFrom, whereCurrent }, orderBy: o.orderBy, limit: o.limit } : {}),
         })
         // A request cancelled, a truncate (new generation), or a session cleaned
         // up meanwhile: install nothing (0.9 cooperative cancellation; a page
@@ -791,20 +840,38 @@ export function doCollectionOptions(opts: {
         await installPage(page, w)
       }
 
-      const loadSubset = (o: LoadSubsetOptions): true | Promise<void> => {
-        if (o.cursor) return loadMore(o)
+      /** The request as it is sent (ADR-0023 amendment 2026-11-17): one the
+       *  server can read that holds every row core asked for. The client
+       *  filters, sorts and cuts the rows it holds, so a wider request gives the
+       *  same query. When the server cannot sort by the `orderBy`, or cannot read
+       *  part of the `where` (`readableWhere`), the request is for the whole
+       *  readable `where` subset: no `orderBy`, `limit` or `offset` (a limit over a
+       *  wider `where` could miss rows of the narrower one). Decided here, once, so
+       *  the request key, the watch, the covered fetch and the SSR read all see
+       *  the same request. */
+      const sendable = (o: LoadSubsetOptions): LoadSubsetOptions => {
+        const where = readableWhere(o.where)
+        if (where === o.where && (o.orderBy == null || serverCanSort(o.orderBy))) return o
+        return { where, signal: o.signal }
+      }
+
+      const loadSubset = (core: LoadSubsetOptions): true | Promise<void> => {
+        if (core.cursor) return loadMore(core)
+        // Bookkeeping (`outstanding`, `acquisitionOf`) is by the object core
+        // passed, which it releases with; everything else uses the sent request.
+        const o = sendable(core)
         // Neither a watch's snapshot nor a fetch can skip rows without a cursor:
         // fail loud rather than answer with the wrong page. (Upstream pairs a
         // non-zero offset with a cursor.)
         if (o.offset) {
           return Promise.reject(new Error(`on-demand '${table}': a subset request with offset ${o.offset} and no cursor is unsupported`))
         }
-        outstanding.set(o, (outstanding.get(o) ?? 0) + 1)
+        outstanding.set(core, (outstanding.get(core) ?? 0) + 1)
         const key = requestKey(o)
         const existing = acquisitions.get(key)
         if (existing) {
           existing.refs++
-          acquisitionOf.set(o, existing)
+          acquisitionOf.set(core, existing)
           return existing.ready
         }
         let resolve!: () => void
@@ -815,7 +882,7 @@ export function doCollectionOptions(opts: {
         })
         const acq: Acquisition = { key, refs: 1, ready, watch: null, released: false, gen, settle: () => resolve(), fail: reject }
         acquisitions.set(key, acq)
-        acquisitionOf.set(o, acq)
+        acquisitionOf.set(core, acq)
         // A completed load also (re)marks ready — the recovery path out of a
         // failed ready-gate's error state (idempotent otherwise). A send failure
         // or rejected receipt rejects THIS load (0.8.4 surfaces it

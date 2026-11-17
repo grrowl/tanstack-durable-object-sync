@@ -106,3 +106,77 @@ Collection definitions are now `{ table, pk }` — `ddl` is removed.
 - **Cost:** a hard break for every DO subclass — `protected registry = …(ddl)`
   field → a constructor that migrates then `registerSync(registry)`. All three
   examples and the test-worker move to the new shape.
+
+## Amendment 2026-11-17: a generated `rowid` column and a `__proto__` column are refused
+
+**Context.** The review of the unknown columns change (ADR-0013 amendment
+2026-11-17) found two kinds of table that passed `assertSyncCompatible` but
+cannot be synced correctly. Both were measured in workerd 1.20260721.1.
+
+1. **A generated column named `rowid`.** `assertSyncCompatible` read the columns
+   with `pragma_table_info`, which does not list generated columns, so its check
+   for a column named `rowid` (ADR-0015) did not see one. Its probe
+   `SELECT rowid` succeeds, because `rowid` then names the generated column. So
+   `CREATE TABLE p4 (id TEXT PRIMARY KEY, body TEXT, rowid TEXT GENERATED ALWAYS
+   AS (upper(body)) VIRTUAL)` registered, and the default `ORDER BY rowid` sorted
+   by the generated value instead of by insertion order. A stored generated
+   column does the same.
+2. **A column named `__proto__`.** The name passes the identifier check. workerd
+   builds each row of `SELECT *` by setting each column on a plain object, so this
+   name calls the `__proto__` setter: the row has no own `__proto__` key, a text
+   value is dropped, and a NULL sets the row's prototype to null. No snapshot and
+   no delta carries the column, and a `where` on it matched rows in SQL while the
+   evaluator, which reads `row.__proto__`, read the prototype and matched none.
+
+**Decision.**
+
+- `assertSyncCompatible` reads `pragma_table_xinfo` instead of
+  `pragma_table_info`. It lists the same columns and the generated ones, which
+  `SELECT *` returns. A generated column cannot be a primary key, so the pk checks
+  give the same answers. The existing check for a column named `rowid`, in any
+  letter case, now sees a generated one, virtual or stored.
+- It refuses a column named exactly `__proto__`, plain or generated, with a
+  message that names the column. The rule is "a name a row object cannot carry".
+  In an unmodified realm `__proto__` is the only accessor that `Object.prototype`
+  defines, so it is the only such name. The review checked in workerd that a row
+  of `SELECT *` carries columns named `constructor`, `toString`,
+  `hasOwnProperty`, `__defineGetter__`, `valueOf`, `length`, `then`, `0`, the
+  empty string and `a b` as own keys; the test pins the first three. The name is
+  compared exactly, as row keys are, so `__PROTO__` is an ordinary column, and a
+  test pins that too.
+
+Both are refused at registration and not per query, because the fault is in the
+table. With a generated `rowid`, every read with no `orderBy` (an eager
+collection's snapshot, and any on-demand request without one) is sorted by the
+generated value instead of by insertion order; a read with an `orderBy` is not
+affected. With a `__proto__` column, no row of the table can be carried whole.
+That is the kind of fault the other `assertSyncCompatible` checks refuse.
+
+**Consequences.**
+
+- **Breaking.** `registerSync` now throws for a table with a generated column
+  named `rowid` or a column named `__proto__`, where it used to succeed.
+  `registerSync` runs in the constructor, inside `blockConcurrencyWhile`, on
+  every wake, and it stores the registry only after every collection passes
+  (`#registerSync` in `mixin.ts`). So the throw fails the whole object, not only
+  that collection: every sync frame, mutation and `readSyncSnapshot` on it fails,
+  on every wake. An app with such a table must rename the column with
+  `ALTER TABLE … RENAME COLUMN` in a migration that runs before `registerSync`
+  in the constructor, and deploy that migration with the upgrade. `RENAME COLUMN`
+  works for a plain column and for a generated one, virtual or stored, on a
+  table with rows. Dropping a stored generated column and adding it back does
+  not: SQLite refuses to add a STORED column to a table with rows, so the
+  migration would drop the column and then throw.
+- Like every check in `assertSyncCompatible`, these run in `registerSync`. A
+  migration that adds such a column while the object is alive, with no
+  `registerSync` after it, is caught only at the next `registerSync`, at the latest
+  on the next wake. Until then the column check of ADR-0013 reads the live table,
+  so it accepts a query that names a `__proto__` column added that way.
+- No cost at query time. `registerSync` reads the same pragma family as before,
+  once per collection.
+
+**Evidence.** `tests/assert-sync-compatible.test.ts` pins both refusals (virtual
+and stored `rowid`, plain and generated `__proto__`), what SQLite and workerd do
+that makes each table wrong, that `constructor`, `toString`, `hasOwnProperty`
+and `__PROTO__` are still accepted, and that `RENAME COLUMN` on each refused
+column, with rows, makes the table register.

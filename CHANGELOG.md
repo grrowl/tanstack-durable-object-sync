@@ -10,6 +10,29 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ### Changed
 
+- **BREAKING:** `registerSync` refuses a table with a generated column named
+  `rowid` (virtual or stored) or a column named `__proto__`. Both used to
+  register. With the first, every read with no `orderBy` was sorted by the
+  generated value instead of by insertion order. The second cannot be carried
+  on a row object, so no snapshot or delta held it, and a `where` on it
+  disagreed with the deltas. `registerSync` runs in your constructor on every
+  wake, so the throw fails the whole Durable Object, not only that collection.
+  Rename the column with `ALTER TABLE … RENAME COLUMN` in a migration that
+  runs before `registerSync`, and deploy the two together. `RENAME COLUMN`
+  works for a generated column too. Do not drop a stored generated column and
+  add it back, which fails on a table with rows (ADR-0007 amendment).
+- **An on-demand query that orders by or filters on something other than a
+  column loads the rest of its `where` subset.** This covers a nested field
+  such as `m.title.length`, in an `orderBy` or a `where`, on every
+  `@tanstack/db` version. On 0.8.x it also covers an `orderBy` on a field of
+  a subquery, or one with clauses on two collections of a join. The adapter
+  sends a request the server can read and the client filters, sorts and cuts
+  the rows itself. The query is right on the socket and in a server render,
+  but its `limit` no longer saves loading, and a `where` on a nested field
+  alone loads the whole collection, which then stays loaded while any other
+  query on that collection is mounted. Before, the server sorted such a query
+  by another column or by nothing, so a limited query could show the wrong
+  rows, and a `where` on a nested field showed none (ADR-0023 amendment).
 - **BREAKING: ids and names have a length limit.** A `subId`, `fetchId` or
   `txId` may be at most 256 UTF-8 bytes, and a collection or command name at
   most 128. A frame whose id is over the limit gets its own refusal, with
@@ -175,6 +198,19 @@ While pre-1.0, the public API may change between 0.x releases.
   like a malformed one: hydrate throws, an eager collection reconciles from a
   snapshot, and an on-demand collection truncates and reloads its queries.
   `seedCursor` refuses such a cursor too.
+- **A column reference must have the one shape the server reads.** A ref in
+  `where`, `orderBy` or a cursor must be exactly
+  `{ type: "ref", path: [name] }`. A frame built by hand with a ref carrying
+  `sourceAlias` or another field, a path that is not an array of one string,
+  or a path of more than one element is refused like an operator off the
+  floor. Before, the server read such a ref as one column while the evaluator
+  read it differently, so the snapshot and the deltas disagreed (ADR-0013
+  amendment).
+- **Six malformed frames are refused.** Before, they got no reply, returned
+  wrong rows, or were ignored: an `orderBy` term of `null` or holding a
+  bigint, an `orderBy` that is not an array, a function with no `args` or
+  with `args` that is not an array, and a function named after an
+  `Object.prototype` member such as `toString` (ADR-0013 amendment).
 
 ### Tests
 
