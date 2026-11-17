@@ -116,6 +116,10 @@ export class SsrSnapshotTransport<Api = unknown> implements Transport<Api> {
   async fetch(frame: Extract<ClientFrame, { t: "fetch" }>): Promise<Array<unknown>> {
     const { collection, where, cursor, orderBy, limit } = frame
     if (cursor == null) return this.read(collection, where, orderBy, limit)
+    // As the server: without both halves the ties read would be an unbounded scan.
+    if (cursor.whereCurrent == null || cursor.whereFrom == null) {
+      throw new Error(`fetch on '${collection}' rejected during SSR: malformed cursor`)
+    }
     const and = (a: unknown, b: unknown): unknown => (a == null ? b : { type: "func", name: "and", args: [plain(a), plain(b)] })
     const ties = await this.read(collection, and(where, cursor.whereCurrent), orderBy)
     const page = await this.read(collection, and(where, cursor.whereFrom), orderBy, limit)
