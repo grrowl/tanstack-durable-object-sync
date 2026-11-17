@@ -26,7 +26,7 @@ import {
 } from "@tanstack/db"
 import { encode as codecEncode } from "../wire/codec.ts"
 import type { MutOp, RowOp } from "../wire/frames.ts"
-import type { SubHandler, Transport } from "./transport.ts"
+import { MAX_CURSOR, type SubHandler, type Transport } from "./transport.ts"
 
 let subSeq = 0
 
@@ -97,8 +97,13 @@ function parseSyncMeta(meta: unknown): DoSyncMeta {
   // ignores it but `since:"-1"` would reach the server, which answers a
   // full snapshot the on-demand catch-up handler discards — no terminal, the
   // transient sub never tears down, and stale hydrated rows survive forever.
-  if (BigInt(m.cursor) < 0n) throw new Error(`negative sync-meta cursor: ${m.cursor}`)
-  return { v: 1, cursor: m.cursor, ...(m.where === undefined ? {} : { where: m.where }) }
+  const cursor = BigInt(m.cursor)
+  if (cursor < 0n) throw new Error(`negative sync-meta cursor: ${m.cursor}`)
+  // The server answers a `since` only in its plain form, and drops any other
+  // with no reply (ADR-0012 amendment 2026-11-17): pass the plain form on, and
+  // refuse a cursor past the largest it accepts like one that does not parse.
+  if (cursor > MAX_CURSOR) throw new Error(`sync-meta cursor past the largest position: ${m.cursor}`)
+  return { v: 1, cursor: String(cursor), ...(m.where === undefined ? {} : { where: m.where }) }
 }
 
 /** Subset of @tanstack/db's LoadSubsetOptions we consume. */

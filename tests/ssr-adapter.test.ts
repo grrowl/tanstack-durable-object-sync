@@ -233,6 +233,67 @@ describe("syncMeta hooks", () => {
   })
 })
 
+describe("a sync-meta cursor reaches the server in its plain form (ADR-0012 amendment 2026-11-17)", () => {
+  // The server refuses a `since` that is not plain decimal digits of at most 19
+  // digits, with no reply. A cursor in sync meta that BigInt parses but that
+  // the server would refuse (" 5", "05", "0x5") used to work, and would now
+  // leave the collection with a sub the server never answers. So import passes
+  // on the plain form, and treats a cursor past the server's largest as one it
+  // cannot parse: it throws, and sync start takes the safe "0" route.
+  const start = async (syncMode: "eager" | "on-demand", cursor: string) => {
+    const calls: Array<string> = []
+    const seeded: Array<string> = []
+    const truncated: Array<string> = []
+    const o = doCollectionOptions({
+      transport: { ...spyTransport(calls), seedCursor: (c: string) => void seeded.push(c) },
+      table: "messages",
+      getKey: (r) => r.id,
+      syncMode,
+    }) as unknown as Hooked
+    let thrown: unknown
+    try {
+      o.sync.importSyncMeta({ v: 1, cursor })
+    } catch (e) {
+      thrown = e
+    }
+    o.sync.sync({ ...controls, truncate: () => truncated.push("truncate"), markReady: () => {} })
+    await flush()
+    // The sub counter is module wide, so the number in an id is not compared.
+    const subs = calls.filter((c) => c.startsWith("sub:")).map((c) => c.replace(/#\d+:/, "#n:"))
+    return { thrown, seeded, truncated, subs }
+  }
+
+  for (const cursor of [" 5", "05", "0x5", "5 "]) {
+    it(`eager and on-demand both resume from "5" for ${JSON.stringify(cursor)}`, async () => {
+      const eager = await start("eager", cursor)
+      expect(eager.thrown).toBeUndefined()
+      expect(eager.seeded).toEqual(["5"])
+      expect(eager.subs).toEqual(["sub:messages#n:since=5"])
+      const onDemand = await start("on-demand", cursor)
+      expect(onDemand.thrown).toBeUndefined()
+      expect(onDemand.subs).toEqual(["sub:messages#hydrate#n:since=5"])
+    })
+  }
+
+  it("a cursor of 20 digits is refused like a malformed one: no seed, no since, the safe route", async () => {
+    const big = "1" + "0".repeat(19)
+    const eager = await start("eager", big)
+    expect(String(eager.thrown)).toMatch(/largest position/)
+    expect(eager.seeded).toEqual([])
+    expect(eager.subs).toEqual(["sub:messages#n:since=none"]) // snapshot + reconcile
+    const onDemand = await start("on-demand", big)
+    expect(String(onDemand.thrown)).toMatch(/largest position/)
+    expect(onDemand.truncated).toEqual(["truncate"])
+    expect(onDemand.subs).toEqual([])
+  })
+
+  it("the largest cursor the server accepts (19 nines) is kept", async () => {
+    const eager = await start("eager", "9".repeat(19))
+    expect(eager.thrown).toBeUndefined()
+    expect(eager.subs).toEqual([`sub:messages#n:since=${"9".repeat(19)}`])
+  })
+})
+
 describe("commit receipts (0.8.5 SyncAppliedReceipt)", () => {
   /** Spy transport that CAPTURES subscribe handlers so a test can drive them. */
   function capturingTransport(calls: Array<string>, handlers: Map<string, import("../src/client/transport.ts").SubHandler>): Transport<Api> {

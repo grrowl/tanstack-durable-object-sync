@@ -15,7 +15,7 @@
 // other runtimes (and tests) provide an already-connected socket.
 
 import { createFrameCodec, type FrameCodec, type WireOut } from "../wire/frame-codec.ts"
-import type { ClientFrame, RowOp, ServerFrame } from "../wire/frames.ts"
+import { type ClientFrame, POSITION, type RowOp, type ServerFrame } from "../wire/frames.ts"
 
 /** Minimal structural socket — satisfied by both browser WebSocket and a
  *  workerd accepted client socket, avoiding the DOM-vs-workers type clash. */
@@ -84,6 +84,11 @@ export interface Transport<Api = unknown> {
  *  raise it into the edge cap's lie. If Cloudflare changes the cap, this
  *  constant changes with an ADR note. Mirrors the server's ADR-0012 default. */
 const MAX_FRAME_BYTES = 1_048_576
+
+/** The largest position the server accepts as a `since`: 19 digits, the length
+ *  of SQLite's largest INTEGER. The server drops a `since` past it with no
+ *  reply (ADR-0012 amendment 2026-11-17), so a cursor past it is refused here. */
+export const MAX_CURSOR = 9_999_999_999_999_999_999n
 
 export class MutationRejectedError extends Error {
   constructor(
@@ -363,6 +368,7 @@ export class WebSocketTransport<Api = unknown> {
    */
   seedCursor(cursor: string): void {
     const c = BigInt(cursor) // malformed cursor throws — fail loud, never guess
+    if (c > MAX_CURSOR) throw new Error(`cursor past the largest position: ${cursor}`)
     if (c <= 0n) return // "0" honestly means: no resume point to claim
     if (c >= this.appliedSeq && this.appliedSeq !== 0n) return // never grow the claim
     const wasLive = this.appliedSeq !== 0n && this.ws !== null
@@ -698,6 +704,13 @@ export class WebSocketTransport<Api = unknown> {
      *  (ADR-0011 D3). One-shot: reconnects resume from `appliedCursor`. */
     since?: string,
   ): Promise<void> {
+    // The server drops a `since` in any other form with no reply, so the sub
+    // would wait for ever (ADR-0012 amendment 2026-11-17). Refuse it here.
+    if (since !== undefined && !POSITION.test(since)) {
+      throw new Error(
+        `since must be a position in plain decimal form (digits only, no sign or leading zero, at most 19 digits): ${JSON.stringify(since)}`,
+      )
+    }
     this.handlers.set(subId, { handler, collection, where, orderBy, limit, since, bootstrapped: false })
     await this.connect()
     // Unsubscribed while the connect was in flight (its `unsub` had no socket

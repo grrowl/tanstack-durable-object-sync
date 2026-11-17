@@ -10,6 +10,31 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ### Changed
 
+- **BREAKING: ids and names have a length limit.** A `subId`, `fetchId` or
+  `txId` may be at most 256 UTF-8 bytes, and a collection or command name at
+  most 128. A frame whose id is over the limit gets its own refusal, with
+  nothing stored: `reset` for a sub, an empty `page` for a fetch, and
+  `rejected` with `LIMIT_EXCEEDED` for a mutation or command. An `unsub`
+  over the limit is ignored. A receipt stored under a longer `txId` before
+  this release still replays. A mutation or command whose name is over the
+  limit is rejected with `LIMIT_EXCEEDED` and recorded like any other
+  rejection. A schema with a table or command name over 128 bytes now fails
+  `registerSync`, with a message that names the limit. The client of this
+  library builds ids of at most 158 bytes from such names. It reaches the
+  limit only through ids the app chose: a transaction id over 256 bytes passed
+  to `createTransaction({ id })`, which is now rejected with
+  `LIMIT_EXCEEDED`; a `table` option the server does not register, which
+  reads as an empty collection, as before; or direct transport calls
+  (ADR-0012 amendment).
+- **A `since` above the head of the change log gets `reset` and a
+  snapshot.** It used to get `uptodate`, so a client of an object whose
+  storage was recreated kept the rows of the old object for ever. Now it gets
+  the right rows on that connection: eager collections resnapshot, and
+  on-demand collections reload their queries. The `reset` does not repair the
+  cursor of the client, which stays above the head. So each reconnect
+  snapshots again until the object passes the cursor. If the object passes it
+  while the client is away, the rows written in between are missed. This is
+  the known limitation "No incarnation epoch" of ADR-0011.
 - **SSR reads what the browser reads.** On `@tanstack/db` 0.9 and later,
   core asks for every matching row in two cases: a limited query ordered by
   text with the default sort, and a first page that ends on a NULL in the
@@ -137,6 +162,19 @@ While pre-1.0, the public API may change between 0.x releases.
   subscription restored on wake whose predicate names a column that a
   migration dropped closes its socket with 1011, so the client reconnects and
   that query is refused (ADR-0013 amendment 2026-11-17).
+- **BREAKING (raw clients only): a `sub` whose `since` is not a plain
+  decimal position is dropped as a malformed frame, with no reply.** A plain
+  decimal position is digits only, with no sign, no leading zero and at most
+  19 digits. Before, `"1e400"` was answered `uptodate` without sending
+  anything, and `"abc"` got a snapshot. `Transport.subscribe` now refuses
+  such a `since` at the call, with a message that names the accepted form. A
+  client of 0.7.1 or earlier sends one only from SSR meta that was changed on
+  the way, and that collection then stops receiving updates.
+- **A cursor in SSR meta is sent in its plain form.** A cursor written another
+  way, such as `"05"`, still resumes. A cursor above 19 digits is refused
+  like a malformed one: hydrate throws, an eager collection reconciles from a
+  snapshot, and an on-demand collection truncates and reloads its queries.
+  `seedCursor` refuses such a cursor too.
 
 ### Tests
 
