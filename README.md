@@ -498,6 +498,11 @@ show. The conventions, what's verified and how, and the full
   so a search box that builds `%term%` stops matching at 49 ASCII characters, or
   about 17 CJK characters. Until refusals fail loud, a refused query reads as no
   results.
+- **A column the table does not have:** a `where` or `orderBy` that names a
+  column the table does not have is refused, and the server logs one line. Until
+  refusals fail loud, the query reads as no results. Two names that used to
+  return rows are refused too: a name in another letter case than the declared
+  one (`BODY` for `body`), and `rowid`.
 
 ---
 

@@ -319,10 +319,17 @@ export function Syncable<Env = unknown, TUser = unknown>() {
        *  cursor advances — codex review), whereas a close engages the
        *  reconnect machinery, which re-subscribes everything recoverable and
        *  routes the bad predicate through `#handleSub`'s pre-existing,
-       *  app-visible rejection. A predicate naming a column the table no
-       *  longer has (a migration dropped it) is handled the same way (ADR-0013
-       *  amendment 2026-11-17). A sub on a collection that is no longer
-       *  registered is left to `#reconcileSubs`. */
+       *  app-visible rejection.
+       *
+       *  The whole SQL compiler runs on each persisted `where`, with the
+       *  table's columns checked (ADR-0013 amendment 2026-11-17), so any
+       *  compile refusal closes the socket, including a column a migration
+       *  dropped. Within one build only that can fire: the statement compiled
+       *  here is the sub's own with the same `where` and no `orderBy`, `limit`
+       *  or `offset`, so it has no more parameters, bytes or depth than the one
+       *  accepted at sub time. Any other refusal means the row was written by
+       *  an older build, which is what this close is for. A sub on a
+       *  collection that is no longer registered is left to `#reconcileSubs`. */
       #restoreSubs(): void {
         const columns = new Map<string, ReadonlySet<string>>() // read once per table, for this restore only
         for (const ws of this.#liveWs) {
@@ -1186,8 +1193,8 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           let columns = cache.get(table)
           if (!columns) {
             // `table_xinfo`, not `table_info`: it lists generated columns, which
-            // `SELECT *` returns. `hidden = 1` (a virtual table's hidden column) it omits.
-            const rows = this.#sql.exec<{ name: string }>("SELECT name FROM pragma_table_xinfo(?) WHERE hidden != 1", table)
+            // `SELECT *` returns. Rows read: one per column of the table.
+            const rows = this.#sql.exec<{ name: string }>("SELECT name FROM pragma_table_xinfo(?)", table)
             cache.set(table, (columns = new Set(Array.from(rows, (r) => r.name))))
           }
           if (!columns.has(name)) throw new UnsupportedPredicateError(`column '${name}' is not in table '${table}'`)

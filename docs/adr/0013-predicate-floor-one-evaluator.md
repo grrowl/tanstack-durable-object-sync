@@ -322,43 +322,81 @@ does not already refuse. Option 1 is the simplest one that is correct.
 - `compileSubsetQuery` returns, beside the SQL, the names its `where` and
   `orderBy` refer to (`columns`). It stays free of SQLite.
 - The mixin refuses a query that names a column not in
-  `SELECT name FROM pragma_table_xinfo(?) WHERE hidden != 1`, which is the list
-  of names `SELECT *` returns. The names are compared exactly, as a row's keys
-  are. The refusal is an `UnsupportedPredicateError`, so it takes the same path
-  as an operator off the floor: a `sub` gets `reset` and nothing of it stays
-  registered, a `fetch` gets the empty page, and `readSyncSnapshot` throws. The
-  log line is the existing one, for example
+  `SELECT name FROM pragma_table_xinfo(?)`. For any table that can be synced,
+  that is the list of names `SELECT *` returns. The names are compared exactly,
+  as a row's keys are. The refusal is an `UnsupportedPredicateError`, so it takes
+  the same path as an operator off the floor: a `sub` gets `reset` and nothing of
+  it stays registered, a `fetch` gets the empty page, and `readSyncSnapshot`
+  throws. The class does not survive the RPC: a caller of `readSyncSnapshot`
+  through a stub gets a plain `Error` whose message starts with
+  `UnsupportedPredicateError:`. The log line is the existing one, for example
   `sub 's1' on 'messages' rejected: column 'nope' is not in table 'messages'`,
   clipped like every client string.
 - The pk is a column of the table, so it passes. The library adds no column to
   a synced table: its triggers write to `_sync_changes`, and its own tables are
   all `_sync_*`. The `ORDER BY rowid` default and the pk tie break are written by
   the compiler and are not checked. A `rowid` named by the client is refused.
-- With the unknown column refused, the residual in the 2026-09-29 amendment
+- For a ref as the library's client sends it, the SQL and the evaluator now
+  read the same column, so the residual in the 2026-09-29 amendment
   (`isUndefined` is true in the evaluator for a column the table lacks) can no
-  longer be reached.
+  longer be reached by such a ref. This says nothing about a ref built by hand
+  in a shape the client does not send.
+- A table dropped while the object is alive gives an empty list, so a query
+  that names a column is now refused with `column 'x' is not in table 't'`,
+  where before it threw `no such table`. A query that names no column still
+  throws `no such table`.
 
 **Cost.** One read of the pragma for each `sub`, `fetch` and `readSyncSnapshot`
 whose query names a column, and none for one that names no column (an eager
 collection's `sub`). A cursor `fetch` compiles two statements and reads the list
-once for both. The read is a synchronous call into SQLite's in memory schema; it
-was not timed, because workerd does not advance its clock inside a request.
+once for both. A restore reads it once per table. Each read counts as rows read,
+one per column of the table (measured: `rowsRead` 2 and `rowsWritten` 0 on
+`messages (id, body)`), so each such `sub`, `fetch` and snapshot read adds that
+many rows read. Whether Cloudflare bills rows read from a pragma like rows read
+from a table was not verified. The read is a synchronous call into SQLite's in
+memory schema; it was not timed, because workerd does not advance its clock
+inside a request.
 Nothing is kept between queries, so a column added while the object is alive
 (by `ALTER TABLE` in a migration, with or without a later `registerSync`) is
 accepted by the next query. There is no timer and nothing runs while the object
 is idle.
 
 **Restore (ADR-0019).** A persisted sub carries only its `where` (its `orderBy`
-shaped a snapshot that was already sent). On restore, that `where` is now
-compiled and its columns checked, reading each table's columns once per
-restore. If a migration dropped a column it names, the sub is handled as one
-whose predicate no longer compiles: the socket closes with 1011 and its
-persisted subs are deleted. The client reconnects and sends its subs again; the
-one naming the dropped column is refused with `reset`, and the others are served
-as usual. Restore runs inside every `registerSync`, so a column dropped while the
-object is awake is caught the same way when `registerSync` runs after it. One
-dropped with no `registerSync` after it is not caught: until the next wake or
-reconnect, live subs on it read the column as undefined.
+shaped a snapshot that was already sent). On restore, that `where` now runs
+through the whole SQL compiler, not only the evaluator, and its columns are
+checked, reading each table's columns once per restore. Any compile refusal
+closes the socket on wake. Within one build only a missing column can do that:
+the statement compiled on restore is the sub's own, with the same `where` and no
+`orderBy`, `limit` or `offset`, so it has no more parameters, bytes or depth
+than the statement accepted at sub time. Any other refusal can only come from a
+row written by an older build, which is what the 1011 close was written for.
+
+If a migration dropped a column a persisted `where` names, the sub is handled as
+one whose predicate no longer compiles: the socket closes with 1011 and its
+persisted subs are deleted. What the client then goes through, checked by
+reading `src/client/transport.ts` and `src/client/do-collection.ts` and not by
+a run:
+
+- The transport reconnects and sends every sub again. The sub on the dropped
+  column had bootstrapped, so it goes with `since`. The server refuses it with
+  `reset`, and persists nothing of it.
+- In on-demand mode, a `reset` on a bootstrapped watch reads as "below the
+  retention floor". The collection truncates (`truncateAll`), and the truncate
+  replay loads every subset of that collection on that client again from
+  fresh snapshots. The replay sends a fresh sub for the bad query, which is
+  refused as a watch that never bootstrapped: its load settles and nothing else
+  is touched, so it does not loop.
+- In eager mode, the collection's one sub truncates on that `reset` and the
+  collection stays empty, as for any refused eager sub.
+- Subs of other collections on the same socket catch up from `since` as usual.
+- A refused sub is not persisted, so the next wake has nothing to close.
+
+So the cost is one reconnect and one full reload of that collection for each
+client that held such a sub. Restore runs inside every `registerSync`, so a
+column dropped while the object is awake is caught the same way when
+`registerSync` runs after it. One dropped with no `registerSync` after it is not
+caught: until the next wake or reconnect, live subs on it read the column as
+undefined.
 
 **Not changed.** A refused query still reads as no results on the client, as
 every refusal does today. The kinds of values a column is compared with are not
@@ -366,7 +404,8 @@ checked.
 
 **Evidence.** `tests/unknown-columns.test.ts` drives every shape above through a
 `sub` (including the catch-up path), a `fetch` (including a cursor) and
-`readSyncSnapshot` on a real Durable Object, and checks that nothing of a
+`readSyncSnapshot` on a real Durable Object (one of them through the RPC stub),
+pins each half of a cursor `fetch` alone, and checks that nothing of a
 refused sub is registered or persisted, that the log line names the column and
 is clipped, that the pk and a column added after the first query (plain or
 generated) are accepted, and the restore after a column is dropped.
