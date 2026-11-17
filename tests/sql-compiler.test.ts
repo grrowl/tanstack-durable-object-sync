@@ -30,15 +30,27 @@ describe("IR -> SQL compiler (M6)", () => {
     expect(compileWhere(e)).toEqual({ sql: `("n" > ? AND (NOT "k" = ?))`, params: [5, "z"] })
   })
 
-  it("compiles `in` with one placeholder per element", () => {
+  it("compiles `in` strings to one JSON parameter, whatever the list length", () => {
+    // Membership agreement with @tanstack/db is pinned in in-list-parity.test.ts.
     expect(compileWhere(fn("in", ref("id"), val(["a", "b", "c"])))).toEqual({
-      sql: `"id" IN (?, ?, ?)`,
-      params: ["a", "b", "c"],
+      sql: `("id" IN (SELECT value FROM json_each(?)) AND typeof("id") IN ('text', 'null'))`,
+      params: [`["a","b","c"]`],
+    })
+    expect(compileWhere(fn("in", ref("id"), val(Array.from({ length: 3000 }, (_, i) => `k${i}`)))).params).toHaveLength(1)
+  })
+
+  it("compiles an empty `in` to false, unknown for a NULL column", () => {
+    expect(compileWhere(fn("in", ref("id"), val([])))).toEqual({
+      sql: `CASE WHEN "id" IS NULL THEN NULL ELSE 0 END`,
+      params: [],
     })
   })
 
-  it("compiles an empty `in` to a constant-false", () => {
-    expect(compileWhere(fn("in", ref("id"), val([])))).toEqual({ sql: `0`, params: [] })
+  it("refuses a query over 100 bound parameters (Durable Object SQLite's limit)", () => {
+    // Non-integer numbers bind one each; the list stays shallow.
+    const reals = (n: number) => fn("in", ref("n"), val(Array.from({ length: n }, (_, i) => i + 0.5)))
+    expect(compileSubsetQuery("t", { pk: "id", where: reals(99), limit: 1 }).params).toHaveLength(100)
+    expect(() => compileSubsetQuery("t", { pk: "id", where: reals(100), limit: 1 })).toThrow(UnsupportedPredicateError)
   })
 
   it("rejects operators outside the floor (ne, ilike, functions)", () => {

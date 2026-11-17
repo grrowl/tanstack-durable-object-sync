@@ -492,6 +492,12 @@ show. The conventions, what's verified and how, and the full
   `createTransaction` or `transport.sendMut`, and do not show client error
   messages (some contain the `txId`) to other users. If commands return secrets,
   do not put users who distrust each other in one Durable Object (ADR-0012 D4).
+- **`like` patterns over 50 bytes:** SQLite in a Durable Object accepts a LIKE
+  pattern of at most 50 bytes (`SQLITE_LIMIT_LIKE_PATTERN_LENGTH`, set by workerd;
+  Cloudflare's Durable Objects limits page lists it). A longer pattern is refused,
+  so a search box that builds `%term%` stops matching at 49 ASCII characters, or
+  about 17 CJK characters. Until refusals fail loud, a refused query reads as no
+  results.
 
 ---
 

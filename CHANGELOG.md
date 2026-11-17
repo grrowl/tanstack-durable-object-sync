@@ -10,6 +10,12 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ### Changed
 
+- **Predicates within a few levels of SQLite's expression depth limit of 100
+  are now refused.** The server checks depth on a safe bound before it runs a
+  query, so it can refuse a little early. Examples are an `or` of 98 or 99
+  comparisons, an `or` of 95 or more one-value `in` terms, or a flat `and`
+  that is both tall and wide. A `like` pattern over 50 bytes is refused even
+  when no row would be checked (see Known limitations in the README).
 - **The examples run on `@tanstack/db` and `@tanstack/react-db` 1.0.0-rc.1.5.**
   The ssr example also moves `@tanstack/react-router-with-db` to
   `^1.0.0-rc.1`, because 0.1.0 cannot be installed beside the release
@@ -26,6 +32,33 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ### Fixed
 
+- **A `sub` or `fetch` whose `where` has an `in` list of more than 100
+  values now works.** Before, the subscription got no reply and its live query
+  stayed loading forever, and a fetch timed out. Durable Object SQLite allows
+  100 bound parameters per statement. `@tanstack/db`'s join loader sends one
+  `inArray` over every join key, so a join over more than 100 keys hit this
+  (ADR-0013 amendment).
+- **A query over one of Durable Object SQLite's limits is now refused**
+  (`reset`, an empty page, or a rejected `readSyncSnapshot`) instead of
+  hanging. The limits are bound parameters, expression depth, statement
+  length, value size, ORDER BY terms, and a LIKE pattern over 50 bytes. The
+  same applies to a `limit` or `offset` of 2^63 or more, a bigint comparison
+  value, and a predicate too large to store. A refused subscription no longer
+  stays registered, and a refused re-sub drops the subscription it would have
+  replaced (ADR-0012 amendment).
+- **`in` now matches the way `@tanstack/db` does.** A number no longer
+  matches text in a TEXT column ("1.0" for `1`), and a string no longer
+  matches a number in a numeric column. A `null` in the list no longer empties
+  `not(in(…))`, and `not(in(col, []))` no longer includes rows where `col` is
+  NULL. A Date matches by its time value. Booleans, bigints, bytes and objects
+  in the list are ignored, since no row can hold them (ADR-0013 amendment).
+- **The orphaned-subscription sweep no longer fails when a Durable Object has
+  more than 100 live sockets.**
+- **Server log lines no longer quote client strings in full.** A sub, fetch or
+  command id, a collection name, a malformed frame, or a refusal reason that
+  quotes the predicate is clipped to 128 characters, with a note of its full
+  length. Before, a client could make the Durable Object write a log line as long
+  as a frame (ADR-0012 amendment).
 - **The reconnect backoff now grows when connections keep closing soon after
   they open.** Before, every successful open reset the attempt counter, so a
   server that accepted a socket and then closed it held each client at the

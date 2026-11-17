@@ -39,10 +39,17 @@ import {
 import { Broadcaster } from "./broadcast.ts"
 import { decodeResult, encodeResult, lookupTx, recordTx, type SeenTx, sweepDedup } from "./dedup.ts"
 import { compileSchema, type CompiledSync, type SyncSchema, ValidationError } from "./registry.ts"
-import { andPredicates, compileSubsetQuery, UnsupportedPredicateError } from "./sql-compiler.ts"
+import {
+  andPredicates,
+  compileSubsetQuery,
+  isSqliteLimitError,
+  UnsupportedPredicateError,
+  valueTooLarge,
+} from "./sql-compiler.ts"
 import {
   deletePersistedSocketSubs,
   deletePersistedSub,
+  encodeWhere,
   loadPersistedSubs,
   persistSub,
   SubscriptionRegistry,
@@ -323,7 +330,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
             } catch (e) {
               if (e instanceof UnsupportedPredicateError) {
                 console.error(
-                  `restored sub '${row.subId}' on '${row.collection}' no longer compiles (${e.message}); ` +
+                  `restored sub '${clip(row.subId)}' on '${clip(row.collection)}' no longer compiles (${clip(e.message)}); ` +
                     `closing socket for clean re-subscribe`,
                 )
                 this.#dropSocketSubs(ws) // durable rows too — the retry must re-derive from the client
@@ -349,7 +356,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           const sid = this.#socketIdFor(ws)
           for (const sub of this.#subs.forWs(ws)) {
             if (this.#registry.collections.has(sub.collection)) continue
-            console.error(`sub '${sub.subId}' dropped: collection '${sub.collection}' is not registered`)
+            console.error(`sub '${clip(sub.subId)}' dropped: collection '${clip(sub.collection)}' is not registered`)
             this.#subs.remove(ws, sub.subId)
             if (sid) deletePersistedSub(this.#sql, sid, sub.subId)
             this.#send(ws, { t: "reset", sub: sub.subId })
@@ -529,7 +536,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           } catch {
             summary = String(decoded)
           }
-          console.error("malformed frame dropped", summary)
+          console.error("malformed frame dropped", clip(summary))
           return
         }
 
@@ -668,7 +675,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
         // predicate and run the ties SELECT unbounded — a silent full-table scan,
         // which the operator floor exists to forbid. Reject loudly instead.
         if (frame.cursor != null && (frame.cursor.whereCurrent == null || frame.cursor.whereFrom == null)) {
-          console.error(`fetch '${frame.fetchId}' on '${frame.collection}' rejected: malformed cursor`)
+          console.error(`fetch '${clip(frame.fetchId)}' on '${clip(frame.collection)}' rejected: malformed cursor`)
           this.#send(ws, { t: "page", fetchId: frame.fetchId, rows: [], seq: String(currentSeq(this.#sql)) })
           return
         }
@@ -697,8 +704,11 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           rows.push(...Array.from(this.#sql.exec(nq.sql, ...nq.params)))
           this.#send(ws, { t: "page", fetchId: frame.fetchId, rows, seq })
         } catch (e) {
-          if (e instanceof UnsupportedPredicateError) {
-            console.error(`fetch '${frame.fetchId}' on '${frame.collection}' rejected: ${e.message}`)
+          // A statement SQLite still rejects for one of its limits is refused like
+          // the compiler's own checks: it is deterministic for a given statement
+          // and schema, so a retry cannot help.
+          if (e instanceof UnsupportedPredicateError || isSqliteLimitError(e)) {
+            console.error(`fetch '${clip(frame.fetchId)}' on '${clip(frame.collection)}' rejected: ${clip(errorMessage(e))}`)
             this.#send(ws, { t: "page", fetchId: frame.fetchId, rows: [], seq })
             return
           }
@@ -786,7 +796,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           // (ADR-0012). SQLite constraint strings, column names, and programming-
           // error text are internal detail — not client API surface. The authorize
           // catch above is intentionally kept user-facing (README: "throw to deny").
-          console.error(`mutation '${f.collection}' execute failed: ${errorMessage(e)}`)
+          console.error(`mutation '${clip(f.collection)}' execute failed: ${errorMessage(e)}`)
           return this.#rejectTx(ws, f.txId, "mutation failed", "EXECUTE_FAILED")
         }
 
@@ -811,7 +821,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
               try {
                 await after({ user, op, sql: this.#sql, env: this.env })
               } catch (e) {
-                console.error(`afterCommit '${f.collection}:${op.type}' failed: ${errorMessage(e)}`)
+                console.error(`afterCommit '${clip(f.collection)}:${op.type}' failed: ${errorMessage(e)}`)
               }
             })(),
           )
@@ -845,7 +855,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
         try {
           result = await def.execute({ user, args: f.args, sql: this.#sql, env: this.env })
         } catch (e) {
-          console.error(`command '${f.name}' execute failed: ${errorMessage(e)}`)
+          console.error(`command '${clip(f.name)}' execute failed: ${errorMessage(e)}`)
           return this.#rejectTx(ws, f.txId, "command failed", "EXECUTE_FAILED")
         }
 
@@ -1037,7 +1047,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
         if (!coll) {
           // Unknown collection: drop the subscriber's view. Richer sub-error
           // signalling is deferred; for now reset is the honest minimum.
-          this.#send(ws, { t: "reset", sub: frame.subId })
+          this.#refuseSub(ws, frame.subId)
           return
         }
 
@@ -1047,12 +1057,13 @@ export function Syncable<Env = unknown, TUser = unknown>() {
         const existingCount = this.#subs.countFor(ws)
         const existingSub = this.#subs.forWs(ws).find((s) => s.subId === frame.subId)
         if (!existingSub && existingCount >= this.maxSubsPerSocket) {
-          console.error(`sub '${frame.subId}' refused: maxSubsPerSocket (${this.maxSubsPerSocket}) reached`)
-          this.#send(ws, { t: "reset", sub: frame.subId })
+          console.error(`sub '${clip(frame.subId)}' refused: maxSubsPerSocket (${this.maxSubsPerSocket}) reached`)
+          this.#refuseSub(ws, frame.subId)
           return
         }
         // Lower where/orderBy/limit/offset into SQLite. An un-lowerable predicate
-        // (outside the supported floor) is rejected, not silently full-scanned.
+        // (outside the supported floor, or over one of SQLite's limits) is
+        // rejected, not silently full-scanned.
         let query: { sql: string; params: Array<unknown> }
         try {
           query = compileSubsetQuery(frame.collection, {
@@ -1064,11 +1075,20 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           })
         } catch (e) {
           if (e instanceof UnsupportedPredicateError) {
-            console.error(`sub '${frame.subId}' on '${frame.collection}' rejected: ${e.message}`)
-            this.#send(ws, { t: "reset", sub: frame.subId })
+            console.error(`sub '${clip(frame.subId)}' on '${clip(frame.collection)}' rejected: ${clip(e.message)}`)
+            this.#refuseSub(ws, frame.subId)
             return
           }
           throw e
+        }
+        // The predicate's stored form (`_sync_subs.where_ir`) must fit SQLite's
+        // value cap too: tagged values (Dates, bigints) can make it far larger
+        // than the compiled query's own parameters.
+        const whereIr = encodeWhere(frame.where)
+        if (whereIr !== null && valueTooLarge(whereIr)) {
+          console.error(`sub '${clip(frame.subId)}' on '${clip(frame.collection)}' rejected: predicate too large to store`)
+          this.#refuseSub(ws, frame.subId)
+          return
         }
 
         // C1′ (ADR-0011, generalizing ADR-0002 C1): what follows is a synchronous
@@ -1088,8 +1108,8 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           sub = this.#subs.add(ws, frame.subId, frame.collection, frame.where)
         } catch (e) {
           if (e instanceof UnsupportedPredicateError) {
-            console.error(`sub '${frame.subId}' on '${frame.collection}' rejected: ${e.message}`)
-            this.#send(ws, { t: "reset", sub: frame.subId })
+            console.error(`sub '${clip(frame.subId)}' on '${clip(frame.collection)}' rejected: ${clip(e.message)}`)
+            this.#refuseSub(ws, frame.subId)
             return
           }
           throw e
@@ -1099,7 +1119,13 @@ export function Syncable<Env = unknown, TUser = unknown>() {
         // after `add` succeeds — a rejected predicate must not persist.
         {
           const sid = this.#socketIdFor(ws)
-          if (sid) persistSub(this.#sql, sid, frame.subId, frame.collection, frame.where)
+          try {
+            if (sid) persistSub(this.#sql, sid, frame.subId, frame.collection, whereIr)
+          } catch (e) {
+            if (!isSqliteLimitError(e)) throw e
+            this.#refuseOverLimit(ws, frame, e)
+            return
+          }
         }
         const seq = String(currentSeq(this.#sql))
 
@@ -1115,14 +1141,46 @@ export function Syncable<Env = unknown, TUser = unknown>() {
             this.#emitCatchUp(ws, sub, coll, since, seq)
             return
           }
-          this.#send(ws, { t: "reset", sub: frame.subId })
         }
 
-        const rows = Array.from(this.#sql.exec(query.sql, ...query.params)) as Array<Record<string, SqlStorageValue>>
+        // Every row is read before this sub's first frame (the fallback's `reset`
+        // included), so a read that throws has sent the client nothing to undo
+        // (a reset before `snap-end` is taken as holding no rows, ADR-0023 D5).
+        let rows: Array<Record<string, SqlStorageValue>>
+        try {
+          rows = Array.from(this.#sql.exec(query.sql, ...query.params)) as Array<Record<string, SqlStorageValue>>
+        } catch (e) {
+          if (!isSqliteLimitError(e)) throw e
+          this.#refuseOverLimit(ws, frame, e)
+          return
+        }
+        if (since > 0) this.#send(ws, { t: "reset", sub: frame.subId })
         for (const row of rows) {
           this.#send(ws, { t: "snap", sub: frame.subId, key: row[coll.pk], row, seq })
         }
         this.#send(ws, { t: "snap-end", sub: frame.subId, seq })
+      }
+
+      /** The backstop behind the compiler's limit checks (ADR-0012 amendment
+       *  2026-11-17): SQLite rejected one of this sub's statements for one of its
+       *  limits. That is deterministic for a given statement and schema, so it is
+       *  a refusal. */
+      #refuseOverLimit(ws: WebSocket, frame: Extract<ClientFrame, { t: "sub" }>, e: unknown): void {
+        console.error(
+          `sub '${clip(frame.subId)}' on '${clip(frame.collection)}' refused at a SQLite limit: ${clip(errorMessage(e))}`,
+        )
+        this.#refuseSub(ws, frame.subId)
+      }
+
+      /** Refuse a sub on purpose with `reset`. Nothing of the subId stays
+       *  registered: a re-sub also drops the entry it would have replaced, in
+       *  memory and durably, since the client now holds that subId as reset
+       *  (ADR-0012 amendment 2026-11-17). */
+      #refuseSub(ws: WebSocket, subId: string): void {
+        this.#subs.remove(ws, subId)
+        const sid = this.#socketIdFor(ws)
+        if (sid) deletePersistedSub(this.#sql, sid, subId)
+        this.#send(ws, { t: "reset", sub: subId })
       }
 
       /** Windowed catch-up: the latest op per changed key since `since`, resolved
@@ -1164,7 +1222,7 @@ export function Syncable<Env = unknown, TUser = unknown>() {
           // over this socket's subs — never on the hot path).
           const subId = (frame as { sub?: string }).sub
           const collection = subId ? this.#subs.forWs(ws).find((s) => s.subId === subId)?.collection : undefined
-          const where = collection ? ` for collection '${collection}'` : subId ? ` for sub '${subId}'` : ""
+          const where = collection ? ` for collection '${clip(collection)}'` : subId ? ` for sub '${clip(subId)}'` : ""
           console.warn(
             `oversize outbound '${frame.t}' frame (${bytes} bytes > ${WARN_OUTBOUND_FRAME_BYTES})${where} — ` +
               `full-row rebroadcast; column projection (issue #28) is the real fix`,
@@ -1206,4 +1264,14 @@ export function Syncable<Env = unknown, TUser = unknown>() {
 
 function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
+}
+
+/** Log lines clip every string a client chose (a sub, fetch or command id, a
+ *  collection name, a malformed frame, a refusal reason, which can quote the
+ *  client's predicate), so a client cannot make the DO write an unbounded line
+ *  (ADR-0012 amendment 2026-11-17). A normal id (`messages#3`, a UUID) stays
+ *  whole. Only log text is clipped: nothing stored, sent or compared. */
+const LOG_CLIP_CHARS = 128
+function clip(s: string): string {
+  return s.length <= LOG_CLIP_CHARS ? s : `${s.slice(0, LOG_CLIP_CHARS)}… [clipped, ${s.length} chars]`
 }
