@@ -137,7 +137,8 @@ const SINCE_09: Record<string, Array<string>> = {
   "subquery with a select of the same name, orderBy outside": [],
   "subquery with a renaming select, orderBy outside": [],
   "join, two orderBy clauses on different aliases": ["files where id"],
-  // The tie request after the window grows is a `where` on the order expression.
+  // The tie request (on the first load, and when the window grows) is a `where`
+  // on the order expression.
   "a nested field": ["messages orderBy body.length", "messages where body.length"],
   "orderBy with a limit, indexed": ["messages orderBy body"],
   "subquery with a select of the same name, indexed": [],
