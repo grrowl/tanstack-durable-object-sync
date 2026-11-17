@@ -381,7 +381,10 @@ server change:
 - A fetch with a cursor is the server's two reads (ADR-0003): first
   `and(where, whereCurrent)` without a limit (the boundary ties), then
   `and(where, whereFrom)` with the limit (the next page), both in the request's
-  order. The rows are returned ties first, as the server returns them.
+  order. The rows are returned ties first, as the server returns them. A
+  cursor that lacks either half is refused, as the server refuses it (the ties
+  read would be an unbounded scan); the render rejects where the socket
+  answers an empty page, the same difference as for every refusal (below).
 
 Every read's position joins the render's MIN cursor (D2).
 
@@ -389,8 +392,8 @@ Every read's position joins the render's MIN cursor (D2).
 position because a page lands in a live delta stream: a delete applied between
 the two reads could be undone by the later merge. A render has no delta stream.
 Its rows go only into the dehydrated state, both reads join the MIN cursor, and
-the hydration catch-up replays every change after the earlier one. Two effects
-remain, both inside the render, both repaired on hydration:
+the hydration catch-up replays every change after the earlier one. Three
+effects remain, all inside the render, all repaired on hydration:
 
 - A row that moves past the boundary between the two reads is returned by both.
   The adapter writes a key once per page (ADR-0003, dated note): the first copy,
@@ -400,10 +403,18 @@ remain, both inside the render, both repaired on hydration:
 - A row that moves onto the boundary value, or joins at it, between the two
   reads is returned by neither. The render does not show it, and the catch-up
   brings it on hydration.
+- A row an earlier read returned and that is deleted, or leaves the predicate,
+  before a later read is still rendered, and the catch-up removes or updates
+  it. This is the skew between reads that D2 already accepts across subsets.
 
 On the WebSocket path the skip changes nothing. The server reads both halves in
-one synchronous turn, and `col = ?` never matches a row that `col > ?`,
-`col < ?` or `col IS NULL` matches, so a page never repeats a key. Only an app
+one synchronous turn. Core's cursors put `eq` in `whereCurrent` and `gt` or
+`lt`, alone or `OR isNull OR isUndefined`, in `whereFrom`; these compile to
+`col = ?` against `col > ?`, `col < ?` or `col IS NULL` on the same column and
+value, which no row matches together, so such a page never repeats a key.
+Core's cursor for a Date boundary is a 1 ms range (`gte` and `lt`) that would
+overlap `gt`, but it cannot occur here: rows read from SQLite never hold a
+Date, so no boundary value is one. Only an app
 whose `getKey` does not return the primary key, which is outside the contract
 (ADR-0001 D9, ADR-0007), could get one; such a page used to fail on 1.0 and now
 keeps the first row.
