@@ -216,8 +216,13 @@ function compileExpr(node: unknown, params: Array<unknown>, names: Set<string>):
     )
   }
   const { name, args } = node
+  // The evaluator calls `args.map`; a map with `length` would compile here and throw there.
+  if (typeof name !== "string" || !Array.isArray(args)) {
+    throw new UnsupportedPredicateError("a function expression needs a string name and an args array")
+  }
 
-  if (name in COMPARATORS) {
+  // Own keys only: `in` would find `toString` on the prototype and write broken SQL.
+  if (Object.hasOwn(COMPARATORS, name)) {
     if (args.length !== 2) throw new UnsupportedPredicateError(`'${name}' expects 2 arguments`)
     if (name === "like") {
       // @tanstack/db's evaluateLike returns false unless BOTH operands are
@@ -298,6 +303,9 @@ export function compileWhere(where: unknown): { sql: string; params: Array<unkno
  *  simple { col, dir }. Nulls default to first, as in TanStack's comparator, in
  *  either direction. */
 function orderByTerm(item: unknown, names: Set<string>): { col: string; desc: boolean; nullsLast: boolean } {
+  if (typeof item !== "object" || item === null) {
+    throw new UnsupportedPredicateError(`unsupported orderBy clause: ${String(item)}`)
+  }
   const o = item as {
     expression?: unknown
     compareOptions?: { direction?: string; nulls?: string }

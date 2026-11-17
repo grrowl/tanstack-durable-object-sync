@@ -106,6 +106,18 @@ const SHAPES: Array<{ name: string; cause: RegExp; where?: unknown; orderBy?: un
   { name: "orderBy, a nested path the client sends for a nested field", cause: /nested/, orderBy: by({ type: "ref", path: ["body", "x"] }), limit: 2 },
 ]
 
+// Frames that threw from the compiler instead of being refused, so a `sub` or a
+// `fetch` got no reply at all and stayed loading. Not column refs, but the same
+// parse: each is now refused with its cause, like the shapes above.
+const MALFORMED: typeof SHAPES = [
+  { name: "an orderBy term that is null", cause: /orderBy clause/, orderBy: [null], limit: 2 },
+  { name: "a function with no args", cause: /args/, where: { type: "func", name: "eq" } },
+  // `name in COMPARATORS` followed the prototype chain and wrote broken SQL.
+  { name: "a function named after an Object.prototype member", cause: /not supported/, where: fn("toString", ref("body"), val("b1")) },
+  // The compiler read `args[0]` and `args[1]`; the evaluator calls `args.map` and throws.
+  { name: "a function whose args is not an array", cause: /args/, where: { type: "func", name: "eq", args: { 0: ref("body"), 1: val("b1"), length: 2 } } },
+]
+
 describe("a column reference the evaluator reads differently from SQL is refused", () => {
   let lines: Array<string>
   beforeEach(() => {
@@ -114,7 +126,7 @@ describe("a column reference the evaluator reads differently from SQL is refused
   })
   afterEach(() => vi.restoreAllMocks())
 
-  for (const shape of SHAPES) {
+  for (const shape of [...SHAPES, ...MALFORMED]) {
     const { name: _n, cause, ...query } = shape
     it(`sub, ${shape.name}: reset, nothing registered, logged`, async () => {
       const room = `ref-sub-${crypto.randomUUID()}`
