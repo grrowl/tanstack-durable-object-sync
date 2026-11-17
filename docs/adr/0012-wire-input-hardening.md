@@ -182,9 +182,10 @@ same date](./0013-predicate-floor-one-evaluator.md)). This change guarantees:
 - **A statement over one of SQLite's limits is a deliberate refusal.** Two lines
   of defence, in order:
   1. *The compiler's checks come first.* `compileSubsetQuery` refuses a statement
-     over any limit a query can reach, on a one-sided bound (it never accepts what
-     SQLite rejects for a limit, and may refuse a little early; ADR-0013
-     amendment). Before a sub is added, its predicate's stored form
+     over any limit a query can reach, on one-sided bounds that may refuse a
+     little early (ADR-0013 amendment). The depth bound covers top-level
+     conjunctions; a conjunction nested inside an `or` can still plan deeper,
+     and the backstop below covers that. Before a sub is added, its predicate's stored form
      (`_sync_subs.where_ir`, the tagged value codec) is checked against the value
      cap too: tagged Dates and bigints can make it far larger than the compiled
      query's own parameters.
@@ -194,7 +195,8 @@ same date](./0013-predicate-floor-one-evaluator.md)). This change guarantees:
      (`SQLITE_LIMIT_ERRORS` in `sql-compiler.ts`), and each is provoked for real
      in `tests/sqlite-limits.test.ts`, so a change in workerd's wording fails a
      test instead of bringing the hang back. These errors are deterministic for a
-     given statement, so a retry cannot help, and a refusal is the truth. The net
+     given statement and schema, so a retry cannot help, and a refusal is the
+     truth. The net
      covers the sub's write-through, its snapshot read and the fetch's reads; a
      row that is over the cap only because of a very long subId is one case it
      catches.
@@ -205,9 +207,14 @@ same date](./0013-predicate-floor-one-evaluator.md)). This change guarantees:
   answers with `reset` and removes the subId in memory and in `_sync_subs`. A
   refused re-sub therefore also drops the entry it would have replaced, since the
   client now holds that subId as reset. A refused `fetch` answers with an empty
-  `page`, as before. The orphan-sub sweep (ADR-0019 D4) had the same bug: it bound
-  one parameter per live socket and threw in the background with 101 sockets. It
-  now passes them as one JSON parameter.
+  `page`, as before. The orphan-sub sweep (ADR-0019 D4) had the same bug as the
+  long lists: it bound one parameter per live socket and threw in the background
+  with 101 sockets. It now passes them as one JSON parameter.
+- **A log line clips every string the client chose** (an id, a collection name, a
+  malformed frame, a refusal reason that quotes the predicate) to 128 characters,
+  and says that it was clipped and how long it was, so a client cannot make the
+  server write an unbounded log line. Only log text is clipped; nothing stored,
+  sent or compared changes.
 
 The snapshot rows are read before the sub's first frame, and the below-floor
 fallback reads them before it sends its `reset`. So a read that throws has sent

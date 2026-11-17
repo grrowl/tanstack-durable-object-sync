@@ -6,10 +6,12 @@ import { compileSubsetQuery, compileWhere, isSqliteLimitError } from "../src/ser
 // `SqliteDatabase::setupSecurity`). A statement over one throws from SQLite at
 // run time, and a sub that throws gets no reply and stays registered. So the
 // compiler refuses every statement over a limit (ADR-0013 amendment
-// 2026-11-17). The property is one-sided: the compiler never accepts a
-// statement SQLite rejects; it may refuse a little early. Exactness is not
-// possible for depth: SQLite adds a level to a `where` holding a subquery, and a
-// MULTI-INDEX OR plan adds depth that depends on the table's own indexes.
+// 2026-11-17). The property is one-sided: on the shapes below, the compiler
+// accepts no statement SQLite rejects for a limit; it may refuse a little early.
+// Exactness is not possible for depth: SQLite adds a level to a `where` holding a
+// subquery, and a MULTI-INDEX OR plan adds depth that depends on the table's own
+// indexes. The depth bound covers top-level conjunctions; a conjunction nested
+// inside an `or` can still plan deeper, and the limit-error backstop covers it.
 //
 // Each case is compiled; an accepted one is run as compiled, and a refused one
 // is run as the same SQL built without the checks, to see whether SQLite would
@@ -130,7 +132,7 @@ async function expectSafeEdges(families: Array<Family>): Promise<void> {
   expect(problems).toEqual([])
 }
 
-describe("the compiler never accepts a statement SQLite rejects for a limit", () => {
+describe("on these shapes the compiler accepts no statement SQLite rejects for a limit", () => {
   it("bound parameters (100)", async () => {
     const reals = (n: number): unknown => fn("in", ref("n"), val(range(1, n).map((i) => i + 0.5)))
     await expectSafeEdges([
@@ -188,10 +190,18 @@ describe("the compiler never accepts a statement SQLite rejects for a limit", ()
   })
 
   it("statement length (100 000 bytes)", async () => {
+    // The first leaf count whose SQL passes 100 000 bytes, by binary search
+    // (the length grows with the leaf count): a handful of builds, not thousands.
     const length = (n: number): number => unchecked("mi", { where: balanced(n) }).sql.length
-    let n = 1000
-    while (length(n) <= 100_000) n += 1
-    await expectSafeEdges([{ label: "balanced or", cases: range(n - 3, n + 1).map((c) => ({ where: balanced(c) })), slack: 1 }])
+    let lo = 1
+    let n = 20_000
+    while (lo < n) {
+      const mid = Math.floor((lo + n) / 2)
+      if (length(mid) > 100_000) n = mid
+      else lo = mid + 1
+    }
+    // Length does not depend on the plan, so one table is enough.
+    await expectSafeEdges([{ label: "balanced or", cases: range(n - 3, n + 1).map((c) => ({ where: balanced(c) })), tables: ["m"], slack: 1 }])
   })
 
   it("one bound value (2 200 000 bytes): a JSON list, a string, bytes", async () => {
@@ -313,7 +323,9 @@ describe("fuzz: no accepted statement is rejected by SQLite", () => {
     )
     expect(result.unsafe).toEqual([])
     expect(result.earliest).toBeLessThanOrEqual(6)
-  }, 60_000)
+    // About 13 s on a fast laptop; the limit leaves room for a runner several
+    // times slower.
+  }, 120_000)
 })
 
 describe("SQLite's limit errors are recognised (the backstop)", () => {

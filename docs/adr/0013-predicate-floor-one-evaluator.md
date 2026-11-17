@@ -202,8 +202,11 @@ more binds as a REAL SQLite will not take (`datatype mismatch`).
    empty result on the client. Before this change these values bound as text
    (`'true'`, a Date's `toString()`) or a blob and disagreed, or threw (bigint).
 3. **Every limit in the table is refused when the query is compiled, on a safe
-   bound.** The checks are one-sided: the compiler never accepts a statement that
-   SQLite rejects for a limit, and it may refuse a little early. `compileSubsetQuery`
+   bound.** The checks are one-sided: they may refuse a little early, and on top-
+   level conjunctions they accept no statement that SQLite rejects for a limit.
+   A conjunction nested inside an `or` can still plan deeper than the depth
+   bound counts; the limit-error backstop (ADR-0012 amendment) refuses that
+   hand-built shape. `compileSubsetQuery`
    refuses (`UnsupportedPredicateError`, so `reset`, an empty page, or a rejected
    `readSyncSnapshot`) a statement that binds more than 100 values in total (every
    list, comparison literal, `limit` and `offset` counts); whose SQL is over 100 000

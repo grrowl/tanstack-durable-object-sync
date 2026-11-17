@@ -26,8 +26,10 @@ const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/
 // SQLite limits in a Durable Object, set by workerd's `SqliteDatabase::setupSecurity`
 // (Cloudflare's Durable Objects limits page lists the same). A query over one is
 // refused when it is compiled (ADR-0013 amendment 2026-11-17). The checks are
-// one-sided: they never accept a statement SQLite rejects for a limit, and may
-// refuse a little early. tests/sqlite-limits.test.ts pins that in workerd.
+// one-sided and may refuse a little early. The depth bound covers top-level
+// conjunctions; a conjunction nested inside an `or` can still plan deeper, and
+// `SQLITE_LIMIT_ERRORS` below is the backstop for that. tests/sqlite-limits.test.ts
+// pins this in workerd.
 /** SQLITE_LIMIT_VARIABLE_NUMBER: bound parameters per statement. */
 const MAX_BOUND_PARAMS = 100
 /** SQLITE_LIMIT_EXPR_DEPTH: height of an expression tree. */
@@ -55,7 +57,7 @@ export function valueTooLarge(v: unknown): boolean {
 }
 
 /** SQLite's messages for a statement over one of its limits, as workerd reports
- *  them. Deterministic for a given statement, so a retry cannot help: the
+ *  them. Deterministic for a given statement and schema, so a retry cannot help: the
  *  compiler's checks come first, and these are the backstop (ADR-0012 amendment
  *  2026-11-17). tests/sqlite-limits.test.ts provokes each one for real. */
 const SQLITE_LIMIT_ERRORS = [
@@ -177,14 +179,17 @@ function compileIn(col: string, list: Array<unknown>, params: Array<unknown>): C
 
 const hasSubquery = (parts: Array<Compiled>): boolean => parts.some((p) => p.subquery)
 
-/** A height no plan of this `where` exceeds in SQLite (one-sided; ADR-0013
- *  amendment 2026-11-17). Two things add depth beyond the tree's own height:
+/** A height SQLite's plan of this `where` does not exceed at the top level
+ *  (one-sided; ADR-0013 amendment 2026-11-17). Two things add depth beyond the
+ *  tree's own height:
  *  - a MULTI-INDEX OR plan rebuilds the other top-level conjuncts as one
  *    left-deep AND and wraps it again, which can reach the tallest conjunct plus
  *    the number of conjuncts, whatever the table's indexes; the bound allows one
  *    more;
  *  - a `where` holding a subquery (`json_each`) is one level taller as a whole.
- *  The tree's own height never exceeds tallest conjunct + count - 1. */
+ *  The tree's own height never exceeds tallest conjunct + count - 1. SQLite does
+ *  the same rebuild for a conjunction inside an `or` operand, which this does not
+ *  count; that hand-built shape is left to the limit-error backstop. */
 function depthBound(w: Compiled): number {
   const conjuncts = w.conjuncts ?? [w.height]
   const tallest = conjuncts.reduce((a, b) => Math.max(a, b), 0)

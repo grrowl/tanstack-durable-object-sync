@@ -54,6 +54,11 @@ While pre-1.0, the public API may change between 0.x releases.
   in the list are ignored, since no row can hold them (ADR-0013 amendment).
 - **The orphaned-subscription sweep no longer fails when a Durable Object has
   more than 100 live sockets.**
+- **Server log lines no longer quote client strings in full.** A sub, fetch or
+  command id, a collection name, a malformed frame, or a refusal reason that
+  quotes the predicate is clipped to 128 characters, with a note of its full
+  length. Before, a client could make the Durable Object write a log line as long
+  as a frame (ADR-0012 amendment).
 - **The reconnect backoff now grows when connections keep closing soon after
   they open.** Before, every successful open reset the attempt counter, so a
   server that accepted a socket and then closed it held each client at the
