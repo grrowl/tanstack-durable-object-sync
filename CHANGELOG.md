@@ -80,6 +80,13 @@ While pre-1.0, the public API may change between 0.x releases.
   D17 is qualified to match.
 - ADR-0012 D3 points to ADR-0014, which changed how `handleCall` sanitizes
   authorize errors.
+- Two accepted limitations are now documented in the README and in dated ADR
+  amendments. The server orders text by bytes, so a limited query ordered by
+  a text column should set `stringSort: "lexical"` (ADR-0023). Dedup is keyed
+  by `txId` alone, so inside one Durable Object a `txId` works like a
+  password: a connection that presents another's `txId` gets its stored reply,
+  and one that uses it first makes the owner's write answer `committed`
+  without running (ADR-0012 D4).
 
 ## [0.7.1] — 2026-11-17
 

@@ -19,7 +19,7 @@ explains the displacement.
 | [0009](./0009-changelog-time-retention.md) | Changelog time-based retention; reset stale reconnects | Accepted |
 | [0010](./0010-typed-mutations-collection-manifest.md) | Typed mutations via a collection-row manifest on `SyncRegistry` | Accepted (manifest superseded by 0014) |
 | [0011](./0011-ssr-dehydrate-hydrate.md) | SSR: dehydrate on the worker, hydrate to the cursor | Accepted (experimental; generalizes 0002 C1 → C1′; amended for merged upstream + 0015/0016 lift; D5 peer floor superseded by 0022) |
-| [0012](./0012-wire-input-hardening.md) | Wire-input hardening: frame-shape guards, inbound limits, sanitized execute errors | Accepted (D1 amended by 0025 for op keys; D2 limit order amended by 0025) |
+| [0012](./0012-wire-input-hardening.md) | Wire-input hardening: frame-shape guards, inbound limits, sanitized execute errors | Accepted (D1 amended by 0025 for op keys; D2 limit order amended by 0025; D4 accepted as a limitation, both effects named, 2026-11-17) |
 | [0013](./0013-predicate-floor-one-evaluator.md) | Filtered-subscription membership: one evaluator is the source of truth; the floor is the verified-agreeing set | Accepted |
 | [0014](./0014-object-sync-schema.md) | `defineSync`: one schema value, mutations on the collection, commands on the connection | Accepted (supersedes 0001 D11 builder; closes 0010 manifest) |
 | [0015](./0015-syncable-mixin.md) | `Syncable` mixin: the sync core as a mixin over any DO base | Accepted (reframes 0001 D13; Actor unsupported; wake-test gap closed by 0019) |
@@ -30,7 +30,7 @@ explains the displacement.
 | [0020](./0020-connect-contract-abortable-open.md) | connect() never resolves disconnected; open() is abortable via AbortSignal | Accepted (amends 0016 + 0011 seam) |
 | [0021](./0021-in-flight-settlement-unexpected-close.md) | In-flight mut/call settlement across an unexpected close: hold-and-replay + typed `ConnectionLostError` | Accepted (fixes #39; builds on 0020/0016/0011) |
 | [0022](./0022-db-version-support-policy.md) | `@tanstack/db` version support: an uncapped floor, tested at both ends | Accepted (supersedes 0011 D5 peer floor in part; peer range, contract table and `locked` leg amended by 0028) |
-| [0023](./0023-on-demand-watches-acquisitions-holds.md) | On-demand: watches, exact acquisitions, and row holds | Accepted (supersedes 0001 D8's subset model; 0.9 adapter contracts) |
+| [0023](./0023-on-demand-watches-acquisitions-holds.md) | On-demand: watches, exact acquisitions, and row holds | Accepted (supersedes 0001 D8's subset model; 0.9 adapter contracts; locale ordering of text accepted as a limit, 2026-11-17) |
 | [0024](./0024-examples-single-tanstack-db.md) | Examples bundle exactly one `@tanstack/db`, and CI proves it | Accepted (examples only) |
 | [0025](./0025-empty-op-key-rejection.md) | An empty `mut` op key is rejected with a reply, after the dedup lookup | Accepted (amends 0012 D1 for op keys; makes 0014 D3 true; amended: every per-tx rejection runs after the dedup lookup; a duplicate of an in-flight txId waits, then replays) |
 | [0028](./0028-db-1-0-release-candidates.md) | `@tanstack/db` 1.0: the peer range admits the release candidates, and the adapter follows the 1.0 sync contract | Accepted (amends 0022; 0026 and 0027 are reserved for proposed ADRs not yet merged) |

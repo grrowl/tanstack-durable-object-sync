@@ -4,7 +4,8 @@ import { createFrameCodec } from "../src/wire/frame-codec.ts"
 import type { ClientFrame, ServerFrame } from "../src/wire/frames.ts"
 
 // bugbash L3 — accepted limitation, deferred by ADR-0012 D4 ("Dedup identity
-// binding deferred"). WHY: `_sync_seen_tx` is keyed by txId alone, so the
+// binding deferred"; both effects and the reasons are in its amendment of
+// 2026-11-17). WHY: `_sync_seen_tx` is keyed by txId alone, so the
 // receipt belongs to whichever socket presented the txId FIRST, whoever that
 // was. Two halves, both `it.fails` until an identity-scoped dedup lands. They
 // encode the scoping D4 sketches (a `dedupScope(user)` hook): another identity's
