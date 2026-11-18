@@ -75,6 +75,8 @@ interface SyncParams {
    *  real @tanstack/db provides exactly one. */
   fail?: (error: unknown) => void
   markError?: (error?: unknown) => void
+  reportError?: (error: unknown) => void
+  reportHealthy?: (error?: unknown) => void
   truncate: () => void
 }
 
@@ -245,20 +247,37 @@ export function doCollectionOptions(opts: {
     const { collection, begin, write, commit, truncate } = params
     const restarted = hasRun
     hasRun = true
-    // The first load fails loud: `preload()` rejects with the cause instead of
-    // waiting forever (`fail` from @tanstack/db 1.0, `markError` before it,
-    // ADR-0028). Once this run has been ready there is no load left to fail:
-    // the collection is usable and the transport retries by itself. Reporting
-    // a failure then would only strand it. From 1.0 `fail` ends the sync run,
-    // and before 1.0 `markError` waits for a snapshot that a catch-up never
-    // brings.
+    let alive = true
     let ready = false
+    let dialReported = false
+    let stopped: Error | undefined
+    const healthy = (): void => {
+      if (alive && stopped) {
+        params.reportHealthy?.(stopped)
+        stopped = undefined
+      }
+    }
+    const reportStop = (error: Error): void => {
+      if (!alive || !ready || stopped === error) return
+      healthy()
+      stopped = error
+      params.reportError?.(error)
+    }
     const markReady = (): void => {
+      if (!alive) return
       ready = true
       params.markReady()
     }
     const failLoad = (e: unknown): void => {
-      if (!ready) (params.fail ?? params.markError)?.(e)
+      if (alive && !ready) (params.fail ?? params.markError)?.(e)
+    }
+    // markError before 1.0 is recoverable by markReady on the same run.
+    // fail on 1.0 ends the run, so reserve it for a terminal outcome.
+    const dialFailed = (e: unknown): void => {
+      if (!params.fail && !dialReported) {
+        dialReported = true
+        failLoad(e)
+      }
     }
     const consumeHydratedCursor = (): string | null => {
       const hc = hydratedCursor
@@ -338,29 +357,41 @@ export function doCollectionOptions(opts: {
       else write({ type: op, value: cols })
     }
 
-    const makeHandler = (
-      onReady: () => void,
-      opts?: { reconcileSnapshots?: boolean; onFail?: (e: unknown) => void },
-    ): SubHandler => {
-      // Where a rejected receipt lands: a subset load rejects ITS promise; the
-      // collection-level default fails readiness loud (before @tanstack/db 1.0
-      // a later markReady — any successful snapshot — recovers, error → ready).
-      const onFail = opts?.onFail ?? failLoad
-      // `reconcileSnapshots` (armed for every EAGER sub, never for on-demand
-      // subset subs — a subset snapshot must not delete other subsets' rows):
-      // a snapshot is authoritative SET semantics over the synced rows —
-      // held keys absent from it were deleted server-side, and snapshots
-      // carry no tombstones (ADR-0011 D4). Track each snapshot's keys and
-      // delete the rest at ITS boundary; no truncate, so a hydrated first
-      // paint never flashes empty. The set is per-snapshot (reset at every
-      // snap-end), and an EMPTY snapshot (zero snap frames — the server
-      // wiped the table) still reconciles everything away at the boundary.
+    const makeEagerHandler = (subId: string) => {
+      let retired = false
+      let received = false
+      let stopDuringApply: Error | undefined
+      const fail = (error: unknown): void => {
+        if (!alive || ready || retired) return
+        retired = true
+        transport.unsubscribe(subId)
+        failLoad(error)
+      }
+      const snapshotReceived = (receipt: CommitReceipt): void => {
+        received = true
+        stopDuringApply = undefined
+        healthy()
+        afterApplied(receipt, () => {
+          if (retired) return
+          markReady()
+          if (stopDuringApply) reportStop(stopDuringApply)
+        }, fail)
+      }
+      // An eager snapshot is the authoritative set. Track its keys until
+      // snap-end so an empty snapshot also removes stale hydrated rows.
       let snapKeys: Set<string> | null = null
-      return {
+      const handler: SubHandler = {
+        onDialFailed: dialFailed,
+        onStopped: error => {
+          if (ready) reportStop(error)
+          else if (received) stopDuringApply = error // only a local commit receipt remains
+          else fail(error)
+        },
         onSnap: (_key, row) => {
           ensureBegin()
           const key = getKey(row as Record<string, unknown>)
-          if (opts?.reconcileSnapshots) (snapKeys ??= new Set()).add(key)
+          snapKeys ??= new Set()
+          snapKeys.add(key)
           // A held key's snapshot row is an upsert: hydrated rows may have
           // changed since dehydration, and a differing insert would throw
           // DuplicateKeySyncError. With the C1′ barrier a snapshot row is
@@ -368,21 +399,19 @@ export function doCollectionOptions(opts: {
           write(syncedHas(key) ? { type: "update", value: row } : { type: "insert", value: row })
         },
         onSnapEnd: () => {
-          if (opts?.reconcileSnapshots) {
-            const seen = snapKeys // null ⇒ empty snapshot ⇒ empty authoritative set
-            snapKeys = null
-            const sd = syncedData()
-            if (!sd) throw new Error("snapshot reconcile requires collection._state.syncedData (incompatible @tanstack/db)")
-            for (const key of sd.keys()) {
-              // ensureBegin only when a delete is actually due — the common
-              // converged/empty case stays boundary-free.
-              if (!seen?.has(key)) {
-                ensureBegin()
-                write({ type: "delete", key })
-              }
+          const seen = snapKeys // null ⇒ empty snapshot ⇒ empty authoritative set
+          snapKeys = null
+          const sd = syncedData()
+          if (!sd) throw new Error("snapshot reconcile requires collection._state.syncedData (incompatible @tanstack/db)")
+          for (const key of sd.keys()) {
+            // ensureBegin only when a delete is actually due — the common
+            // converged/empty case stays boundary-free.
+            if (!seen?.has(key)) {
+              ensureBegin()
+              write({ type: "delete", key })
             }
           }
-          afterApplied(flush(), onReady, onFail)
+          snapshotReceived(flush())
         },
         onDelta: (op, key, cols) => writeDelta(op, key as string, cols),
         // The transport restarts a sub that never bootstrapped from a fresh
@@ -397,7 +426,13 @@ export function doCollectionOptions(opts: {
           }
           snapKeys = null
         },
-        onUptodate: () => flush(),
+        onUptodate: own => {
+          flush()
+          if (own) {
+            stopDuringApply = undefined
+            healthy()
+          }
+        },
         onReset: () => {
           flush()
           begin()
@@ -408,9 +443,10 @@ export function doCollectionOptions(opts: {
           // promise — and the live query's preload() — would hang forever. For a
           // compaction/rotation reset (a valid sub that re-snapshots) this is an
           // idempotent no-op: onSnapEnd's onReady() has already fired.
-          afterApplied(track(commit()), onReady, onFail)
+          snapshotReceived(track(commit()))
         },
       }
+      return { handler, fail }
     }
 
     if (syncMode === "on-demand") {
@@ -463,11 +499,11 @@ export function doCollectionOptions(opts: {
       // longer share or cover, so upstream's truncate replay (load-then-release
       // on 0.8, release-then-reload on 0.9) really reloads every demand.
       let gen = 0
-      let alive = true // false after cleanup: late async work installs nothing
       const watches = new Set<Watch>()
       const acquisitions = new Map<string, Acquisition>() // current generation, by request key
-      const acquisitionOf = new WeakMap<object, Acquisition>() // by the options object core loaded
-      const outstanding = new WeakMap<object, number>() // loads not yet released, per options object
+      // Core releases by the original options object. The same object can
+      // acquire a replacement before its failed or truncated load is released.
+      const outstanding = new WeakMap<object, Acquisition[]>()
       const holders = new Map<string, Set<Watch>>()
       const requestKey = (o: LoadSubsetOptions): string => codecEncode([o.where ?? null, o.orderBy ?? null, o.limit ?? null])
 
@@ -609,9 +645,8 @@ export function doCollectionOptions(opts: {
       // repopulate right after.
       //
       // markReady gates on the catch-up sub FRAME being sent (not completed):
-      // loadSubset subs only fire after ready, so on the single ordered
-      // socket the catch-up's truncate/deltas always precede subset
-      // snapshots. Ready never waits for data — stale-while-revalidate.
+      // Core can ask for a subset before ready. Register the catch-up first
+      // so the transport sends it before every watch, even after a retry.
       const hc = consumeHydratedCursor()
       let catchupId: string | null = null
       let readyGate: Promise<void>
@@ -627,6 +662,14 @@ export function doCollectionOptions(opts: {
           id,
           table,
           {
+            onDialFailed: dialFailed,
+            onStopped: error => {
+              if (ready) reportStop(error)
+              else if (catchupId === id) {
+                done()
+                failLoad(error)
+              }
+            },
             onSnap: () => {}, // catch-ups never snapshot; reset's resnapshot is dropped (unsubbed)
             onSnapEnd: () => {},
             onDelta: (op, key, cols) => {
@@ -640,17 +683,15 @@ export function doCollectionOptions(opts: {
             onUptodate: (ownTerminal) => {
               flush()
               if (ownTerminal) {
+                healthy()
                 done()
-                // Also heals an earlier failed gate (error → ready, 0.8.2):
-                // the readyGate rejected, the policy-driven reconnect
-                // resubscribed this catch-up, and its terminal is the first
-                // proof the collection is usable again (codex review —
-                // idempotent when the gate already marked ready).
+                // Idempotent if sending the catch-up already marked it ready.
                 markReady()
               }
             },
             onReset: () => {
               truncateAll()
+              healthy()
               done() // before the trailing resnapshot frames arrive
               markReady() // same healing as the terminal path
             },
@@ -661,7 +702,7 @@ export function doCollectionOptions(opts: {
           hc,
         )
       } else {
-        // No resume point: once connected, drop the rows, honestly. They were
+        // No resume point: drop the rows at sync start. They were
         // hydrated with no cursor, or this run replaces another whose rows
         // core kept (a 1.0 `reload()`, ADR-0028). No watch of this run holds
         // them, so nothing would remove one the server has since deleted.
@@ -669,23 +710,20 @@ export function doCollectionOptions(opts: {
         // run can still be queued behind a persisting write, and lands later.
         // Core's truncate replay reloads every live demand with fresh subs.
         dropRows = hc === "0" || restarted
-        readyGate = transport.connect()
+        readyGate = Promise.resolve()
       }
-      // A failed gate fails the first load loud (preload() rejects with the
-      // cause) instead of hanging. Without a hydration catch-up nothing
-      // retries it: the transport reconnects only for live subscriptions, and
-      // this run has none yet. The app starts a new run: `reload()` on
-      // @tanstack/db 1.0, `cleanup()` then `preload()` before it (ADR-0028).
-      //
-      // Only the gate itself can fail the load. What runs once it is open is
-      // not under failLoad: applying the truncate makes the collection ready
-      // in core, which runs the app's ready callbacks, and one that throws
-      // surfaces from this commit. It is the app's error. It goes uncaught, as
-      // a throw from markReady() does, and the collection stays ready.
+      // Keep ready callbacks outside the gate's failure branch. A callback
+      // thrown by the application is not a failed read.
       void readyGate.then(() => {
+        if (!alive) return
         if (dropRows) truncateAll()
         markReady()
-      }, failLoad)
+      }, error => {
+        if (!alive || ready || catchupId === null) return
+        unsubscribeQuietly(catchupId)
+        catchupId = null
+        failLoad(error)
+      })
 
       const openWatch = (o: LoadSubsetOptions, onReady: () => void, onFail: (e: unknown) => void, onRefused: () => void): Watch => {
         let accept!: (ok: boolean) => void
@@ -708,7 +746,19 @@ export function doCollectionOptions(opts: {
           rows: new Set(),
         }
         watches.add(w)
+        const ended = (error: unknown): void => {
+          if (!watches.delete(w)) return
+          unsubscribeQuietly(w.subId)
+          dropHolds(w)
+          flush()
+          failAccept(error)
+          onFail(error)
+        }
         const handler: SubHandler = {
+          onStopped: error => {
+            if (w.bootstrapped) reportStop(error)
+            else ended(error)
+          },
           onSnap: (_key, row) => {
             const key = getKey(row as Record<string, unknown>)
             ensureBegin()
@@ -720,6 +770,7 @@ export function doCollectionOptions(opts: {
           onSnapEnd: () => {
             w.bootstrapped = true
             w.accept(true)
+            healthy()
             afterApplied(flush(), onReady, onFail)
           },
           onDelta: (op, key, cols) => {
@@ -728,7 +779,10 @@ export function doCollectionOptions(opts: {
               hold(key as string, w)
             } else if (unhold(key as string, w)) writeDelta(op, key as string, cols)
           },
-          onUptodate: () => flush(),
+          onUptodate: own => {
+            flush()
+            if (own) healthy()
+          },
           onReset: () => {
             if (!w.bootstrapped) {
               // Before its first snapshot a reset can only be a refusal
@@ -758,10 +812,7 @@ export function doCollectionOptions(opts: {
           // delivered, so a row deleted meanwhile does not survive the restart.
           onRestart: () => dropHolds(w),
         }
-        void transport.subscribe(w.subId, table, handler, o.where, o.orderBy, o.limit).catch((e) => {
-          onFail(e)
-          failAccept(e) // requests waiting to be covered by it fail with it
-        })
+        void transport.subscribe(w.subId, table, handler, o.where, o.orderBy, o.limit).catch(ended)
         return w
       }
 
@@ -806,7 +857,7 @@ export function doCollectionOptions(opts: {
         // A request cancelled, a truncate (new generation), or a session cleaned
         // up meanwhile: install nothing (0.9 cooperative cancellation; a page
         // read before a truncate would come back as an unheld ghost).
-        if (!alive || o.signal?.aborted || g !== gen) return
+        if (!alive || o.signal?.aborted || g !== gen || (cover && !watches.has(cover))) return
         // 0.8.5 contract: a subset load settles only once its rows are visible.
         await installPage(page, cover)
       }
@@ -815,8 +866,9 @@ export function doCollectionOptions(opts: {
        *  accepted the watch. A refused watch covers nothing: the request then
        *  opens its own. */
       const fetchCovered = async (acq: Acquisition, o: LoadSubsetOptions, w: Watch): Promise<void> => {
-        if (!(await w.accepted)) {
-          if (!alive || acq.released || acq.gen !== gen) return
+        const accepted = await w.accepted
+        if (!alive || acq.released || acq.gen !== gen) return
+        if (!accepted) {
           unpin(w)
           await new Promise<void>((resolve, reject) => {
             acq.watch = openWatch(o, resolve, reject, () => {
@@ -857,7 +909,7 @@ export function doCollectionOptions(opts: {
 
       const loadSubset = (core: LoadSubsetOptions): true | Promise<void> => {
         if (core.cursor) return loadMore(core)
-        // Bookkeeping (`outstanding`, `acquisitionOf`) is by the object core
+        // Bookkeeping is by the object core
         // passed, which it releases with; everything else uses the sent request.
         const o = sendable(core)
         // Neither a watch's snapshot nor a fetch can skip rows without a cursor:
@@ -866,12 +918,13 @@ export function doCollectionOptions(opts: {
         if (o.offset) {
           return Promise.reject(new Error(`on-demand '${table}': a subset request with offset ${o.offset} and no cursor is unsupported`))
         }
-        outstanding.set(core, (outstanding.get(core) ?? 0) + 1)
         const key = requestKey(o)
+        const owners = outstanding.get(core) ?? []
+        outstanding.set(core, owners)
         const existing = acquisitions.get(key)
         if (existing) {
           existing.refs++
-          acquisitionOf.set(core, existing)
+          owners.push(existing)
           return existing.ready
         }
         let resolve!: () => void
@@ -880,9 +933,17 @@ export function doCollectionOptions(opts: {
           resolve = res
           reject = rej
         })
-        const acq: Acquisition = { key, refs: 1, ready, watch: null, released: false, gen, settle: () => resolve(), fail: reject }
+        const fail = (error: unknown): void => {
+          if (acquisitions.get(key) === acq) acquisitions.delete(key)
+          if (!acq.released) {
+            acq.released = true
+            if (acq.watch) unpin(acq.watch)
+          }
+          reject(error)
+        }
+        const acq: Acquisition = { key, refs: 1, ready, watch: null, released: false, gen, settle: resolve, fail }
         acquisitions.set(key, acq)
-        acquisitionOf.set(core, acq)
+        owners.push(acq)
         // A completed load also (re)marks ready — the recovery path out of a
         // failed ready-gate's error state (idempotent otherwise). A send failure
         // or rejected receipt rejects THIS load (0.8.4 surfaces it
@@ -897,12 +958,12 @@ export function doCollectionOptions(opts: {
         if (cover) {
           cover.pins++
           acq.watch = cover
-          fetchCovered(acq, o, cover).then(loaded, reject)
+          fetchCovered(acq, o, cover).then(loaded, fail)
         } else {
           // Forward orderBy/limit so the snapshot is this request's bounded
           // window (recent N), not the whole where-subset. The watch's
           // predicate is still `where`, so entering rows are delivered.
-          acq.watch = openWatch(o, loaded, reject, () => {
+          acq.watch = openWatch(o, loaded, fail, () => {
             // Refused: a later identical request tries again.
             if (acquisitions.get(key) === acq) acquisitions.delete(key)
           })
@@ -918,10 +979,10 @@ export function doCollectionOptions(opts: {
         // with the options object it loaded (0.8.x and 0.9.x alike). A repeat
         // release, or an object that was never loaded, is a no-op — releasing by
         // an equal object's request key could release another owner's load.
-        const acq = acquisitionOf.get(o)
-        const n = outstanding.get(o) ?? 0
-        if (!acq || n <= 0) return
-        outstanding.set(o, n - 1)
+        const owners = outstanding.get(o)
+        const acq = owners?.shift()
+        if (!acq) return
+        if (!owners?.length) outstanding.delete(o)
         if (acq.released || --acq.refs > 0) return
         acq.released = true
         acq.settle() // released before its rows arrived: nothing will settle it now
@@ -944,6 +1005,7 @@ export function doCollectionOptions(opts: {
           }
           watches.clear()
           holders.clear()
+          for (const acq of acquisitions.values()) acq.settle()
           acquisitions.clear()
           if (catchupId !== null) unsubscribeQuietly(catchupId)
         },
@@ -965,30 +1027,14 @@ export function doCollectionOptions(opts: {
     const eagerSubId = `${table}#${++subSeq}`
     {
       const hc = consumeHydratedCursor()
-      const handler = makeHandler(markReady, { reconcileSnapshots: true })
-      if (hc !== null) {
-        // Hydrated (ADR-0011 D3): the rows were applied upstream as synced
-        // upserts before we ran. Resume from the dehydrated cursor (server
-        // catch-up; below the floor an honest reset + resnapshot) — or, with
-        // no resume point ("0"), take a fresh snapshot and reconcile it.
-        // Ready NOW: stale-while-revalidate is the explicit SSR contract —
-        // first paint renders the hydrated rows, the boundary converges them.
-        // So a dial that fails here is not a failed load (see failLoad): the
-        // transport retries it.
-        void transport
-          .subscribe(eagerSubId, table, handler, where, undefined, undefined, hc === "0" ? undefined : hc)
-          .catch(failLoad)
-        markReady()
-      } else {
-        // A first-connect failure fails the first load loud (preload()
-        // rejects). The policy-driven reconnect keeps retrying. Before
-        // @tanstack/db 1.0 the eventual snapshot's markReady recovers the
-        // collection (error → ready, 0.8.2); from 1.0 a failed run stays
-        // failed and the app calls `reload()` (ADR-0028).
-        void transport.subscribe(eagerSubId, table, handler, where).catch(failLoad)
-      }
+      const { handler, fail } = makeEagerHandler(eagerSubId)
+      const since = hc === null || hc === "0" ? undefined : hc
+      void transport.subscribe(eagerSubId, table, handler, where, undefined, undefined, since).catch(fail)
+      // Hydrated eager rows are usable while their catch-up waits.
+      if (hc !== null) markReady()
     }
     return () => {
+      alive = false
       hydratedCursor = null // GC wiped the rows; a retained cursor would lie
       transport.unsubscribe(eagerSubId)
     }

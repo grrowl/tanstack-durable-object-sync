@@ -41,6 +41,11 @@ export interface SubHandler {
    *  not reached its first terminal, so it resubscribes without `since` and the
    *  snapshot that follows replaces whatever part of the first one arrived. */
   onRestart?(): void
+  /** A failed dial will be retried. Used by pre-1.0 eager readiness. */
+  onDialFailed?(error: unknown): void
+  /** Automatic retries ended. The owner may release this registration or
+   *  keep it for a later connection. Explicit close() is a pause. */
+  onStopped?(error: TransportStoppedError): void
 }
 
 /** The transport surface `doCollectionOptions` consumes — structural, so the
@@ -53,6 +58,9 @@ export interface Transport<Api = unknown> {
    *  `doCollectionOptions` recovers it (never `unknown`). */
   readonly __api?: Api
   connect(): Promise<void>
+  /** On WebSocketTransport this waits for the first send across retries and
+   *  explicit close. A stop before that send rejects with TransportStoppedError.
+   *  Removing the registration ends a pending wait. SSR resolves after its read. */
   subscribe(
     subId: string,
     collection: string,
@@ -85,6 +93,10 @@ export interface Transport<Api = unknown> {
  *  constant changes with an ADR note. Mirrors the server's ADR-0012 default. */
 const MAX_FRAME_BYTES = 1_048_576
 
+function wireBytes(data: WireOut): number {
+  return typeof data === "string" ? new TextEncoder().encode(data).byteLength : data.byteLength
+}
+
 /** The largest position the server accepts as a `since`: 19 digits, the length
  *  of SQLite's largest INTEGER. The server drops a `since` past it with no
  *  reply (ADR-0012 amendment 2026-11-17), so a cursor past it is refused here. */
@@ -100,15 +112,18 @@ export class MutationRejectedError extends Error {
   }
 }
 
-/** Thrown by `connect()` — and so by any `await connect()` in `subscribe` /
- *  `sendMut` / `fetch` — when the transport was closed while a dial was in
- *  flight and was NOT revived by a later `connect()`. `connect()` never
- *  resolves having adopted no socket (issue #37): it re-dials when revived, or
- *  rejects with this typed, catchable error so a collection fails its ready
- *  gate loud (do-collection routes it to `markError`) instead of resolving a
- *  silently-empty collection or floating an unhandled rejection. The default
- *  `open()` also rejects with it when `close()` aborts an in-flight handshake
- *  (issue #38 / ADR-0020). */
+/** The reconnect policy returned null or threw. A failed dial, send or
+ *  policy exception is available as cause; a peer close carries its details. */
+export class TransportStoppedError extends Error {
+  constructor(readonly closeCode?: number, readonly closeReason?: string, cause?: unknown) {
+    const message = cause instanceof Error ? cause.message : cause
+    const detail = [closeCode, closeReason, typeof message === "string" ? message : undefined].filter(value => value != null).join(" ")
+    super(`reconnect policy stopped${detail ? `: ${detail}` : ""}`, { cause })
+    this.name = "TransportStoppedError"
+  }
+}
+
+/** A direct connect() or write lost its handshake to an intentional close. */
 export class TransportClosedError extends Error {
   constructor(message = "transport closed during connect") {
     super(message)
@@ -199,11 +214,30 @@ export interface TransportOptions {
    *  reconnecting. Default: `defaultReconnectDelay(250)`. A truly fixed delay
    *  is a policy too: `() => 500`. */
   reconnectDelay?: number | ReconnectDelayFn
-  /** Called when an unexpected drop is TERMINAL — the policy returned `null`
-   *  (default: any 4000-4999 application close, e.g. an auth rejection) — so
-   *  the app can tell "re-auth needed" from a transient blip the transport is
-   *  still retrying. Never called for an intentional `close()`. */
-  onClosed?: (code: number | undefined, reason: string | undefined) => void
+  /** Called when the policy returns null or throws, including a terminal
+   *  application close (4000–4999 under the default policy). The error
+   *  carries the peer close or the underlying dial, send or policy exception.
+   *  An intentional close() pauses registered reads without calling this hook. */
+  onClosed?: (code: number | undefined, reason: string | undefined, error: TransportStoppedError) => void
+}
+
+interface Subscription {
+  handler: SubHandler
+  /** Immutable on-wire request, including the original resume position. */
+  initial: WireOut
+  since?: string
+  bootstrapped: boolean
+  everSent: boolean
+  firstSend?: { resolve(): void; reject(error: Error): void }
+}
+
+interface PageRequest {
+  frame: WireOut
+  resolve(rows: Array<unknown>): void
+  reject(error: unknown): void
+  /** The socket responsible for the page. Null while waiting to send. */
+  socket: WebSocketLike | null
+  timer?: ReturnType<typeof setTimeout>
 }
 
 interface SeqWaiter {
@@ -264,31 +298,15 @@ export class WebSocketTransport<Api = unknown> {
    *  cursor: the cursor says nothing about rows a sub never received — other
    *  subs may have advanced it. Until then a sub given an explicit `since`
    *  (SSR hydration) resumes from THAT, and any other restarts from a snapshot. */
-  private readonly handlers = new Map<
-    string,
-    {
-      handler: SubHandler
-      collection: string
-      where?: unknown
-      orderBy?: unknown
-      limit?: number
-      since?: string
-      bootstrapped: boolean
-    }
-  >()
+  private readonly handlers = new Map<string, Subscription>()
   private appliedSeq = 0n
   private readonly seqWaiters: Array<SeqWaiter> = []
   private readonly pendingTx = new Map<string, TxWaiter>()
-  private readonly pendingFetches = new Map<
-    string,
-    { resolve: (rows: Array<unknown>) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }
-  >()
+  private readonly pendingFetches = new Map<string, PageRequest>()
   /** Suppresses auto-reconnect after an intentional close(). */
   private intentionallyClosed = false
-  /** True while reconnecting, so connect() resubscribes on success. */
-  private reconnecting = false
   private readonly reconnectDelay: ReconnectDelayFn
-  private readonly onClosed?: (code: number | undefined, reason: string | undefined) => void
+  private readonly onClosed?: TransportOptions["onClosed"]
   /** Consecutive reconnect attempts since the last connection that stayed
    *  open `HEALTHY_OPEN_MS`, or since a terminal stop or close(); the 1-based
    *  value passed to the policy. */
@@ -401,7 +419,6 @@ export class WebSocketTransport<Api = unknown> {
     } catch {
       /* already dead; the reconnect proceeds regardless */
     }
-    this.reconnecting = true
     this.clearReconnectTimer()
     void this.connect().catch(() => {
       /* retries route through connect()'s failure path (policy-driven) */
@@ -468,7 +485,7 @@ export class WebSocketTransport<Api = unknown> {
         // reconnect first). A `page` is a snapshot, not an outcome: the fresh
         // socket's replay may already have deleted a row it carries, so a stale
         // page FAILS its fetch rather than resurrect that row (ADR-0023).
-        this.onMessage(ev.data, this.ws !== ws)
+        this.onMessage(ev.data, ws)
       })
       ws.addEventListener("close", (ev) => {
         // Only the CURRENT socket's close may detach/reconnect. A stale
@@ -478,19 +495,8 @@ export class WebSocketTransport<Api = unknown> {
         this.ws = null
         this.connectPromise = null
         if (this.intentionallyClosed) return // close() owns pendingTx teardown
-        this.resetBackoffIfHealthy()
-        // Auto-reconnect on an unexpected drop while subscriptions are active.
-        if (this.handlers.size > 0) {
-          // Hold in-flight mut/call for dedup replay on reconnect (issue #39)
-          // BEFORE scheduling — a terminal policy then fails them typed below.
-          this.parkPendingForReplay()
-          const { code, reason } = ev as { code?: number; reason?: string }
-          this.scheduleReconnect(code, reason)
-        } else {
-          // No subscriptions → ADR-0016 does not reconnect, so no replay can ever
-          // learn the outcome: settle the in-flight mut/call now, typed (issue #39).
-          this.failPendingConnectionLost()
-        }
+        const { code, reason } = ev as { code?: number; reason?: string }
+        this.socketLost(code, reason)
       })
       this.ws = ws
       this.wsOpenedAt = Date.now()
@@ -498,15 +504,18 @@ export class WebSocketTransport<Api = unknown> {
       // beat it). It does NOT reset the backoff: resetBackoffIfHealthy does,
       // when this socket goes away after proving healthy (ADR-0016 §3).
       this.clearReconnectTimer()
-      // On a reconnect, re-establish every subscription from our single applied
-      // cursor so the server serves a windowed catch-up rather than a snapshot.
-      if (this.reconnecting) {
-        this.reconnecting = false
-        this.resubscribeAll()
-        // Replay any in-flight mut/call parked by the drop, so the dedup table
-        // answers each with its true recorded outcome (issue #39 / ADR-0021).
-        this.resendParkedTx()
+      try {
+        this.resubscribeAll(ws)
+        if (this.ws === ws) this.resendParkedTx()
+        for (const [id, request] of this.pendingFetches) {
+          if (this.ws !== ws) break
+          if (!request.socket) this.sendPage(id, request, ws)
+        }
+      } catch (error) {
+        this.abandonSocket(ws, error)
+        throw error
       }
+      if (this.ws !== ws) throw new Error("socket lost during install")
     })()
     this.connectPromise = p
     // A socket that never OPENED fires no close event, so the close-handler
@@ -517,50 +526,77 @@ export class WebSocketTransport<Api = unknown> {
     // dial (a revived transport's earlier attempt that re-dialed via the epoch
     // branch above) must not null a newer attempt's promise or double-schedule
     // its reconnect — that newer attempt owns its own recovery.
-    p.catch(() => {
+    p.catch((error: unknown) => {
       if (this.connectPromise !== p) return
       this.connectPromise = null
-      if (!this.intentionallyClosed && this.handlers.size > 0) {
-        // A socket that never opened has no close frame — the policy sees an
-        // undefined code (backoff, under the default).
-        this.scheduleReconnect()
+      if (!this.handlers.size) {
+        this.rejectPages(error, true)
+      } else if (!this.intentionallyClosed) {
+        // A demand-driven dial can beat an armed timer. Its failure does not
+        // consume another policy attempt or push that timer into the future.
+        if (this.reconnectTimer === null) this.scheduleReconnect(undefined, undefined, error)
+        if (this.reconnectTimer !== null) {
+          this.notifyHandlers(entry => {
+            if (entry.firstSend) entry.handler.onDialFailed?.(error)
+          })
+        }
       }
     })
     return p
   }
 
-  /** Consult the policy and either arm the next reconnect attempt or stop. */
-  private scheduleReconnect(closeCode?: number, closeReason?: string): void {
-    // The flag is set at SCHEDULING time, not in the timer: a demand-driven
-    // connect() (a mutation inside the reconnect window) may establish the
-    // fresh socket first, and it must run the resubscribe path too — or every
-    // subscription is silently dead on the new socket and the late timer
-    // wedges the flag (pre-existing bug, found in the ADR-0011 grill). It is
-    // also set on a TERMINAL close, so an app-driven connect() after e.g.
-    // re-auth still resubscribes from the cursor.
-    this.reconnecting = true
-    // At most one pending attempt: a newer drop supersedes an older timer.
-    this.clearReconnectTimer()
-    const delay = this.reconnectDelay(++this.reconnectAttempt, closeCode, closeReason)
-    if (delay === null) {
-      // Terminal (default: application close 4000-4999, e.g. an
-      // accept-then-close auth rejection): retrying cannot help — surface the
-      // close to the app instead of looping against the DO.
-      this.onClosed?.(closeCode, closeReason)
-      // This run of retries is over. An app-driven connect() (e.g. after
-      // re-auth) starts a new one with the policy's full budget.
-      this.reconnectAttempt = 0
-      // No reconnect will ever replay these — settle in-flight mut/call typed now
-      // rather than let the parked timer wait out timeoutMs (issue #39).
+  private socketLost(code?: number, reason?: string, cause?: unknown): void {
+    this.resetBackoffIfHealthy()
+    if (!this.handlers.size) {
       this.failPendingConnectionLost()
+      // Standalone reads already on the wire keep their original timeout.
+      this.rejectPages(cause ?? new ConnectionLostError("connection lost before sending the page request"), true)
+      return
+    }
+    this.parkPendingForReplay()
+    this.parkPages()
+    this.scheduleReconnect(code, reason, cause)
+  }
+
+  private scheduleReconnect(code?: number, reason?: string, cause?: unknown): void {
+    this.clearReconnectTimer()
+    let delay: number | null
+    try {
+      delay = this.reconnectDelay(++this.reconnectAttempt, code, reason)
+    } catch (error) {
+      cause = error
+      delay = null
+    }
+    if (delay === null) {
+      const error = new TransportStoppedError(code, reason, cause)
+      this.reconnectAttempt = 0
+      this.failPendingConnectionLost()
+      this.rejectPages(error)
+      this.notifyHandlers(entry => {
+        entry.firstSend?.reject(error)
+        entry.firstSend = undefined
+        entry.handler.onStopped?.(error)
+      })
+      this.onClosed?.(code, reason, error)
       return
     }
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
-      void this.connect().catch(() => {
-        /* next attempt retries via the connect-failure path above */
-      })
+      void this.connect().catch(() => { /* the owning dial handles recovery */ })
     }, delay)
+  }
+
+  /** A callback may release or replace subscriptions, or throw. Finish
+   *  settling all owners from this event before surfacing a callback error. */
+  private notifyHandlers(notify: (entry: Subscription) => void): void {
+    for (const [id, entry] of [...this.handlers]) {
+      if (this.handlers.get(id) !== entry) continue
+      try {
+        notify(entry)
+      } catch (error) {
+        queueMicrotask(() => { throw error })
+      }
+    }
   }
 
   /** Only a connection that stayed open `HEALTHY_OPEN_MS` resets the backoff
@@ -584,28 +620,47 @@ export class WebSocketTransport<Api = unknown> {
    *  subs, and a catch-up from it would skip changes it never received — its
    *  load would never settle. An explicit catch-up resumes from its own `since`
    *  (replaying a catch-up is idempotent); any other restarts from a snapshot. */
-  private resubscribeAll(): void {
+  private resubscribeAll(ws: WebSocketLike): void {
     const cursor = this.appliedCursor
-    for (const [subId, entry] of this.handlers) {
-      if (!entry.bootstrapped && entry.since === undefined) entry.handler.onRestart?.()
-      // A late hydration chunk may have REGRESSED the cursor below a pending
-      // catch-up's own `since` (seedCursor): then the lower one is the resume
-      // point, so the replay re-covers the clobbered window.
+    for (const [id, entry] of [...this.handlers]) {
+      if (this.ws !== ws) return
+      if (this.handlers.get(id) !== entry) continue
+      if (entry.everSent && !entry.bootstrapped && entry.since === undefined) {
+        entry.handler.onRestart?.()
+        if (this.ws !== ws || this.handlers.get(id) !== entry) continue
+      }
       const since = entry.bootstrapped
         ? cursor
         : entry.since !== undefined && this.appliedSeq > 0n && this.appliedSeq < BigInt(entry.since)
           ? cursor
           : entry.since
-      this.sendFrame({
-        t: "sub",
-        subId,
-        collection: entry.collection,
-        where: entry.where,
-        orderBy: entry.orderBy,
-        limit: entry.limit,
-        since,
-      })
+      this.sendSubscription(ws, entry, since)
     }
+  }
+
+  private sendSubscription(ws: WebSocketLike, entry: Subscription, since?: string): void {
+    let data = entry.initial
+    if (since !== entry.since) {
+      const frame = this.codec.decode(data) as Extract<ClientFrame, { t: "sub" }>
+      data = this.codec.encode({ ...frame, since })
+    }
+    ws.send(data)
+    entry.everSent = true
+    entry.firstSend?.resolve()
+    entry.firstSend = undefined
+  }
+
+  /** A partial install cannot be used. Only this socket owns its recovery. */
+  private abandonSocket(ws: WebSocketLike, error: unknown): void {
+    if (ws !== this.ws) return
+    this.ws = null
+    this.connectPromise = null
+    try {
+      ws.close()
+    } catch {
+      /* already closed */
+    }
+    this.socketLost(undefined, undefined, error)
   }
 
   /** Re-send every parked mut/call frame after a reconnect so the server's dedup
@@ -679,11 +734,8 @@ export class WebSocketTransport<Api = unknown> {
       w.reject(new Error("transport closed"))
     }
     this.pendingTx.clear()
-    for (const [, w] of this.pendingFetches) {
-      clearTimeout(w.timer)
-      w.reject(new Error("transport closed"))
-    }
-    this.pendingFetches.clear()
+    if (this.handlers.size) this.parkPages()
+    else this.rejectPages(new TransportClosedError())
     try {
       this.ws?.close()
     } catch {
@@ -711,17 +763,35 @@ export class WebSocketTransport<Api = unknown> {
         `since must be a position in plain decimal form (digits only, no sign or leading zero, at most 19 digits): ${JSON.stringify(since)}`,
       )
     }
-    this.handlers.set(subId, { handler, collection, where, orderBy, limit, since, bootstrapped: false })
-    await this.connect()
-    // Unsubscribed while the connect was in flight (its `unsub` had no socket
-    // to ride): sending now would register a ghost subscription the server
-    // persists (ADR-0019) with no local handler — dead weight against the
-    // sub cap until the socket drops (codex review).
-    if (!this.handlers.has(subId)) return
-    this.sendFrame({ t: "sub", subId, collection, where, orderBy, limit, since })
+    const frame = { t: "sub", subId, collection, where, orderBy, limit, since } as const
+    const initial = this.codec.encode(frame)
+    // Leave room for the longest resume position. Check exact encoded size
+    // only near the cap. An unsendable predicate must never start a retry loop.
+    const bytes = wireBytes(initial)
+    if (bytes > MAX_FRAME_BYTES ||
+        (bytes > MAX_FRAME_BYTES - 64 && wireBytes(this.codec.encode({ ...frame, since: String(MAX_CURSOR) })) > MAX_FRAME_BYTES)) {
+      throw new Error("subscription exceeds the inbound WebSocket frame limit")
+    }
+    this.handlers.get(subId)?.firstSend?.resolve()
+    this.handlers.delete(subId)
+    return new Promise<void>((resolve, reject) => {
+      const entry = { handler, initial, since, bootstrapped: false, everSent: false, firstSend: { resolve, reject } }
+      this.handlers.set(subId, entry)
+      const ws = this.ws
+      if (ws) {
+        try {
+          this.sendSubscription(ws, entry, since)
+        } catch (error) {
+          this.abandonSocket(ws, error)
+        }
+      } else {
+        void this.connect().catch(() => { /* firstSend follows the retry policy */ })
+      }
+    })
   }
 
   unsubscribe(subId: string): void {
+    this.handlers.get(subId)?.firstSend?.resolve()
     this.handlers.delete(subId)
     if (this.ws) {
       this.sendFrame({ t: "unsub", subId })
@@ -731,16 +801,15 @@ export class WebSocketTransport<Api = unknown> {
     // does not reconnect for zero subs, so a pending reconnect has nothing to
     // resubscribe — and it must never silently reconnect just to REPLAY a parked
     // mut/call (that would contradict ADR-0021's no-subs fallback). Cancel a
-    // still-pending reconnect timer, clear the reconnecting flag so any handshake
-    // already in flight installs WITHOUT resubscribing or replaying, and settle the
+    // still-pending reconnect timer and settle the
     // parked in-flight mut/call typed now (issue #39 / ADR-0021). A dial already
     // parked on open() is not force-aborted here — that would entangle ADR-0020's
     // epoch/revival machinery; at worst it installs an idle, demand-less socket
     // (as an initial connect also can), which the app disposes via close().
     if (this.handlers.size === 0) {
       this.clearReconnectTimer()
-      this.reconnecting = false
       this.failPendingConnectionLost()
+      if (!this.connectPromise) this.rejectPages(new ConnectionLostError("connection lost before the page arrived"), true)
     }
   }
 
@@ -777,15 +846,58 @@ export class WebSocketTransport<Api = unknown> {
 
   /** One-shot page fetch; resolves with the page's rows. No live subscription. */
   async fetch(frame: Extract<ClientFrame, { t: "fetch" }>): Promise<Array<unknown>> {
-    await this.connect()
+    const id = frame.fetchId
+    if (this.pendingFetches.has(id)) throw new Error(`fetchId already in flight: ${id}`)
+    const data = this.codec.encode(frame)
+    if (wireBytes(data) > MAX_FRAME_BYTES) throw new Error("fetch exceeds the inbound WebSocket frame limit")
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingFetches.delete(frame.fetchId)
-        reject(new Error(`fetch timeout: ${frame.fetchId}`))
-      }, this.timeoutMs)
-      this.pendingFetches.set(frame.fetchId, { resolve, reject, timer })
-      this.sendFrame(frame)
+      const request: PageRequest = { frame: data, resolve, reject, socket: null }
+      this.pendingFetches.set(id, request)
+      const ws = this.ws
+      if (ws) {
+        try {
+          this.sendPage(id, request, ws)
+        } catch (error) {
+          this.abandonSocket(ws, error)
+        }
+      } else {
+        void this.connect().catch(() => { /* the owning dial handles settlement */ })
+      }
     })
+  }
+
+  private sendPage(id: string, request: PageRequest, ws: WebSocketLike): void {
+    request.socket = ws
+    request.timer = setTimeout(() => {
+      this.pendingFetches.delete(id)
+      request.reject(new Error(`fetch timeout: ${id}`))
+    }, this.timeoutMs)
+    try {
+      ws.send(request.frame)
+    } catch (error) {
+      if (!this.handlers.size) {
+        clearTimeout(request.timer)
+        this.pendingFetches.delete(id)
+        request.reject(error)
+      }
+      throw error
+    }
+  }
+
+  private parkPages(): void {
+    for (const request of this.pendingFetches.values()) {
+      clearTimeout(request.timer)
+      request.socket = null
+    }
+  }
+
+  private rejectPages(error: unknown, onlyUnsent = false): void {
+    for (const [id, request] of this.pendingFetches) {
+      if (onlyUnsent && request.socket) continue
+      this.pendingFetches.delete(id)
+      clearTimeout(request.timer)
+      request.reject(error)
+    }
   }
 
   /** Resolves once `appliedSeq >= target`. */
@@ -813,7 +925,7 @@ export class WebSocketTransport<Api = unknown> {
     // A string frame (the JSON debug codec) goes over the wire as UTF-8 —
     // measure bytes, not UTF-16 code units, or non-ASCII payloads undercount
     // and slip past the guard only to die at the edge cap (codex review).
-    const bytes = typeof encoded === "string" ? new TextEncoder().encode(encoded).byteLength : encoded.byteLength
+    const bytes = wireBytes(encoded)
     if (bytes > MAX_FRAME_BYTES) {
       throw new MutationRejectedError(
         `frame too large (${bytes} bytes > the ${MAX_FRAME_BYTES}-byte inbound WebSocket edge cap)`,
@@ -859,7 +971,8 @@ export class WebSocketTransport<Api = unknown> {
     this.ws.send(data)
   }
 
-  private onMessage(data: unknown, stale = false): void {
+  private onMessage(data: unknown, socket: WebSocketLike): void {
+    const stale = this.ws !== socket
     let frame: ServerFrame
     try {
       frame = this.codec.decode(data as ArrayBuffer | string) as ServerFrame
@@ -915,7 +1028,7 @@ export class WebSocketTransport<Api = unknown> {
       }
       case "page": {
         const w = this.pendingFetches.get(frame.fetchId)
-        if (w) {
+        if (w?.socket === socket) {
           clearTimeout(w.timer)
           this.pendingFetches.delete(frame.fetchId)
           if (stale) w.reject(new Error(`fetch page from an abandoned socket: ${frame.fetchId}`))

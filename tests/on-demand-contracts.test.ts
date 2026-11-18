@@ -603,7 +603,7 @@ describe("loadSubset / unloadSubset contract pins (fake transport)", () => {
 })
 
 describe("codex diff review: pinned fixes", () => {
-  type Opts = { where?: unknown; orderBy?: unknown; limit?: number; signal?: AbortSignal }
+  type Opts = { where?: unknown; orderBy?: unknown; limit?: number; signal?: AbortSignal; cursor?: unknown }
   type OnDemand = { loadSubset: (o: Opts) => true | Promise<void>; unloadSubset: (o: Opts) => void }
   const eqBody = (v: string): unknown => ({ type: "func", name: "eq", args: [{ type: "ref", path: ["body"] }, { type: "val", value: v }] })
 
@@ -735,6 +735,18 @@ describe("codex diff review: pinned fixes", () => {
     expect(h.subs.length).toBe(3)
   })
 
+  it("a cursor page cannot reinstall rows after its covering watch was released", async () => {
+    const h = harness([{ id: "late", body: "x" }])
+    const watch = { where: eqBody("x"), limit: 1 }
+    await h.res.loadSubset(watch)
+    const page = h.res.loadSubset({ ...watch, cursor: { whereFrom: eqBody("x") } })
+    h.res.unloadSubset(watch)
+    h.releaseFetch()
+    await page
+    expect(h.unsubs).toEqual(h.subs)
+    expect(h.rows.has("late")).toBe(false)
+  })
+
   it("one owner's abort does not cancel a covered fetch another owner shares", async () => {
     const h = harness([{ id: "cold", body: "x" }])
     await h.res.loadSubset({ where: eqBody("x"), limit: 1 }) // the watch
@@ -843,9 +855,10 @@ describe("codex third review: pinned fixes", () => {
       sleep(ms).then(() => "pending"),
     ])
 
-  function harness(opts: { snaps: (where: unknown, limit?: number) => boolean; failSub?: (where: unknown, limit?: number) => Error | null }) {
+  function harness(opts: { snaps: (where: unknown, limit?: number) => boolean; failSub?: (where: unknown, limit?: number) => Error | null; fetch?: () => Promise<unknown[]> }) {
     const subs: Array<string> = []
     const handlers = new Map<string, SubHandler>()
+    const unsubs: string[] = []
     let receipt: true | Promise<void> = true
     const transport = {
       connect: async () => {},
@@ -859,8 +872,8 @@ describe("codex third review: pinned fixes", () => {
         }
         if (opts.snaps(where, limit)) h.onSnapEnd()
       },
-      unsubscribe: () => {},
-      fetch: async () => [],
+      unsubscribe: (id: string) => unsubs.push(id),
+      fetch: opts.fetch ?? (async () => []),
       sendMut: async () => ({}),
       close: () => {},
     } as unknown as WebSocketTransport<TestApi>
@@ -873,7 +886,7 @@ describe("codex third review: pinned fixes", () => {
       markReady: () => {},
       truncate: () => {},
     })
-    return { subs, handlers, res, setReceipt: (r: true | Promise<void>) => (receipt = r) }
+    return { subs, unsubs, handlers, res, setReceipt: (r: true | Promise<void>) => (receipt = r) }
   }
 
   it("a truncate settles orphaned loads only once the truncate itself is applied", async () => {
@@ -903,6 +916,26 @@ describe("codex third review: pinned fixes", () => {
         expect(await outcome(orphan)).toBe("rejected: truncate aborted")
       }
     }
+  })
+
+  it("a late release of a failed covered request leaves the retried request and its watch live", async () => {
+    let reads = 0
+    const h = harness({ snaps: () => true, fetch: async () => {
+      if (++reads === 1) throw new Error("page timeout")
+      return []
+    } })
+    const watch = { where: eqBody("x"), limit: 2 }
+    const covered = { where: eqBody("x"), limit: 5 }
+    await h.res.loadSubset(watch)
+    await expect(h.res.loadSubset(covered)).rejects.toThrow("page timeout")
+    await h.res.loadSubset(covered)
+    expect(reads).toBe(2)
+    h.res.unloadSubset(watch)
+    h.res.unloadSubset(covered) // first load's release arrives after the retry
+    expect(h.unsubs).toEqual([])
+    h.res.unloadSubset(covered)
+    expect(h.unsubs).toEqual(h.subs)
+    expect(h.subs).toHaveLength(1)
   })
 
   it("a request waiting on a pending watch fails with it when that watch's subscribe fails", async () => {
