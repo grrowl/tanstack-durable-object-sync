@@ -10,6 +10,15 @@ While pre-1.0, the public API may change between 0.x releases.
 
 ### Changed
 
+- **Breaking change to first-load recovery.** On `@tanstack/db` 1.0 an
+  eager preload waits through automatic retries. A terminal policy decision
+  rejects pending eager and subset reads with `TransportStoppedError`.
+  A fresh on-demand source is ready offline and its queries wait for data.
+  An intentional `close()` pauses registered reads, including in-flight pages,
+  and the next connection resends them. Clean up collections to dispose them.
+  Apps that previously refreshed credentials in `onClosed` and called
+  `connect()` must move transparent refresh into the retry policy and opener,
+  or restart failed loads. [Migration example](./README.md#transport-lifecycle--reconnect).
 - **BREAKING:** `registerSync` refuses a table with a generated column named
   `rowid` (virtual or stored) or a column named `__proto__`. Both used to
   register. With the first, every read with no `orderBy` was sorted by the

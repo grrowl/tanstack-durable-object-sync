@@ -11,9 +11,12 @@
 // pins that a bare SyncDurableObject claims the upgrade on ANY path, so
 // Workers need no URL rewrite.
 
+import { CollectionImpl, createCollection, createLiveQueryCollection } from "@tanstack/db"
+import { doCollectionOptions } from "../src/client/do-collection.ts"
+import type { TestApi } from "./test-worker.ts"
 import { env, runInDurableObject, SELF } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
-import { WebSocketTransport, type SubHandler, type WebSocketLike } from "../src/client/transport.ts"
+import { TransportStoppedError, WebSocketTransport, type SubHandler, type WebSocketLike } from "../src/client/transport.ts"
 import { createFrameCodec } from "../src/wire/frame-codec.ts"
 import type { ClientFrame, ServerFrame } from "../src/wire/frames.ts"
 
@@ -173,6 +176,138 @@ describe("auth path: upgrade statuses and application close codes", () => {
       expect(state.getWebSockets()[0]!.deserializeAttachment()).toEqual({ userId: "alice" })
     })
     ws.close()
+  })
+
+  for (const refreshable of [false, true]) {
+    it(`pending eager and subset loads follow the auth policy (refreshable=${refreshable})`, async () => {
+      const room = `auth-first-load-${crypto.randomUUID()}`
+      await installAuthzOverride(room)
+      await runInDurableObject(env.SYNC_DO.get(env.SYNC_DO.idFromName(room)), (_i, state) => {
+        state.storage.sql.exec("INSERT INTO messages(id,body) VALUES('seed','hello')")
+      })
+      const codes: number[] = []
+      const users: string[] = []
+      let user = "intruder"
+      let refreshed: Promise<string> | undefined
+      const t = new WebSocketTransport<TestApi>({
+        url: "unused",
+        open: async () => {
+          if (refreshed) user = await refreshed
+          users.push(user)
+          const response = await upgrade(`/sync/${room}`, { "x-user": user })
+          const ws = response.webSocket!
+          ws.accept()
+          return ws as unknown as WebSocketLike
+        },
+        reconnectDelay: (_attempt, code) => {
+          codes.push(code!)
+          if (!refreshable) return null
+          refreshed = new Promise(resolve => setTimeout(() => resolve("alice"), 5))
+          return 0
+        },
+      })
+      const eager = createCollection(doCollectionOptions({ transport: t, table: "messages", getKey: m => m.id }))
+      const source = createCollection(doCollectionOptions({ transport: t, table: "messages", getKey: m => m.id, syncMode: "on-demand" }))
+      const query = createLiveQueryCollection(q => q.from({ m: source }))
+      const loads = await Promise.allSettled([eager.preload(), query.preload()])
+      expect(codes).toEqual([4403])
+      expect(source.status).toBe("ready")
+      if (refreshable) {
+        expect(users).toEqual(["intruder", "alice"])
+        expect(loads.map(l => l.status)).toEqual(["fulfilled", "fulfilled"])
+        expect(query.get("seed")).toMatchObject({ body: "hello" })
+      } else {
+        expect(users).toEqual(["intruder"])
+        for (const load of loads) {
+          expect(load.status).toBe("rejected")
+          if (load.status === "rejected") expect(load.reason).toMatchObject({
+            name: "TransportStoppedError", closeCode: 4403, closeReason: "org access denied",
+          })
+        }
+        expect(eager.status).toBe("error")
+        user = "alice"
+        await t.connect()
+        if ("reload" in CollectionImpl.prototype) await (eager as unknown as { reload(): Promise<void> }).reload()
+        else {
+          await eager.cleanup()
+          await eager.preload()
+        }
+        await query.cleanup()
+        const next = createLiveQueryCollection(q => q.from({ m: source }))
+        await next.preload()
+        expect(next.get("seed")).toMatchObject({ body: "hello" })
+        await next.cleanup()
+      }
+      expect(eager.get("seed")).toMatchObject({ body: "hello" })
+      await query.cleanup()
+      await source.cleanup()
+      await eager.cleanup()
+      t.close()
+    })
+  }
+
+  it("an intentional pause keeps the same first load pending until the revived socket denies access", async () => {
+    const room = `pause-denied-${crypto.randomUUID()}`
+    await installAuthzOverride(room)
+    let opens = 0
+    const t = new WebSocketTransport<TestApi>({
+      url: "unused",
+      open: async signal => {
+        if (++opens === 1) {
+          return new Promise<WebSocketLike>((_resolve, reject) => {
+            signal!.addEventListener("abort", () => reject(new Error("handshake aborted")), { once: true })
+          })
+        }
+        return await openWs(`/sync/${room}`, { "x-user": "intruder" }) as unknown as WebSocketLike
+      },
+    })
+    const messages = createCollection(doCollectionOptions({ transport: t, table: "messages", getKey: m => m.id }))
+    const load = messages.preload()
+    const denied = expect(load).rejects.toMatchObject({ name: "TransportStoppedError", closeCode: 4403 })
+    expect(opens).toBe(1)
+    t.close()
+    await Promise.resolve()
+    expect(messages.status).toBe("loading")
+    await t.connect()
+    await denied
+    expect(messages.status).toBe("error")
+    expect(opens).toBe(2)
+    await messages.cleanup()
+    t.close()
+  })
+
+  it("retains ready rows on denial and clears the stop on a successful catch-up", async () => {
+    const room = `ready-denied-${crypto.randomUUID()}`
+    const stub = env.SYNC_DO.get(env.SYNC_DO.idFromName(room))
+    await runInDurableObject(stub, (_i, state) => {
+      state.storage.sql.exec("INSERT INTO messages(id,body) VALUES('seed','before')")
+    })
+    let stop: TransportStoppedError | undefined
+    const t = new WebSocketTransport<TestApi>({
+      url: "unused",
+      open: async () => await openWs(`/sync/${room}`) as unknown as WebSocketLike,
+      onClosed: (_code, _reason, error) => { stop = error },
+    })
+    const messages = createCollection(doCollectionOptions({ transport: t, table: "messages", getKey: m => m.id }))
+    const health = () => (messages as unknown as { health?: { failureReason: unknown } }).health
+    await messages.preload()
+    await runInDurableObject(stub, (_i, state) => {
+      for (const ws of state.getWebSockets()) ws.close(4403, "access revoked")
+    })
+    await waitFor(() => !!stop)
+    expect(stop).toBeInstanceOf(TransportStoppedError)
+    expect(messages.status).toBe("ready")
+    expect(messages.get("seed")?.body).toBe("before")
+    if ("reload" in CollectionImpl.prototype) {
+      expect(health()?.failureReason).toMatchObject({ name: "TransportStoppedError", message: stop!.message })
+    }
+    await runInDurableObject(stub, (_i, state) => {
+      state.storage.sql.exec("UPDATE messages SET body='after' WHERE id='seed'")
+    })
+    await t.connect()
+    await waitFor(() => messages.get("seed")?.body === "after" && !health()?.failureReason)
+    await messages.cleanup()
+    t.close()
   })
 
   it("the transport treats the 4403 rejection as terminal: no retry loop, onClosed surfaces it", async () => {

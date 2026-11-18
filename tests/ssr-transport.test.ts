@@ -62,6 +62,14 @@ describe("SsrSnapshotTransport (server-side render path, ADR-0011 D2)", () => {
     expect(BigInt(transport.appliedCursor)).toBeGreaterThan(0n) // dehydration exports this
   })
 
+  it("an eager read that fails rejects preload with the original cause", async () => {
+    const denied = new Error("SSR read denied")
+    const transport = new SsrSnapshotTransport<Api>({ read: async () => { throw denied } })
+    const messages = createCollection(doCollectionOptions({ transport, table: "messages", getKey: m => m.id }))
+    await expect(messages.preload()).rejects.toBe(denied)
+    expect(messages.status).toBe("error")
+  })
+
   it("on-demand: a server-side live query preload drives loadSubset through one read", async () => {
     const room = `ssrt-od-${crypto.randomUUID()}`
     await seed(room, [

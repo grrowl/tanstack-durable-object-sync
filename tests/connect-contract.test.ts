@@ -144,15 +144,20 @@ describe("connect() contract — never resolves disconnected (#37)", () => {
     const sub1Outcome = sub1.then(() => "ok", (e) => e) // capture the rejection — no unhandled
     await waitFor(() => fakes.length === 1)
 
-    t.close() // aborts the in-flight open → sub1 must reject typed
-    expect(await sub1Outcome).toBeInstanceOf(TransportClosedError)
+    t.close() // Aborts the handshake. The subscription belongs to its owner.
+    let settled = false
+    void sub1Outcome.then(() => (settled = true))
+    await new Promise((r) => setTimeout(r, 0))
+    expect(settled).toBe(false)
 
-    // Revive: a fresh subscribe re-dials. The frame must land on the NEW socket.
+    // Revive: a fresh subscribe re-dials. BOTH frames must land on the NEW socket.
     const sub2 = t.subscribe("s2", "messages", noopHandler())
     await waitFor(() => releases[1] !== undefined)
     releases[1]!()
     await sub2
-    expect(fakes[1]!.sent.some((f) => f.t === "sub" && (f as { subId?: string }).subId === "s2")).toBe(true)
+    expect(await sub1Outcome).toBe("ok")
+    const subs = fakes[1]!.sent.filter((f) => f.t === "sub").map((f) => (f as { subId?: string }).subId)
+    expect(subs).toEqual(["s1", "s2"])
     t.close()
   })
 })
@@ -278,6 +283,105 @@ describe("close() aborts an in-flight handshake — no leaked CONNECTING socket 
     release!() // …but when it resolves, the orphan is closed and connect() rejects
     await waitFor(() => socketClosed)
     expect(await outcome).toBeInstanceOf(TransportClosedError)
+    t.close()
+  })
+})
+
+describe("read settlement across sockets (ADR-0029)", () => {
+  it("a terminal dial or policy exception settles every unsent read with the original cause", async () => {
+    for (const throws of [false, true]) {
+      const dialError = new Error("offline")
+      const policyError = new Error("policy failed")
+      const t = new WebSocketTransport({
+        url: "wss://x",
+        open: () => { throw dialError },
+        reconnectDelay: () => {
+          if (throws) throw policyError
+          return null
+        },
+      })
+      const results = await Promise.allSettled([
+        t.subscribe("s1", "messages", noopHandler()),
+        t.fetch({ t: "fetch", fetchId: "page", collection: "messages" }),
+      ])
+      for (const result of results) {
+        expect(result.status).toBe("rejected")
+        if (result.status === "rejected") {
+          expect(result.reason.name).toBe("TransportStoppedError")
+          expect(result.reason.cause).toBe(throws ? policyError : dialError)
+        }
+      }
+      t.unsubscribe("s1")
+      t.close()
+    }
+  })
+
+  it("failed writes during an armed retry leave its policy budget for the pending read", async () => {
+    const fake = makeFake()
+    const attempts: number[] = []
+    let offline = true
+    const t = new WebSocketTransport({
+      url: "wss://x",
+      open: () => {
+        if (offline) throw new Error("offline")
+        return fake.ws
+      },
+      reconnectDelay: attempt => {
+        attempts.push(attempt)
+        return attempt === 1 ? 60_000 : null
+      },
+    })
+    const sub = t.subscribe("s1", "messages", noopHandler())
+    await waitFor(() => attempts.length === 1)
+    for (let i = 0; i < 3; i++) {
+      await expect(t.sendMut({ t: "mut", collection: "messages", txId: String(i), ops: [] })).rejects.toThrow("offline")
+    }
+    expect(attempts).toEqual([1])
+    offline = false
+    await t.connect()
+    await sub
+    expect(fake.sent.map(f => f.t)).toEqual(["sub"])
+    t.close()
+  })
+
+  it("a page replays after its watch, ignores a late answer, and rejects on a policy stop", async () => {
+    const sockets: Fake[] = []
+    const t = new WebSocketTransport({
+      url: "wss://x", reconnectDelay: (_attempt, code) => code === 4403 ? null : 60_000,
+      open: () => {
+        const fake = makeFake()
+        sockets.push(fake)
+        return fake.ws
+      },
+    })
+    await t.subscribe("watch", "messages", noopHandler())
+    const frame = { t: "fetch", fetchId: "page", collection: "messages" } as const
+    const page = t.fetch(frame)
+    sockets[0]!.emit("close", { code: 1006 })
+    await t.connect()
+    expect(sockets[1]!.sent.map(f => f.t)).toEqual(["sub", "fetch"])
+    const answer = (value: string) => ({ data: codec.encode({ t: "page", fetchId: "page", rows: [value], seq: "0" }) })
+    sockets[0]!.emit("message", answer("stale"))
+    sockets[1]!.emit("message", answer("fresh"))
+    expect(await page).toEqual(["fresh"])
+
+    const denied = t.fetch(frame)
+    sockets[1]!.emit("close", { code: 4403, reason: "forbidden" })
+    await expect(denied).rejects.toMatchObject({ name: "TransportStoppedError", closeCode: 4403, closeReason: "forbidden" })
+    t.close()
+  })
+
+  it("a subscription send that throws abandons the socket and the next install finishes the batch once", async () => {
+    const broken = makeFake()
+    const working = makeFake()
+    let opens = 0
+    broken.ws.send = () => { throw new Error("send failed") }
+    const t = new WebSocketTransport({
+      url: "wss://x", open: () => (++opens === 1 ? broken : working).ws, reconnectDelay: () => 0,
+    })
+    await Promise.all(["a", "b"].map(id => t.subscribe(id, "messages", noopHandler())))
+    expect(opens).toBe(2)
+    expect(working.sent.map(f => f.t === "sub" && f.subId)).toEqual(["a", "b"])
     t.close()
   })
 })

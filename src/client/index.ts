@@ -13,6 +13,7 @@ export {
   defaultReconnectDelay,
   MutationRejectedError,
   TransportClosedError,
+  TransportStoppedError,
   WebSocketTransport,
 } from "./transport.ts"
 export type { ReconnectDelayFn, SubHandler, Transport, TransportOptions, WebSocketLike } from "./transport.ts"

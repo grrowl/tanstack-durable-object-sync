@@ -1,16 +1,11 @@
 import { describe, expect, it } from "vitest"
 import { doCollectionOptions, type DoSyncMeta } from "../src/client/do-collection.ts"
-import type { Transport } from "../src/client/transport.ts"
+import { TransportStoppedError, type SubHandler, type Transport } from "../src/client/transport.ts"
 
-// WHY (ADR-0011 D3, adapter-level ordering): on-demand readiness must GATE on
-// the transient hydration catch-up sub being SENT — loadSubset subs only fire
-// after ready, so on the single ordered socket the catch-up's truncate/deltas
-// always precede subset snapshots. A markReady racing ahead (the bug: its
-// connect().then() was registered first) lets a subset snapshot land at a seq
-// the catch-up then stomps over — or, below the floor, lets the catch-up's
-// truncate WIPE an already-loaded subset. Also pins the syncMeta hook
-// contract: export shape, import validation, where-fingerprint downgrade,
-// min-merge.
+// The hydrated on-demand catch-up must register before subset watches.
+// Core can ask for its first subset while the collection is still loading.
+// On the ordered stream the catch-up's deltas or truncate must precede
+// those snapshots. The source can become ready once the catch-up is sent.
 
 interface Msg {
   id: string
@@ -81,7 +76,7 @@ describe("hydrated on-demand start ordering", () => {
     expect(ready).toBeGreaterThan(catchup)
   })
 
-  it("without hydration there is no catch-up sub and ready follows connect", async () => {
+  it("without hydration ready requires no socket", async () => {
     const calls: Array<string> = []
     const opts = doCollectionOptions({
       transport: spyTransport(calls),
@@ -91,8 +86,7 @@ describe("hydrated on-demand start ordering", () => {
     }) as unknown as Hooked
     opts.sync.sync({ ...controls, markReady: () => calls.push("ready") })
     await flush()
-    expect(calls.filter((c) => c.startsWith("sub:"))).toEqual([])
-    expect(calls).toContain("ready")
+    expect(calls).toEqual(["ready"])
   })
 
   it("no resume point ('0'): hydrated rows are truncated, not left to go stale", async () => {
@@ -115,6 +109,34 @@ describe("hydrated on-demand start ordering", () => {
     expect(calls.filter((c) => c.startsWith("sub:"))).toEqual([]) // no unfiltered full snapshot
     expect(calls).toContain("ready")
   })
+})
+
+it("a policy stop after snap-end waits for the accepted commit before reporting health", async () => {
+  const calls: string[] = []
+  const transport = spyTransport(calls)
+  let handler!: SubHandler
+  transport.subscribe = async (_id, _collection, h) => { handler = h }
+  const opts = doCollectionOptions({ transport, table: "messages", getKey: m => m.id }) as unknown as Hooked
+  let apply!: () => void
+  const receipt = new Promise<void>(resolve => { apply = resolve })
+  opts.sync.sync({
+    ...controls,
+    collection: { _state: { syncedData: new Map() } },
+    commit: () => receipt,
+    markReady: () => calls.push("ready"),
+    reportError: () => calls.push("unhealthy"),
+    reportHealthy: () => calls.push("healthy"),
+    fail: () => calls.push("failed"),
+  })
+  handler.onSnap("a", { id: "a" })
+  handler.onSnapEnd()
+  handler.onStopped!(new TransportStoppedError(4403, "access denied"))
+  expect(calls).toEqual([])
+  apply()
+  await flush()
+  expect(calls).toEqual(["ready", "unhealthy"])
+  handler.onUptodate(true)
+  expect(calls).toEqual(["ready", "unhealthy", "healthy"])
 })
 
 describe("syncMeta hooks", () => {

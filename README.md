@@ -274,21 +274,57 @@ resolve with the command's result on `committed`.
 
 #### Transport lifecycle & reconnect
 
-The transport auto-reconnects on an unexpected drop and resubscribes every
-collection from its single applied cursor (a windowed catch-up, not a
-re-snapshot). Tune the pacing with `reconnectDelay` (a base-delay `number` for
-the default jittered backoff, or a full `(attempt, closeCode?, closeReason?) =>
-number | null` policy — return `null` to stop). Application close codes
-(4000-4999) are terminal by default; wire `onClosed(code, reason)` to observe a
-deliberate server close (e.g. an auth rejection) — see
-[ADR-0016](./docs/adr/0016-reconnect-policy.md).
+While the transport retries, eager first loads on `@tanstack/db` 1.0 and
+on-demand subset loads on every version wait for the original request. Before
+1.0, an eager preload (or hydrated on-demand gate) still reports its first
+failed dial and heals when the transport succeeds. A fresh on-demand source
+is ready offline. Its mounted queries wait for their rows.
 
-`close()` disposes the transport, and `connect()` **revives** it: a later
-`connect()` clears the intentional-close latch, so a reused transport
-auto-reconnects and delivers `onClosed` again. A `connect()` (and any
-`subscribe`/`sendMut`/`fetch` awaiting it) never resolves disconnected — it
-rejects `TransportClosedError` if the transport was closed and stays closed
-([ADR-0020](./docs/adr/0020-connect-contract-abortable-open.md)).
+A reconnect policy returns a delay in milliseconds to retry or `null` to give
+up. The default retries network outages with jittered backoff and stops on
+application close codes 4000–4999. A stop rejects outstanding first reads with
+`TransportStoppedError`. Its `closeCode`, `closeReason`, and `cause` distinguish
+a peer refusal, a failed dial, and a thrown policy. `onClosed(code, reason, error)`
+receives that same error. For a browser to see a specific denial, the server
+must accept the upgrade and close with an application code. A rejected HTTP
+upgrade looks like a failed dial and follows the network retry policy.
+Already-ready collections keep their rows and resume
+on the next connection. On 1.0 their health can surface the interruption.
+
+**Migrating credential refresh.** If you refresh in `onClosed` and then call
+`connect()`, a first load that already rejected needs to be restarted. For
+transparent recovery, let the policy retry your service's expiry code and let
+the opener await the fresh credential. This example assumes the app's session
+and socket helpers support cancellation, and that its server uses 4401 for
+expiry and 4403 for denied access.
+
+```ts
+const backoff = defaultReconnectDelay(250)
+const transport = new WebSocketTransport<Api>({
+  url,
+  reconnectDelay(attempt, code, reason) {
+    if (attempt > 4) return null
+    if (code === 4401) {
+      session.invalidateAccessToken()
+      return 0
+    }
+    return backoff(attempt, code, reason)
+  },
+  async open(signal) {
+    const token = await session.getValidAccessToken(signal)
+    return openAuthenticatedSocket(url, token, signal)
+  },
+})
+```
+
+After a terminal denial and subsequent sign-in, restart a failed eager run
+with `collection.reload()` on 1.0, or `cleanup()` followed by `preload()` on
+older versions. Dispose and recreate a failed live query.
+Calling `close()` yourself pauses registered reads. A subsequent `connect()`,
+write, fetch, or new subscription revives them. To dispose permanently, clean
+up your collections or unsubscribe raw handlers, then close the transport.
+Direct `connect()` and writes still reject when their handshake is aborted.
+[First-load contract](./docs/adr/0029-first-load-recovery.md).
 
 The socket opener is injectable (`open`, for non-browser runtimes or tests). It
 receives an optional `AbortSignal` that `close()` aborts while the handshake is

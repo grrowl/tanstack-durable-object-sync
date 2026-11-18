@@ -5,16 +5,6 @@ import { doCollectionOptions } from "../src/client/do-collection.ts"
 import { WebSocketTransport, type WebSocketLike } from "../src/client/transport.ts"
 import type { TestApi } from "./test-worker.ts"
 
-// WHY (ADR-0028): a collection whose first connect fails must say so. Its
-// `preload()` rejects with the cause instead of waiting forever on a server
-// that is not there. The adapter reports this through the sync controls, which
-// @tanstack/db renamed in 1.0 (`markError` became `fail`). Calling only the old
-// name does nothing on 1.0, and the collection stays `loading`.
-//
-// A failed collection must also be recoverable once the server is reachable,
-// through the call upstream gives an app for it: `reload()` from 1.0,
-// `cleanup()` then `preload()` before it.
-
 const hasReload = "reload" in CollectionImpl.prototype
 
 const room = (tag: string): string => `fcf-${tag}-${crypto.randomUUID()}`
@@ -28,6 +18,7 @@ async function waitFor(pred: () => boolean, timeoutMs = 3000): Promise<void> {
 }
 
 interface Dial {
+  attempts?: number
   down: boolean
 }
 /** A real transport to the DO whose dial fails while `dial.down`. */
@@ -36,6 +27,7 @@ function transportFor(r: string, dial: Dial): WebSocketTransport<TestApi> {
     url: `https://example.com/sync/${r}`,
     reconnectDelay: () => 5,
     open: async () => {
+      dial.attempts = (dial.attempts ?? 0) + 1
       if (dial.down) throw new Error("dial failed: server unreachable")
       const res = await SELF.fetch(`https://example.com/sync/${r}`, { headers: { Upgrade: "websocket" } })
       const ws = res.webSocket
@@ -61,40 +53,47 @@ async function seededRoom(tag: string): Promise<string> {
 function within<T>(p: Promise<T>, ms = 1500): Promise<T> {
   return Promise.race([p, sleep(ms).then(() => Promise.reject(new Error(`still pending after ${ms} ms`)))])
 }
-/** Start a failed collection over, as upstream tells an app to. */
-async function restart(c: { preload: () => Promise<void>; cleanup: () => Promise<void> }): Promise<void> {
-  const reload = (c as { reload?: () => Promise<void> }).reload
-  if (reload) return reload.call(c)
-  await c.cleanup()
-  await c.preload()
-}
-
-describe("a failed first connect fails the collection's first load", () => {
+describe("first load across a retry or intentional pause (ADR-0029)", () => {
   for (const syncMode of ["eager", "on-demand"] as const) {
-    it(`${syncMode}: preload() rejects with the cause, and a restart recovers once the server is reachable`, async () => {
+    it.runIf(hasReload || syncMode === "on-demand")(`${syncMode} loads after a transient outage without restarting`, async () => {
       const r = await seededRoom(syncMode)
       const dial: Dial = { down: true }
       const t = transportFor(r, dial)
-      const messages = createCollection(doCollectionOptions({ transport: t, table: "messages", getKey: (m) => m.id, syncMode }))
-
-      await expect(within(messages.preload())).rejects.toThrow("dial failed: server unreachable")
-      expect(messages.status).toBe("error")
-
+      const messages = createCollection(doCollectionOptions({ transport: t, table: "messages", getKey: m => m.id, syncMode }))
+      if (syncMode === "on-demand") {
+        await within(messages.preload())
+        expect(dial.attempts ?? 0).toBe(0)
+      }
+      const hi = createLiveQueryCollection(q => q.from({ m: messages }).where(({ m }) => eq(m.body, "hi")))
+      const load = hi.preload()
+      await waitFor(() => (dial.attempts ?? 0) >= 2)
+      expect(hi.status).toBe("loading")
       dial.down = false
-      await within(restart(messages))
-      expect(messages.status).toBe("ready")
-      const hi = createLiveQueryCollection((q) => q.from({ m: messages }).where(({ m }) => eq(m.body, "hi")))
-      await within(hi.preload())
+      await within(load)
       expect(hi.get("seed")).toMatchObject({ id: "seed", body: "hi" })
+      await hi.cleanup()
+      await messages.cleanup()
+      t.close()
+    })
+
+    it(`${syncMode} survives close and remount during its first dial`, async () => {
+      const r = await seededRoom("remount")
+      const dial = { down: false, attempts: 0 }
+      const t = transportFor(r, dial)
+      const messages = createCollection(doCollectionOptions({ transport: t, table: "messages", getKey: m => m.id, syncMode }))
+      const hi = createLiveQueryCollection(q => q.from({ m: messages }))
+      const load = hi.preload()
+      expect(dial.attempts).toBe(1)
+      t.close()
+      await t.connect()
+      await within(load)
+      expect(hi.get("seed")).toMatchObject({ body: "hi" })
+      await hi.cleanup()
+      await messages.cleanup()
       t.close()
     })
   }
 
-  // Before 1.0 an eager collection also heals with no call from the app: its
-  // subscription keeps the transport retrying, and the snapshot that finally
-  // arrives marks the collection ready. From 1.0 a failed sync run is over
-  // (`markReady()` after `fail()` does nothing), so only the restart above
-  // recovers it.
   it.runIf(!hasReload)("eager, before 1.0: the transport's own retry heals the collection", async () => {
     const r = await seededRoom("heal")
     const dial: Dial = { down: true }

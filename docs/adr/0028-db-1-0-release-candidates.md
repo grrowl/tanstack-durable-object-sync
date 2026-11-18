@@ -7,6 +7,8 @@ the upstream behaviour that [ADR-0002](./0002-adversarial-review-corrections.md)
 C2 verified.
 **Date:** 2026-11-17
 
+The first-load decision in D2 was subsequently amended by [ADR-0029](./0029-first-load-recovery.md).
+
 ## Context
 
 The weekly `Upstream latest` job (ADR-0022 §3) was red from 2026-10-12. The job

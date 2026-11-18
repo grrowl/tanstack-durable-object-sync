@@ -250,7 +250,8 @@ describe("the next run of auto-reconnect starts at attempt 1", () => {
     fakes[0]!.emit("close", { code: 1006 })
     for (let i = 1; i <= 3; i++) {
       t.unsubscribe(`q${i - 1}`)
-      await t.subscribe(`q${i}`, "messages", noopHandler()).catch(() => {})
+      void t.subscribe(`q${i}`, "messages", noopHandler()).catch(() => {})
+      await waitFor(() => attempts.length === i + 1)
     }
     expect(attempts).toEqual([1, 2, 3, 4])
     t.close()
